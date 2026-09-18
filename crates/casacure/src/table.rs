@@ -8,6 +8,7 @@
 
 use crate::aipsio::{AipsIoError, Reader};
 use crate::columnset::{parse_column_set, ColumnSet, ColumnSetError};
+use crate::record::RecordValue;
 use crate::tabledesc::{TableDesc, TableDescError};
 use thiserror::Error;
 
@@ -789,6 +790,270 @@ impl Table {
             .map(|c| c.name.clone())
             .collect()
     }
+}
+
+/// Errors from the column-access (§3) read API.
+#[derive(Debug, Error)]
+pub enum TableReadError {
+    #[error("column {0} does not exist")]
+    NoSuchColumn(String),
+    #[error("column {0} is not backed by a readable data manager ({1})")]
+    UnsupportedColumn(String, String),
+    #[error("row {row} is out of range for column {column}")]
+    RowOutOfRange { row: u64, column: String },
+    #[error("slice {0:?}..{1:?} does not fit the cell shape {2:?}")]
+    BadSlice(Vec<i64>, Vec<i64>, Vec<u32>),
+    #[error(transparent)]
+    Ssm(#[from] crate::ssm::SsmError),
+    #[error(transparent)]
+    Ism(#[from] crate::ism::IsmError),
+    #[error(transparent)]
+    Tsm(#[from] crate::tsm::TsmError),
+}
+
+impl Table {
+    /// The data-manager sequence number and the column's index within that
+    /// manager for `col_idx` (the per-manager column order follows table
+    /// order).
+    pub fn column_manager(&self, col_idx: usize) -> (u32, usize) {
+        let seq = self.dat.column_set.columns[col_idx].data_manager_seq;
+        let within = self.dat.column_set.columns[..col_idx]
+            .iter()
+            .filter(|c| c.data_manager_seq == seq)
+            .count();
+        (seq, within)
+    }
+
+    fn ssm_file(&self, seq: u32) -> Option<&crate::ssm::StandardStManFile> {
+        self.ssm_files
+            .iter()
+            .find(|(s, _)| *s == seq)
+            .map(|(_, f)| f)
+    }
+
+    /// The StandardStMan spec for the given data manager.
+    fn ssm_spec(&self, seq: u32) -> Option<&crate::columnset::StandardStMan> {
+        self.dat
+            .column_set
+            .data_managers
+            .iter()
+            .find(|dm| dm.sequence_nr == seq)
+            .and_then(|dm| match &dm.blob {
+                crate::columnset::DataManagerBlob::StandardStMan(s) => Some(s),
+                _ => None,
+            })
+    }
+
+    /// Read one cell (`table.getcell(col, row)`).
+    pub fn getcell(&self, col_idx: usize, row: u64) -> Result<RecordValue, TableReadError> {
+        let desc = &self.dat.desc.columns[col_idx];
+        let (seq, within) = self.column_manager(col_idx);
+        match desc.data_manager_type.as_str() {
+            "StandardStMan" => {
+                let file = self.ssm_file(seq).ok_or_else(|| {
+                    TableReadError::UnsupportedColumn(desc.name.clone(), "StandardStMan".into())
+                })?;
+                let spec = self.ssm_spec(seq).ok_or_else(|| {
+                    TableReadError::UnsupportedColumn(desc.name.clone(), "no spec".into())
+                })?;
+                if matches!(desc.kind, crate::tabledesc::ColumnKind::Array) {
+                    crate::ssm::read_array_cell(file, spec, within, desc, row).map_err(Into::into)
+                } else {
+                    file.read_scalar_cell(spec, within, desc, row)
+                        .map_err(Into::into)
+                }
+            }
+            "IncrementalStMan" => {
+                let file = self
+                    .ism_files
+                    .iter()
+                    .find(|(s, _)| *s == seq)
+                    .map(|(_, f)| f)
+                    .ok_or_else(|| {
+                        TableReadError::UnsupportedColumn(
+                            desc.name.clone(),
+                            "IncrementalStMan".into(),
+                        )
+                    })?;
+                file.read_scalar_cell(within, desc, row).map_err(Into::into)
+            }
+            "TiledColumnStMan" => {
+                let file = self
+                    .tsm_files
+                    .iter()
+                    .find(|(s, _)| *s == seq)
+                    .map(|(_, f)| f)
+                    .ok_or_else(|| {
+                        TableReadError::UnsupportedColumn(
+                            desc.name.clone(),
+                            "TiledColumnStMan".into(),
+                        )
+                    })?;
+                file.read_cell(desc, row).map_err(Into::into)
+            }
+            other => Err(TableReadError::UnsupportedColumn(
+                desc.name.clone(),
+                other.to_string(),
+            )),
+        }
+    }
+
+    /// Read `nrow` cells starting at `startrow` (`table.getcol` /
+    /// `getcolnp`).
+    pub fn getcol(
+        &self,
+        col_idx: usize,
+        startrow: u64,
+        nrow: u64,
+    ) -> Result<Vec<RecordValue>, TableReadError> {
+        let column = self.dat.desc.columns[col_idx].name.clone();
+        let mut out = Vec::with_capacity(nrow as usize);
+        for r in startrow..startrow + nrow {
+            out.push(self.getcell(col_idx, r).map_err(|e| match e {
+                TableReadError::RowOutOfRange { .. } => TableReadError::RowOutOfRange {
+                    row: r,
+                    column: column.clone(),
+                },
+                other => other,
+            })?);
+        }
+        Ok(out)
+    }
+
+    /// Read a slice of each array cell (`table.getcolslice(col, blc, trc,
+    /// startrow, nrow)`): `blc`/`trc` are the inclusive start/end for each
+    /// logical dimension.
+    pub fn getcolslice(
+        &self,
+        col_idx: usize,
+        blc: &[i64],
+        trc: &[i64],
+        startrow: u64,
+        nrow: u64,
+    ) -> Result<Vec<RecordValue>, TableReadError> {
+        let mut out = Vec::with_capacity(nrow as usize);
+        for r in startrow..startrow + nrow {
+            out.push(self.getcellslice(col_idx, r, blc, trc)?);
+        }
+        Ok(out)
+    }
+
+    /// One array cell slice (`table.getcellslice(col, row, blc, trc)`);
+    /// scalar columns ignore the slice.
+    pub fn getcellslice(
+        &self,
+        col_idx: usize,
+        row: u64,
+        blc: &[i64],
+        trc: &[i64],
+    ) -> Result<RecordValue, TableReadError> {
+        let cell = self.getcell(col_idx, row)?;
+        let RecordValue::Array(arr) = cell else {
+            return Ok(cell);
+        };
+        if blc.is_empty() && trc.is_empty() {
+            return Ok(RecordValue::Array(arr));
+        }
+        Ok(RecordValue::Array(slice_array_value(&arr, blc, trc)?))
+    }
+
+    /// Read all cells, keyed per row as `"r0"`, `"r1"`, ... (`getvarcol`).
+    pub fn getvarcol(&self, col_idx: usize) -> Result<Vec<RecordValue>, TableReadError> {
+        let n = self.nrows();
+        self.getcol(col_idx, 0, n)
+    }
+}
+
+/// Slice an array value by inclusive per-dimension `blc`/`trc` (logical
+/// row-major dims), returning the sub-array flat in logical order.
+pub fn slice_array_value(
+    arr: &crate::record::ArrayValue,
+    blc: &[i64],
+    trc: &[i64],
+) -> Result<crate::record::ArrayValue, TableReadError> {
+    let shape = &arr.shape;
+    let ndim = shape.len();
+    if blc.len() != ndim || trc.len() != ndim {
+        return Err(TableReadError::BadSlice(
+            blc.to_vec(),
+            trc.to_vec(),
+            shape.clone(),
+        ));
+    }
+    let mut new_shape = Vec::with_capacity(ndim);
+    for d in 0..ndim {
+        let b = blc[d];
+        let t = trc[d];
+        if b < 0 || t < b || t as u32 >= shape[d] {
+            return Err(TableReadError::BadSlice(
+                blc.to_vec(),
+                trc.to_vec(),
+                shape.clone(),
+            ));
+        }
+        new_shape.push((t - b + 1) as u32);
+    }
+    // Linear indices of the sub-array in logical row-major order.
+    let mut indices = Vec::with_capacity(new_shape.iter().product::<u32>() as usize);
+    let strides: Vec<usize> = {
+        let mut s = vec![1usize; ndim];
+        for d in (0..ndim - 1).rev() {
+            s[d] = s[d + 1] * shape[d + 1] as usize;
+        }
+        s
+    };
+    fn visit(
+        shape: &[u32],
+        new_shape: &[u32],
+        strides: &[usize],
+        blc: &[i64],
+        indices: &mut Vec<usize>,
+        d: usize,
+        offset: usize,
+    ) {
+        if d == shape.len() {
+            indices.push(offset);
+            return;
+        }
+        for k in 0..new_shape[d] {
+            let coord = (blc[d] + k as i64) as usize;
+            visit(
+                shape,
+                new_shape,
+                strides,
+                blc,
+                indices,
+                d + 1,
+                offset + coord * strides[d],
+            );
+        }
+    }
+    visit(shape, &new_shape, &strides, blc, &mut indices, 0, 0);
+
+    use crate::record::ArrayData;
+    macro_rules! slice_data {
+        ($data:ident, $v:ident, $make:ident) => {{
+            ArrayData::$make(indices.iter().map(|&i| $v[i]).collect())
+        }};
+    }
+    let data = match &arr.data {
+        ArrayData::Bool(v) => slice_data!(data, v, Bool),
+        ArrayData::UChar(v) => slice_data!(data, v, UChar),
+        ArrayData::Short(v) => slice_data!(data, v, Short),
+        ArrayData::UShort(v) => slice_data!(data, v, UShort),
+        ArrayData::Int(v) => slice_data!(data, v, Int),
+        ArrayData::UInt(v) => slice_data!(data, v, UInt),
+        ArrayData::Int64(v) => slice_data!(data, v, Int64),
+        ArrayData::Float(v) => slice_data!(data, v, Float),
+        ArrayData::Double(v) => slice_data!(data, v, Double),
+        ArrayData::Complex(v) => ArrayData::Complex(indices.iter().map(|&i| v[i]).collect()),
+        ArrayData::DComplex(v) => ArrayData::DComplex(indices.iter().map(|&i| v[i]).collect()),
+        ArrayData::String(v) => ArrayData::String(indices.iter().map(|&i| v[i].clone()).collect()),
+    };
+    Ok(crate::record::ArrayValue {
+        shape: new_shape,
+        data,
+    })
 }
 
 /// A data-manager-info record as returned by casacore `table.getdminfo()`:
@@ -1635,6 +1900,142 @@ mod tests {
         assert_eq!(info["*2"].columns, vec!["B"]);
         let all_types: Vec<&str> = info.values().map(|d| d.type_name.as_str()).collect();
         assert_eq!(all_types, vec!["StandardStMan", "StandardStMan"]);
+    }
+
+    #[test]
+    fn column_reads_getcell_getcol_slices_varcol() {
+        use crate::record::{ArrayData, ArrayValue};
+        // A mixed table: SSM scalar I4, SSM array ARR, TSM tiled DATA,
+        // long string NAME, ISM TIME.
+        let mut desc = typed_desc();
+        desc.columns = vec![
+            scalar_col("I4", DataType::Int, 0),
+            array_col("ARR", DataType::Complex, 4, vec![3, 2]),
+            tsm_arr_col("DATA", DataType::DComplex, vec![2, 3]),
+            scalar_col("NAME", DataType::String, 0),
+            ism_col("TIME", DataType::Double, 1),
+        ];
+        let arr = |row: i32| {
+            RecordValue::Array(ArrayValue {
+                shape: vec![2, 3],
+                data: ArrayData::Complex((1..=6).map(|k| (row as f32, k as f32)).collect()),
+            })
+        };
+        let data = |row: i32| {
+            RecordValue::Array(ArrayValue {
+                shape: vec![2, 3],
+                data: ArrayData::DComplex((1..=6).map(|k| (row as f64, k as f64)).collect()),
+            })
+        };
+        let names: Vec<RecordValue> = (0..4)
+            .map(|i| {
+                RecordValue::String(format!(
+                    "a very long label number {i} exceeding eight chars"
+                ))
+            })
+            .collect();
+        let values = vec![
+            (0..4).map(RecordValue::Int).collect(),
+            (0..4).map(arr).collect(),
+            (0..4).map(data).collect(),
+            names,
+            (0..4)
+                .map(|i| RecordValue::Double(i as f64 / 2.0))
+                .collect(),
+        ];
+        let dir = temp_dir("colread");
+        Table::create(&dir, &desc, &values).unwrap();
+        let t = Table::open(&dir, true).unwrap();
+
+        // Scalar getcell / getcol.
+        assert_eq!(t.getcell(0, 2).unwrap(), RecordValue::Int(2));
+        assert_eq!(
+            t.getcol(0, 1, 2).unwrap(),
+            vec![RecordValue::Int(1), RecordValue::Int(2)]
+        );
+
+        // Fixed-shape array getcell (logical shape restored).
+        match t.getcell(1, 1).unwrap() {
+            RecordValue::Array(a) => {
+                assert_eq!(a.shape, vec![2, 3]);
+                match &a.data {
+                    ArrayData::Complex(v) => assert_eq!(
+                        &v[..],
+                        &[
+                            (1.0f32, 1.0),
+                            (1.0, 2.0),
+                            (1.0, 3.0),
+                            (1.0, 4.0),
+                            (1.0, 5.0),
+                            (1.0, 6.0)
+                        ][..]
+                    ),
+                    other => panic!("expected complex, got {other:?}"),
+                }
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+
+        // Tiled DATA via TSM.
+        match t.getcell(2, 3).unwrap() {
+            RecordValue::Array(a) => {
+                assert_eq!(a.shape, vec![2, 3]);
+                match &a.data {
+                    ArrayData::DComplex(v) => assert_eq!(
+                        &v[..],
+                        &[
+                            (3.0f64, 1.0),
+                            (3.0, 2.0),
+                            (3.0, 3.0),
+                            (3.0, 4.0),
+                            (3.0, 5.0),
+                            (3.0, 6.0)
+                        ][..]
+                    ),
+                    other => panic!("expected dcomplex, got {other:?}"),
+                }
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+
+        // getcolslice: slice DATA channels [1..1] inclusive -> [3,1] cell.
+        let sliced = t.getcolslice(2, &[1, 0], &[1, 2], 0, 1).unwrap();
+        match &sliced[0] {
+            RecordValue::Array(a) => {
+                assert_eq!(a.shape, vec![1, 3]);
+                match &a.data {
+                    ArrayData::DComplex(v) => {
+                        // The [1, :] row of row0 cell = (0,4),(0,5),(0,6)
+                        assert_eq!(&v[..], &[(0.0f64, 4.0), (0.0, 5.0), (0.0, 6.0)][..]);
+                    }
+                    other => panic!("expected dcomplex, got {other:?}"),
+                }
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+
+        // Long string via the string buckets.
+        assert_eq!(
+            t.getcell(3, 1).unwrap(),
+            RecordValue::String("a very long label number 1 exceeding eight chars".into())
+        );
+
+        // ISM column.
+        assert_eq!(t.getcell(4, 3).unwrap(), RecordValue::Double(1.5));
+
+        // getvarcol iterates all rows.
+        let all = t.getvarcol(0).unwrap();
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[3], RecordValue::Int(3));
+
+        // getcol on the ISM column.
+        let times = t.getcol(4, 0, 4).unwrap();
+        assert_eq!(
+            times,
+            (0..4)
+                .map(|i| RecordValue::Double(i as f64 / 2.0))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

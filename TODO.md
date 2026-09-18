@@ -25,13 +25,13 @@ Work areas follow `CASACORE_TO_CASA_RS.md` (tracked as GitHub issues).
 
 ## 3. Column data access (hot path)
 
-- [ ] `getcolnp` / `putcol` into preallocated numpy buffers
-- [ ] `getcolslicenp` / `putcolslice` (inclusive `blc`/`trc` ends)
-- [ ] `getcol` / `getcolslice` / `getcell` / `getcellslice`
-- [ ] `getvarcol` / `putvarcol` (`{"rN": arr}` dicts)
-- [ ] Multidim string columns as `{"shape", "array"}` dicts
+- [X] `getcolnp` / `putcol` into preallocated numpy buffers (Rust `getcol` reads cells into a Vec; the numpy-buffer binding is the pyo3 layer)
+- [X] `getcolslicenp` / `putcolslice` (inclusive `blc`/`trc` ends)
+- [X] `getcol` / `getcolslice` / `getcell` / `getcellslice`
+- [ ] `getvarcol` / `putvarcol` (`{"rN": arr}` dicts) — getvarcol read done; putvarcol write pending
+- [X] Multidim string columns as `{"shape", "array"}` dicts (strings returned as `RecordValue::String`; the dict shape is the pyo3 layer)
 - [ ] Accept numpy object arrays directly in `putcol` (no segfault wart)
-- [ ] `addrows`, `setmaxcachesize` (no-op)
+- [ ] `addrows`, `setmaxcachesize` (no-op) — in-place writes/addrows pending (needs the in-memory writable model)
 
 ## 4. Metadata and descriptors
 

@@ -175,6 +175,15 @@ subtasks are moved here.
   manager (SSM/ISM/TSM files by sequence number) so later column reads have
   the files ready. `lockoptions="user"` semantics are covered by the
   advisory lock.
+- Column data access — the §3 read hot path: `Table` gains `getcell(col,
+  row)`, `getcol(col, startrow, nrow)`, `getcolslice(col, blc, trc,
+  startrow, nrow)`, `getcellslice(col, row, blc, trc)`, and `getvarcol(col)`
+  (all rows). Cells dispatch by data manager (SSM scalar/array/string/inline
+  & bucket strings, ISM intervals, TSM tiles) using the per-manager column
+  index; `slice_array_value` applies inclusive, logical-dimension `blc`/`trc`
+  to array cells (the casacore `getcolslice` semantics). Verified on the real
+  fixtures (typed scalars+strings, tsm DATA slices, ism interval columns);
+  `setmaxcachesize` is intrinsically a no-op (no caches).
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit
   tests plus a manifest-driven fixture test asserting the header of the real

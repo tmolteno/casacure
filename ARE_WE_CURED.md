@@ -3,15 +3,13 @@
 Overall progress towards replacing casacore as the dask-ms I/O backend.
 Work areas are tracked as GitHub issues; subtasks live in `TODO.md`.
 
-**Verdict: NOT YET CURED** — StandardStMan (scalar, array, long-string), IncrementalStMan, **and** TiledColumnStMan columns read+write with proven two-way interop in **multi-data-manager tables**, and `getdminfo()` round-trips match casacore; next up is §2 table lifecycle/locking.
-
-## §1 (on-disk format) is complete.
+**Verdict: NOT YET CURED** — §1 on-disk format, §2 lifecycle, and the §3 column-*read* hot path are complete; in-place writes (putcol/putvarcol/addrows) remain.
 
 ## Test status
 
 | Suite | Command | Passing | Coverage |
 |---|---|---|---|
-| Rust unit + fixture tests | `cargo test` | 67/67 | type system, AipsIO read+write (both endians), `table.dat`, StandardStMan data file + `table.f0i` + string buckets, IncrementalStMan (interval index, multi-DM tables) — all read+write |
+| Rust unit + fixture tests | `cargo test` | 69/69 | type system, AipsIO read+write (both endians), `table.dat`, StandardStMan data file + `table.f0i` + string buckets, IncrementalStMan (interval index, multi-DM tables) — all read+write |
 | casacore comparison tests | `.venv/bin/python -m pytest tests/` | 5/5 | type system only |
 | write interop (manual) | `examples/create_sample_table.rs` + python-casacore | ✓ | casacure-write → casacore-read: SSM scalars, arrays, long strings, and ISM TIME/ANT1 in one 4-file table; 3-row and 100-row variants return exactly the written values |
 
@@ -21,7 +19,7 @@ Work areas are tracked as GitHub issues; subtasks live in `TODO.md`.
 |---|---|---|
 | §1 CASA table on-disk format | DONE | `table.dat` fully parsed **and written** (multi-DM ColumnSet). StandardStMan (scalars, `table.f0i` arrays, string buckets), IncrementalStMan (interval index), and TiledColumnStMan (tile buckets, reversed-dim shapes) fully read **and written** — one table can mix all three across several files, and python-casacore round-trips every column exactly. `getdminfo()` matches casacore byte-for-byte (incl. SPEC records); managers grouped by type+group and named by group (the `_1` auto-suffix belongs to the future `addcols`). |
 | §2 Table lifecycle & locking | DONE | `Table` open/create, advisory lock/unlock, flush/close, iswritable/name, nrows/colnames; Send+Sync; eager DM-file loading |
-| §3 Column data access | 0% | not started |
+| §3 Column data access | ~50% | read hot path done (getcell/getcol/getcolslice/getcellslice/getvarcol across SSM/ISM/TSM/strings); in-place writes (putcol/putvarcol/addrows) and pyo3 numpy bindings pending |
 | §4 Type system | ~90% | `ValueType` + numpy mapping done, verified against casacore 3.8.1 |
 | §5 Metadata & descriptors | 0% | not started |
 | §6 TaQL subset | 0% | not started |

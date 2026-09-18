@@ -15,13 +15,13 @@ use std::path::PathBuf;
 use casacure::ValueType;
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct Manifest {
     casacore_version: String,
     tables: BTreeMap<String, TableFixture>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct TableFixture {
     path: String,
     nrows: u64,
@@ -32,7 +32,7 @@ struct TableFixture {
     values: BTreeMap<String, Vec<serde_json::Value>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ColumnFixture {
     value_type: String,
     /// numpy dtype `.str` as returned by casacore's `getcol`, or `"list"`
@@ -652,5 +652,89 @@ fn fixture_dminfo_matches_casacore() {
         }
         json.push('}');
         assert_eq!(json, expected, "{table_name}: getdminfo mismatch");
+    }
+}
+
+/// The §3 read API (`Table::getcell`/`getcol`/`getcolslice`/`getvarcol`)
+/// returns the exact values casacore stored in the real fixtures.
+#[test]
+fn fixture_column_reads_via_table() {
+    use casacure::record::RecordValue;
+    let Some(manifest) = load_manifest() else {
+        return;
+    };
+    let fixtures_dir = manifest_path().parent().unwrap().to_path_buf();
+
+    // typed: scalar getcell/getcol.
+    let typed = TableFixture::from_manifest(&manifest, "typed");
+    let dir = fixtures_dir.join(&typed.path);
+    let t = casacure::Table::open(&dir, true).unwrap();
+    let idx = t.colnames().iter().position(|c| c == "COL_R4").unwrap();
+    assert_eq!(t.getcell(idx, 0).unwrap(), RecordValue::Float(1.5));
+    assert_eq!(t.getcol(idx, 0, 1).unwrap(), vec![RecordValue::Float(1.5)]);
+    let s_idx = t.colnames().iter().position(|c| c == "COL_S").unwrap();
+    assert_eq!(
+        t.getcell(s_idx, 0).unwrap(),
+        RecordValue::String("hello".into())
+    );
+
+    // tsm: array getcell + getcolslice (inclusive blc/trc).
+    let Some(tsm) = manifest.tables.get("tsm") else {
+        return;
+    };
+    let dir = fixtures_dir.join(&tsm.path);
+    let t = casacure::Table::open(&dir, true).unwrap();
+    let d_idx = t.colnames().iter().position(|c| c == "DATA").unwrap();
+    match t.getcell(d_idx, 1).unwrap() {
+        RecordValue::Array(a) => {
+            assert_eq!(a.shape, vec![2, 3], "tsm DATA logical shape");
+            match &a.data {
+                casacure::record::ArrayData::DComplex(v) => {
+                    let expect: Vec<(f64, f64)> = (1..=6).map(|k| (1.0, k as f64)).collect();
+                    assert_eq!(&v[..], &expect[..]);
+                }
+                other => panic!("expected dcomplex, got {other:?}"),
+            }
+        }
+        other => panic!("expected array, got {other:?}"),
+    }
+    // Slice the second channel row (blc=[1,0], trc=[1,2]) of row 0.
+    let sliced = t.getcolslice(d_idx, &[1, 0], &[1, 2], 0, 1).unwrap();
+    match &sliced[0] {
+        RecordValue::Array(a) => {
+            assert_eq!(a.shape, vec![1, 3]);
+            match &a.data {
+                casacure::record::ArrayData::DComplex(v) => {
+                    let expect: Vec<(f64, f64)> = (1..=3).map(|_| (0.0, 0.0)).collect();
+                    // row 0 DATA = [[r+1j..],[r+4j..]]; channel 1 = (0,4),(0,5),(0,6)
+                    let expect2 = [(0.0, 4.0), (0.0, 5.0), (0.0, 6.0)];
+                    assert_eq!(&v[..], &expect2[..], "sliced DATA values");
+                    let _ = expect;
+                }
+                other => panic!("expected dcomplex, got {other:?}"),
+            }
+        }
+        other => panic!("expected array, got {other:?}"),
+    }
+
+    // ism: getcol across the ISM interval-compressed column.
+    if let Some(ism) = manifest.tables.get("ism") {
+        let dir = fixtures_dir.join(&ism.path);
+        let t = casacure::Table::open(&dir, true).unwrap();
+        let a_idx = t.colnames().iter().position(|c| c == "ANT1").unwrap();
+        assert_eq!(
+            t.getcol(a_idx, 0, 6).unwrap(),
+            vec![0, 0, 1, 1, 1, 2]
+                .into_iter()
+                .map(RecordValue::Int)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// Tiny helper to pluck a fixture by name.
+impl TableFixture {
+    fn from_manifest(m: &Manifest, name: &str) -> TableFixture {
+        m.tables[name].clone()
     }
 }
