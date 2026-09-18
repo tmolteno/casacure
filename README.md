@@ -4,7 +4,7 @@ A rust replacement for casacore, designed to be pip installable on any machine
 
 This will be a rust crate, with a python interface. The needed functionality is that sufficient to stop dask-ms depending on casacore which is a building nightmare on non-amd64 architectures.
 
-Initially casacore will be a submodule, that we keep updated with the casacore master repository (we will never modify this code)
+Initially casacure will be a rust-crate that we keep updated with the casacore master repository (we will never modify this code). There will also be a python-casacure. Initially muliprocessing will be left out, but eventually rayon may be used to speed up an compute intensive tasks.
 
 ## TODO 
 
