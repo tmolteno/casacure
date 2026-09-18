@@ -1773,7 +1773,9 @@ fn parse_column_spec(p: &mut Parser) -> Result<ColumnDesc, TaqlError> {
         }
     }
 
-    let column_kind = if ndim == -1 || shape.is_none() {
+    // Scalar vs array: an explicit `NDIM` makes an array column (fixed shape
+    // when `SHAPE` is present, variable otherwise); `R8` alone is scalar.
+    let column_kind = if ndim == -1 {
         ColumnKind::Scalar(def)
     } else {
         let _ = def;

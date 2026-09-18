@@ -597,16 +597,51 @@ pub(crate) fn table_record_to_dict<'py>(
     py: Python<'py>,
     rec: &TableRecord,
 ) -> PyResult<Bound<'py, PyDict>> {
+    table_record_to_dict_ctx(py, rec, None)
+}
+
+/// Like `table_record_to_dict`, but `TpTable` keyword fields are resolved to
+/// the `"Table: <path>"` string python-casacore exposes, with `base` the
+/// directory containing the parent table.
+pub(crate) fn table_record_to_dict_ctx<'py>(
+    py: Python<'py>,
+    rec: &TableRecord,
+    base: Option<&std::path::Path>,
+) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     for (field, value) in rec.desc.fields.iter().zip(rec.values.iter()) {
         let v = match value {
-            RecordValue::Record(sub) => table_record_to_dict(py, sub)?.into_any().unbind(),
+            RecordValue::Record(sub) => {
+                table_record_to_dict_ctx(py, sub, base)?.into_any().unbind()
+            }
             RecordValue::Array(a) => array_to_dict(py, a)?.into_any().unbind(),
+            RecordValue::Table(name) => {
+                let resolved = resolve_subtable_py(name, base);
+                PyString::new(py, &resolved).into_any().unbind()
+            }
             other => element_to_py(py, other)?,
         };
         d.set_item(&field.name, v)?;
     }
     Ok(d)
+}
+
+fn resolve_subtable_py(name: &str, base: Option<&std::path::Path>) -> String {
+    match base {
+        Some(b) => {
+            let path = std::path::Path::new(name);
+            let joined = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                b.join(path)
+            };
+            format!(
+                "Table: {}",
+                casacure::record::lexical_normalize(&joined).display()
+            )
+        }
+        None => name.to_string(),
+    }
 }
 
 /// Build a `TableRecord` from a Python dict (`putkeywords` etc).
@@ -653,10 +688,26 @@ pub(crate) fn pyobject_to_record(py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResu
         return Ok(RecordValue::Double(f));
     }
     if let Ok(d) = v.downcast::<PyDict>() {
-        // The `{"shape": [..], "array": [..]}` multidim-string dict form.
+        // The `{"shape": [..], "array": [..]}` multidim-string dict form:
+        // only when the array is actually strings.
         if d.contains("shape")? && d.contains("array")? {
-            if let Ok(sv) = py_to_string_array(py, v) {
-                return Ok(sv);
+            let is_strings = match d.get_item("array")? {
+                Some(a) => match a.downcast::<PyList>() {
+                    Ok(list) => match list.iter().next() {
+                        None => true,
+                        Some(e) => {
+                            e.is_instance_of::<PyString>()
+                                || e.is_instance_of::<numpy::PyArrayDyn<Py<PyAny>>>()
+                        }
+                    },
+                    Err(_) => false,
+                },
+                None => false,
+            };
+            if is_strings {
+                if let Ok(sv) = py_to_string_array(py, v) {
+                    return Ok(sv);
+                }
             }
         }
         return Ok(RecordValue::Record(dict_to_table_record(py, d)?));

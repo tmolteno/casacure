@@ -256,31 +256,41 @@ impl Table {
             .iter()
             .find(|c| c.name == column)
             .ok_or_else(|| PyKeyError::new_err(format!("no such column: {column}")))?;
-        let vt = self_coldesc(col, py)?;
+        let base = std::path::Path::new(&self.path)
+            .parent()
+            .map(|p| p.to_path_buf());
+        let vt = self_coldesc(py, col, base.as_deref())?;
         Ok(vt.into_any().unbind())
     }
 
     /// `getkeywords()` -> dict.
     fn getkeywords(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let json = {
-            let inner = self.inner.lock().unwrap();
-            match &*inner {
-                Inner::Read(t) => t.getkeywords(),
-                Inner::Write { wt, .. } => wt.keywords_json(),
-            }
+        let inner = self.inner.lock().unwrap();
+        let rec = match &*inner {
+            Inner::Read(t) => &t.dat.desc.keywords,
+            Inner::Write { wt, .. } => &wt.desc().keywords,
         };
-        let rec = core::record::parse_json_record(&json).map_err(err)?;
-        Ok(convert::table_record_to_dict(py, &rec)?.into_any().unbind())
+        let base = std::path::Path::new(&self.path)
+            .parent()
+            .map(|p| p.to_path_buf());
+        Ok(convert::table_record_to_dict_ctx(py, rec, base.as_deref())?
+            .into_any()
+            .unbind())
     }
 
     /// `getcolkeywords(column)` -> dict.
     fn getcolkeywords(&self, py: Python<'_>, column: &str) -> PyResult<Py<PyAny>> {
         let d = PyDict::new(py);
         let desc = self.desc();
+        let base = std::path::Path::new(&self.path)
+            .parent()
+            .map(|p| p.to_path_buf());
         if let Some(col) = desc.columns.iter().find(|c| c.name == column) {
-            return Ok(convert::table_record_to_dict(py, &col.keywords)?
-                .into_any()
-                .unbind());
+            return Ok(
+                convert::table_record_to_dict_ctx(py, &col.keywords, base.as_deref())?
+                    .into_any()
+                    .unbind(),
+            );
         }
         Ok(d.into_any().unbind())
     }
@@ -488,6 +498,22 @@ impl Table {
         let col_idx = self.col_index(column)?;
         let v = self.read_cell(col_idx, row)?;
         if let RecordValue::Array(a) = &v {
+            // Variable-ndim array columns: casacore's getcell returns the cell
+            // with the leading row singleton stripped (getvarcol keeps it).
+            let varcol = self
+                .desc()
+                .columns
+                .get(col_idx)
+                .map(|c| {
+                    matches!(c.kind, core::tabledesc::ColumnKind::Array)
+                        && c.shape.as_deref().is_none_or(|s| s.is_empty())
+                })
+                .unwrap_or(false);
+            if varcol && !a.shape.is_empty() && a.shape[0] == 1 {
+                let mut trimmed = a.clone();
+                trimmed.shape.remove(0);
+                return convert::array_to_ndarray(py, &trimmed);
+            }
             return convert::array_to_ndarray(py, a);
         }
         convert::cell_to_py(py, &v)
@@ -616,7 +642,7 @@ impl Table {
                     desc.columns[col_idx].kind,
                     core::tabledesc::ColumnKind::Array
                 );
-                let mut cells = self.value_to_cells(py, col_idx, &v, 1, is_array_col)?;
+                let mut cells = self.value_to_cells(py, col_idx, &v, 1, is_array_col, true)?;
                 let rec = cells.pop().unwrap_or(RecordValue::Int(0));
                 self.put_cell(col_idx, row, rec)?;
                 let _ = i;
@@ -633,7 +659,7 @@ impl Table {
             desc.columns[col_idx].kind,
             core::tabledesc::ColumnKind::Array
         );
-        let values = self.value_to_cells(py, col_idx, value, nrow, is_array_col)?;
+        let values = self.value_to_cells(py, col_idx, value, nrow, is_array_col, false)?;
         for (i, v) in values.into_iter().enumerate() {
             self.put_cell(col_idx, startrow + i as u64, v)?;
         }
@@ -684,7 +710,7 @@ impl Table {
         let first_n = sorted.first().map(|x| x.0).unwrap_or(1);
         for (n, v) in sorted {
             let row = startrow + (n - first_n);
-            let mut cells = self.value_to_cells(py, col_idx, &v, 1, is_array_col)?;
+            let mut cells = self.value_to_cells(py, col_idx, &v, 1, is_array_col, true)?;
             let rec = cells.pop().unwrap_or(RecordValue::Int(0));
             self.put_cell(col_idx, row, rec)?;
         }
@@ -901,7 +927,12 @@ impl Table {
     fn _getdesc(&self, py: Python<'_>, actual: bool) -> PyResult<Py<PyAny>> {
         let _ = actual;
         let desc = self.desc();
-        Ok(desc_to_pydict(py, &desc)?.into_any().unbind())
+        let base = std::path::Path::new(&self.path)
+            .parent()
+            .map(|p| p.to_path_buf());
+        Ok(desc_to_pydict(py, &desc, base.as_deref())?
+            .into_any()
+            .unbind())
     }
 
     fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
@@ -992,6 +1023,7 @@ impl Table {
         value: &Bound<'_, PyAny>,
         nrow: u64,
         is_array_col: bool,
+        varcol: bool,
     ) -> PyResult<Vec<RecordValue>> {
         if is_array_col {
             // Accept a 2-D+ ndarray or a list of row-arrays.
@@ -1025,47 +1057,51 @@ impl Table {
             // Numeric ndarray.
             if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<f64>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, RecordValue::Double);
+                return ndarray_cells(&readonly, nrow, varcol, RecordValue::Double);
             }
             if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<f32>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, RecordValue::Float);
+                return ndarray_cells(&readonly, nrow, varcol, RecordValue::Float);
             }
             if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<u8>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, RecordValue::UChar);
+                return ndarray_cells(&readonly, nrow, varcol, RecordValue::UChar);
             }
             if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<i16>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, RecordValue::Short);
+                return ndarray_cells(&readonly, nrow, varcol, RecordValue::Short);
             }
             if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<u32>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, RecordValue::UInt);
+                return ndarray_cells(&readonly, nrow, varcol, RecordValue::UInt);
             }
             if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<u16>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, RecordValue::UShort);
+                return ndarray_cells(&readonly, nrow, varcol, RecordValue::UShort);
             }
             if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<i64>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, RecordValue::Int64);
+                return ndarray_cells(&readonly, nrow, varcol, RecordValue::Int64);
             }
             if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<i32>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, RecordValue::Int);
+                return ndarray_cells(&readonly, nrow, varcol, RecordValue::Int);
             }
             if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<bool>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, RecordValue::Bool);
+                return ndarray_cells(&readonly, nrow, varcol, RecordValue::Bool);
             }
             if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<Complex32>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, |e| RecordValue::Complex(e.re, e.im));
+                return ndarray_cells(&readonly, nrow, varcol, |e| {
+                    RecordValue::Complex(e.re, e.im)
+                });
             }
             if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<Complex64>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, |e| RecordValue::DComplex(e.re, e.im));
+                return ndarray_cells(&readonly, nrow, varcol, |e| {
+                    RecordValue::DComplex(e.re, e.im)
+                });
             }
             return Err(PyTypeError::new_err(format!(
                 "putcol: unsupported array data {}",
@@ -1155,16 +1191,19 @@ fn reshape_cell(shape: &[usize]) -> usize {
 fn ndarray_cells<T: numpy::Element + Copy>(
     arr: &numpy::PyReadonlyArrayDyn<'_, T>,
     nrow: u64,
+    varcol: bool,
     f: impl Fn(T) -> RecordValue,
 ) -> PyResult<Vec<RecordValue>> {
     let shape: Vec<usize> = arr.as_array().shape().to_vec();
     if shape.is_empty() {
         return Ok(Vec::new());
     }
-    let cell = shape.iter().skip(1).product::<usize>().max(1);
+    // `putcol` arrays are (nrow, *cell) so the cell shape drops the first
+    // dim; `putvarcol` values are full per-row cells (keep the whole shape).
+    let cell_shape: &[usize] = if varcol { &shape } else { &shape[1..] };
+    let cell = cell_shape.iter().product::<usize>().max(1);
     let flat = arr.as_array();
-    // Cells are stored as given (the shape the caller supplied).
-    let casa_shape: Vec<u32> = shape[1..].iter().map(|&s| s as u32).collect();
+    let casa_shape: Vec<u32> = cell_shape.iter().map(|&s| s as u32).collect();
     let mut out = Vec::with_capacity(nrow.min(flat.len() as u64) as usize);
     for r in 0..nrow as usize {
         let start = r * cell;
@@ -1298,8 +1337,9 @@ fn array_data_of(elems: &[RecordValue]) -> core::record::ArrayData {
 
 /// Build the python-casacore `getcoldesc` dict for a column.
 fn self_coldesc<'py>(
-    col: &core::tabledesc::ColumnDesc,
     py: Python<'py>,
+    col: &core::tabledesc::ColumnDesc,
+    _base: Option<&std::path::Path>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     let vt = ::casacure::casa_value_type(col.data_type);
@@ -1614,18 +1654,19 @@ fn zero_record(dt: &core::record::DataType) -> RecordValue {
 pub(crate) fn desc_to_pydict<'py>(
     py: Python<'py>,
     desc: &core::tabledesc::TableDesc,
+    base: Option<&std::path::Path>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     for col in &desc.columns {
-        d.set_item(&col.name, self_coldesc(col, py)?)?;
+        d.set_item(&col.name, self_coldesc(py, col, base)?.into_any())?;
     }
     d.set_item(
         "_keywords_",
-        convert::table_record_to_dict(py, &desc.keywords)?,
+        convert::table_record_to_dict_ctx(py, &desc.keywords, base)?,
     )?;
     d.set_item(
         "_private_keywords_",
-        convert::table_record_to_dict(py, &desc.private_keywords)?,
+        convert::table_record_to_dict_ctx(py, &desc.private_keywords, base)?,
     )?;
     let empty = PyDict::new(py);
     d.set_item("_define_hypercolumn_", empty)?;

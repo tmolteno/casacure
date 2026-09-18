@@ -319,6 +319,28 @@ subtasks are moved here.
     bit-packing Bool (bits=1) which overflowed wide bool tables — fixed;
   - **empty array cells** (null/offset-0 references casacore writes) read as
     empty arrays instead of erroring — unblocked write-back of real MS files.
+- **dask-ms suite green**: the full dask-ms 0.2.32 test run via the
+  `casacore.tables` shim now passes **104 combined** (test_table_proxy 14/14,
+  test_dataset 33/33 incl. `test_write_dict_data`/`test_row_grouping`,
+  test_dataset_keywords 10/10, ordering/table/columns). Fixes that closed the
+  last gaps:
+  - **`putvarcol` varcol semantics**: dict values are full per-row cells, so
+    the leading dimension is kept (putcol still drops the row dim) — matches
+    casacore's getvarcol `(1,n,...)` returning cells and the `(1,n)` write
+    requirement; value-mismatch in `test_write_dict_data` gone.
+  - **`taql CREATE ... [NDIM=n]`** creates a *variable* array column
+    (previously only `SHAPE=[...]` did; bare `[NDIM=1]` wrongly made a scalar);
+    the table.dat desciption now records the declared `ndim` for variable
+    columns (was 0). Matches real casacore's getcoldesc (`ndim`, `_c_order`).
+  - **`getcell` on a variable array column strips the leading row singleton**
+    (casacore returns the exemplar without the while-storage `1`); `getvarcol`
+    keeps it — fixed the ndim/exemplar mismatch that dropped CHAN_FREQ in
+    `test_row_grouping`.
+  - **keyword dict stability**: `getkeywords`/`getcolkeywords`/`_getdesc`
+    build the dict directly from the `TableRecord` (no JSON float round-trip,
+    so `MS_VERSION` stays a float) and resolve `TpTable` fields to
+    `"Table: <abs-path>"` like python-casacore (`test_dataset_keywords` 10/10).
+
 - `table` module: `parse_table_header` parses the `table.dat` root object
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit

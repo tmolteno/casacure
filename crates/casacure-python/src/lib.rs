@@ -93,7 +93,7 @@ fn default_ms_subtable(
 fn required_ms_desc(py: Python<'_>, name: Option<String>) -> PyResult<Py<PyAny>> {
     let desc = ::casacure::ms::required_ms_desc(name.as_deref())
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(table::desc_to_pydict(py, &desc)?.into_any().unbind())
+    Ok(table::desc_to_pydict(py, &desc, None)?.into_any().unbind())
 }
 
 /// `complete_ms_desc(name=None)` -> the descriptor dict.
@@ -102,7 +102,7 @@ fn required_ms_desc(py: Python<'_>, name: Option<String>) -> PyResult<Py<PyAny>>
 fn complete_ms_desc(py: Python<'_>, name: Option<String>) -> PyResult<Py<PyAny>> {
     let desc = ::casacure::ms::complete_ms_desc(name.as_deref())
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(table::desc_to_pydict(py, &desc)?.into_any().unbind())
+    Ok(table::desc_to_pydict(py, &desc, None)?.into_any().unbind())
 }
 
 /// The `tables` submodule (drop-in for `casacore.tables`).

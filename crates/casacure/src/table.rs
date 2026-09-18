@@ -852,17 +852,19 @@ impl Table {
         s.push(',');
         s.push_str(&kv("comment", &json(&cd.comment)));
         if matches!(cd.kind, crate::tabledesc::ColumnKind::Array) {
+            s.push(',');
+            s.push_str(&format!("\"ndim\":{}", cd.ndim.max(0)));
             if let Some(shape) = &cd.shape {
-                s.push(',');
-                s.push_str(&format!("\"ndim\":{}", shape.len()));
-                s.push_str(",\"shape\":[");
-                for (i, d) in shape.iter().rev().enumerate() {
-                    if i > 0 {
-                        s.push(',');
+                if !shape.is_empty() {
+                    s.push_str(",\"shape\":[");
+                    for (i, d) in shape.iter().rev().enumerate() {
+                        if i > 0 {
+                            s.push(',');
+                        }
+                        s.push_str(&d.to_string());
                     }
-                    s.push_str(&d.to_string());
+                    s.push_str("],\"_c_order\":true");
                 }
-                s.push_str("],\"_c_order\":true");
             }
         }
         s.push(',');
