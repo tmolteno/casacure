@@ -94,7 +94,10 @@ jobs:
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: dist-${{ matrix.target }}-${{ matrix.python || 'ml' }}
+          # Same artifact name over all matrix jobs: GitHub merges same-name
+          # uploads into ONE artifact (concurrent-upload merge, not the
+          # download-side 'merge-multiple' that corrupts files).
+          name: dist
           path: dist
           if-no-files-found: error
 
@@ -112,8 +115,9 @@ jobs:
       - name: Download all wheels
         uses: actions/download-artifact@v4
         with:
-          pattern: dist-*
-          merge-multiple: true
+          # Single merged artifact: a plain download (no pattern /
+          # merge-multiple) so wheel bytes are untouched.
+          name: dist
           path: dist
       - name: Publish to PyPI (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
