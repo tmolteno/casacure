@@ -738,3 +738,57 @@ impl TableFixture {
         m.tables[name].clone()
     }
 }
+
+/// `Table::getcoldesc`/`getdesc`/`getkeywords`/`getcolkeywords` return the
+/// exact dicts python-casacore produces (valueType names, logical shapes,
+/// `_c_order`, keyword records).
+#[test]
+fn fixture_metadata_and_keywords_match_casacore() {
+    let Some(manifest) = load_manifest() else {
+        return;
+    };
+    let fixtures_dir = manifest_path().parent().unwrap().to_path_buf();
+
+    // typed: scalar coldesc (int) valueType "int".
+    let dir = fixtures_dir.join(&manifest.tables["typed"].path);
+    let t = casacure::Table::open(&dir, true).unwrap();
+    let i4 = t.colnames().iter().position(|c| c == "COL_I4").unwrap();
+    assert_eq!(
+        t.getcoldesc(i4).expect("coldesc"),
+        r#"{"valueType":"int","dataManagerType":"StandardStMan","dataManagerGroup":"StandardStMan","option":0,"maxlen":0,"comment":"","keywords":{}}"#
+    );
+
+    // array: array coldesc with logical shape + _c_order.
+    let dir = fixtures_dir.join(&manifest.tables["array"].path);
+    let t = casacure::Table::open(&dir, true).unwrap();
+    let arr = t.colnames().iter().position(|c| c == "ARR").unwrap();
+    assert_eq!(
+        t.getcoldesc(arr).expect("coldesc"),
+        r#"{"valueType":"complex","dataManagerType":"StandardStMan","dataManagerGroup":"StandardStMan","option":4,"maxlen":0,"comment":"","ndim":2,"shape":[2,3],"_c_order":true,"keywords":{}}"#
+    );
+
+    // kw: table + column keywords incl. a nested record.
+    let dir = fixtures_dir.join(&manifest.tables["kw"].path);
+    let t = casacure::Table::open(&dir, true).unwrap();
+    assert_eq!(
+        t.getkeywords(),
+        r#"{"VER":"1.0","MAXROWS":1000,"NEST":{"HH":{"II":5},"S":"x"}}"#
+    );
+    assert_eq!(
+        t.getcolkeywords(0).expect("colkeywords"),
+        r#"{"UNITS":"Jy","MULTI":3}"#
+    );
+    // getdesc: columns + the three special keys.
+    let desc = t.getdesc();
+    assert!(
+        desc.contains(r#""A":{"valueType":"int","dataManagerType":"StandardStMan","dataManagerGroup":"StandardStMan","option":0,"maxlen":0,"comment":"","keywords":{"UNITS":"Jy","MULTI":3}}"#),
+        "getdesc column part: {desc}"
+    );
+    assert!(
+        desc.contains(
+            r#""_keywords_":{"VER":"1.0","MAXROWS":1000,"NEST":{"HH":{"II":5},"S":"x"}}"#
+        ),
+        "getdesc keywords part: {desc}"
+    );
+    assert!(desc.contains(r#""_private_keywords_":{}"#));
+}

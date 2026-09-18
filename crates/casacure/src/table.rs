@@ -790,6 +790,120 @@ impl Table {
             .map(|c| c.name.clone())
             .collect()
     }
+
+    /// The column descriptor as a JSON object matching python-casacore's
+    /// `table.getcoldesc(col)` (valueType / dataManagerType /
+    /// dataManagerGroup / option / maxlen / comment, plus ndim / logical
+    /// `shape` / `_c_order` for array columns, then `keywords`).
+    pub fn getcoldesc(&self, col_idx: usize) -> Option<String> {
+        let cd = self.dat.desc.columns.get(col_idx)?;
+        let mut s = String::new();
+        s.push('{');
+        s.push_str(&kv("valueType", &json(casa_value_type(cd.data_type))));
+        s.push(',');
+        s.push_str(&kv("dataManagerType", &json(&cd.data_manager_type)));
+        s.push(',');
+        s.push_str(&kv("dataManagerGroup", &json(&cd.data_manager_group)));
+        s.push(',');
+        s.push_str(&format!("\"option\":{}", cd.options));
+        s.push(',');
+        s.push_str(&format!("\"maxlen\":{}", cd.max_length));
+        s.push(',');
+        s.push_str(&kv("comment", &json(&cd.comment)));
+        if matches!(cd.kind, crate::tabledesc::ColumnKind::Array) {
+            if let Some(shape) = &cd.shape {
+                s.push(',');
+                s.push_str(&format!("\"ndim\":{}", shape.len()));
+                s.push_str(",\"shape\":[");
+                for (i, d) in shape.iter().rev().enumerate() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    s.push_str(&d.to_string());
+                }
+                s.push_str("],\"_c_order\":true");
+            }
+        }
+        s.push(',');
+        s.push_str(&kv("keywords", &cd.keywords.to_json_string()));
+        s.push('}');
+        Some(s)
+    }
+
+    /// The full table description (python-casacore `table.getdesc()`): one
+    /// column descriptor per column, plus `_define_hypercolumn_`,
+    /// `_keywords_`, and `_private_keywords_`.
+    pub fn getdesc(&self) -> String {
+        let mut s = String::from("{");
+        for (i, cd) in self.dat.desc.columns.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&json(&cd.name));
+            s.push(':');
+            s.push_str(&self.getcoldesc(i).unwrap_or_default());
+        }
+        s.push_str(",\"_define_hypercolumn_\":{},\"_keywords_\":");
+        s.push_str(&self.dat.desc.keywords.to_json_string());
+        s.push_str(",\"_private_keywords_\":");
+        s.push_str(&self.dat.desc.private_keywords.to_json_string());
+        s.push('}');
+        s
+    }
+
+    /// The table keyword record as a JSON object (python-casacore
+    /// `table.getkeywords()`).
+    pub fn getkeywords(&self) -> String {
+        self.dat.desc.keywords.to_json_string()
+    }
+
+    /// A column's keyword record as a JSON object (python-casacore
+    /// `table.getcolkeywords(col)`).
+    pub fn getcolkeywords(&self, col_idx: usize) -> Option<String> {
+        self.dat
+            .desc
+            .columns
+            .get(col_idx)
+            .map(|c| c.keywords.to_json_string())
+    }
+}
+
+fn kv(key: &str, value: &str) -> String {
+    format!("\"{key}\":{value}")
+}
+
+fn json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// python-casacore `valueType` names.
+fn casa_value_type(dt: crate::record::DataType) -> &'static str {
+    use crate::record::DataType;
+    match dt {
+        DataType::Bool => "boolean",
+        DataType::Char | DataType::UChar => "uchar",
+        DataType::Short => "short",
+        DataType::UShort => "ushort",
+        DataType::Int => "int",
+        DataType::UInt => "uint",
+        DataType::Int64 => "int64",
+        DataType::Float => "float",
+        DataType::Double => "double",
+        DataType::Complex => "complex",
+        DataType::DComplex => "dcomplex",
+        DataType::String => "string",
+        _ => "unknown",
+    }
 }
 
 /// Errors from the column-access (§3) read API.

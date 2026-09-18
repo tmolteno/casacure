@@ -35,10 +35,10 @@ Work areas follow `CASACORE_TO_CASA_RS.md` (tracked as GitHub issues).
 
 ## 4. Metadata and descriptors
 
-- [ ] `nrows`, `colnames`, `getcoldesc`
-- [ ] Table keywords: `getkeywords`/`putkeywords`/`removekeyword` (nested records)
-- [ ] Column keywords: `getcolkeywords`/`putcolkeyword`/`removecolkeyword`
-- [ ] Public table-description dict API (replaces private `_getdesc`)
+- [X] `nrows`, `colnames`, `getcoldesc`
+- [ ] Table keywords: `putkeywords`/`removekeyword` (getkeywords read done; write pending)
+- [ ] Column keywords: `putcolkeyword`/`removecolkeyword` (getcolkeywords read done)
+- [X] Public table-description dict API (`Table::getdesc`; replaces private `_getdesc`)
 - [ ] Subtable linkage via `"Table: <path>"` keywords
 
 ## 5. TaQL subset

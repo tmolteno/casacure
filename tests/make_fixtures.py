@@ -223,6 +223,34 @@ def make_tsm_table(fixtures: Path) -> dict:
         }
 
 
+def make_keyword_table(fixtures: Path) -> dict:
+    """A table with table and column keywords (nested records) — metadata
+    round-trip ground truth."""
+    path = fixtures / "kw.tab"
+    scd = ct.makescacoldesc("A", 0)
+    td = ct.maketabdesc([scd])
+    nrow = 1
+    with ct.table(str(path), td, nrow=nrow, ack=False) as t:
+        t.putkeyword("VER", "1.0")
+        t.putkeyword("MAXROWS", 1000)
+        t.putkeyword("NEST", {"HH": {"II": 5}, "S": "x"})
+        t.putcolkeyword("A", "UNITS", "Jy")
+        t.putcolkeyword("A", "MULTI", 3)
+        return {
+            "path": path.name,
+            "nrows": nrow,
+            "big_endian": sys.byteorder == "big",
+            "keywords": {k: v for k, v in t.getkeywords().items()},
+            "colkeywords": dict(t.getcolkeywords("A")),
+            "columns": {
+                "A": {
+                    "value_type": t.getcoldesc("A")["valueType"],
+                    "getcol_dtype": t.getcol("A").dtype.str,
+                }
+            },
+        }
+
+
 def main() -> None:
     if FIXTURES.exists():
         shutil.rmtree(FIXTURES)
@@ -237,6 +265,7 @@ def main() -> None:
             "longstr": make_long_string_table(FIXTURES),
             "ism": make_ism_table(FIXTURES),
             "tsm": make_tsm_table(FIXTURES),
+            "kw": make_keyword_table(FIXTURES),
         },
     }
     (FIXTURES / "manifest.json").write_text(json.dumps(manifest, indent=2))

@@ -665,6 +665,113 @@ fn write_iposition(w: &mut crate::aipsio::Writer, dims: &[i64]) {
     w.put_object_end();
 }
 
+/// JSON serialization for the metadata API (keywords, column descriptors).
+/// Numbers use Rust's `{}` formatting; floats are emitted as e.g. `1.5`.
+impl RecordValue {
+    /// The value as a JSON fragment (matching the dict values python-casacore
+    /// returns: bools, integers, floats, strings, nested records, arrays).
+    pub fn to_json_string(&self) -> String {
+        match self {
+            RecordValue::Bool(b) => b.to_string(),
+            RecordValue::UChar(u) => u.to_string(),
+            RecordValue::Short(i) => i.to_string(),
+            RecordValue::UShort(u) => u.to_string(),
+            RecordValue::Int(i) => i.to_string(),
+            RecordValue::UInt(u) => u.to_string(),
+            RecordValue::Int64(i) => i.to_string(),
+            RecordValue::Float(f) => format_float(*f),
+            RecordValue::Double(d) => format_float(*d),
+            RecordValue::Complex(re, im) => {
+                format!("[{}, {}]", format_float(*re), format_float(*im))
+            }
+            RecordValue::DComplex(re, im) => {
+                format!("[{}, {}]", format_float(*re), format_float(*im))
+            }
+            RecordValue::String(s) => json_string(s),
+            RecordValue::Table(name) => json_string(name),
+            RecordValue::Record(r) => r.to_json_string(),
+            RecordValue::Array(a) => {
+                let mut s = String::from("{\"shape\":[");
+                for (i, d) in a.shape.iter().enumerate() {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    s.push_str(&d.to_string());
+                }
+                s.push_str("],\"array\":[");
+                let mut first = true;
+                for v in array_data_flat(&a.data).iter() {
+                    if !first {
+                        s.push(',');
+                    }
+                    first = false;
+                    s.push_str(v);
+                }
+                s.push_str("]}");
+                s
+            }
+        }
+    }
+}
+
+/// The flat element JSON fragments of an `ArrayData`.
+pub fn array_data_flat(data: &ArrayData) -> Vec<String> {
+    match data {
+        ArrayData::Bool(v) => v.iter().map(|b| b.to_string()).collect(),
+        ArrayData::UChar(v) => v.iter().map(|x| x.to_string()).collect(),
+        ArrayData::Short(v) => v.iter().map(|x| x.to_string()).collect(),
+        ArrayData::UShort(v) => v.iter().map(|x| x.to_string()).collect(),
+        ArrayData::Int(v) => v.iter().map(|x| x.to_string()).collect(),
+        ArrayData::UInt(v) => v.iter().map(|x| x.to_string()).collect(),
+        ArrayData::Int64(v) => v.iter().map(|x| x.to_string()).collect(),
+        ArrayData::Float(v) => v.iter().map(|x| format_float(*x)).collect(),
+        ArrayData::Double(v) => v.iter().map(|x| format_float(*x)).collect(),
+        ArrayData::Complex(v) => v
+            .iter()
+            .map(|(re, im)| format!("[{}, {}]", format_float(*re), format_float(*im)))
+            .collect(),
+        ArrayData::DComplex(v) => v
+            .iter()
+            .map(|(re, im)| format!("[{}, {}]", format_float(*re), format_float(*im)))
+            .collect(),
+        ArrayData::String(v) => v.iter().map(|x| json_string(x)).collect(),
+    }
+}
+
+fn format_float<F: Into<f64>>(f: F) -> String {
+    format!("{}", f.into())
+}
+
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+impl TableRecord {
+    /// The record as a JSON object `{"key": value, ...}` in field order.
+    pub fn to_json_string(&self) -> String {
+        let mut s = String::from("{");
+        for (i, (field, value)) in self.desc.fields.iter().zip(self.values.iter()).enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&json_string(&field.name));
+            s.push(':');
+            s.push_str(&value.to_json_string());
+        }
+        s.push('}');
+        s
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
