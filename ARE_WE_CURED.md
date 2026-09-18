@@ -23,6 +23,7 @@ Which packages that depend on casacore can run on casacure.
 | **python-casacore** 3.8.1 | the interface casacure mirrors (`casacore.tables`) | **interface-compatible** | `casacure.tables` is a drop-in replacement; the type-system comparison (`tests/test_types_compat.py`) passes 5/5 against real python-casacore |
 | **casacore** (C++ library) | owns the on-disk table / MS format | **byte-compatible** | write / read round-trips both directions (casacure → casacore and casacore → casacure → casacore), incl. a full MS (main table + subtables) and multi-manager tables (SSM + ISM + TSM) |
 | **DDFacet** | `pyrap.tables` for its MS data path | **API-compatible (tables surface)** | survey of `../DDFacet` shows its load-bearing casacore use is the tables API — `getcol`/`putcol`/`addcols`/`getcoldesc`/`colnames`/`nrows`/`getkeyword`/`query`/`sort`/`getcolslice` — all provided by casacure; the `t.query(...).sort('TIME')` pattern (ClassMS) is exercised directly |
+| **killMS** | `pyrap.tables` for the calibration / visibility data path | **compatible** | survey of `../killMS` — its casacore surface is the tables API only (`getcol`/`putcol`/`colnames`/`getcoldesc`/`addcols`/`getkeyword`/`query`/`getkeywords`/`putkeyword`/`nrows`/`flush`/`close`), all provided by casacure (incl. the `t.query(TaQL)` pattern in ClassMS); `pyrap.images` appears only in the `Simul/MakeModelImage` utility and `astropy` is used in the Weights modules — no CASA image subsystem required |
 
 ### How compatibility is achieved
 
