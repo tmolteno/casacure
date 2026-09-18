@@ -377,6 +377,17 @@ subtasks are moved here.
     regenerated from real casacore with correct `ndim`/`_c_order` on all
     array columns.
 
+- **upstream store-dispatch prototype validated**: an env-gated
+  `DASK_MS_BACKEND=casacure` alias in dask-ms (`casacore.tables` ->
+  `casacure.tables` via `sys.modules`) lets dask-ms use casacure **directly,
+  without the `casacore` shim**; the full dask-ms 0.2.32 suite passes
+  219/219 that way. The change is ~10 lines in `daskms/__init__.py`; the
+  remaining work is submitting it upstream.
+- **real-casacore interop verified end-to-end**: python-casacore creates an MS
+  (with `addcols` DATA); dask-ms reads it through the shim, doubles DATA /
+  bumps TIME, writes back; real python-casacore re-opens the result and reads
+  back the exact modified values with all 22 main-table columns intact.
+
 - `table` module: `parse_table_header` parses the `table.dat` root object
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit

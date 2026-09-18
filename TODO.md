@@ -59,5 +59,10 @@ Work areas follow `CASACORE_TO_CASA_RS.md` (tracked as GitHub issues).
 ## 7. dask-ms integration
 
 - [X] Cross-implementation round-trip gate (Rust-write → casacore-read and vice versa)
-- [~] Full dask-ms test suite passing against casacure — dask-ms 0.2.32's own tests via the `casacore.tables` shim: **test_table_proxy 14/14; ~82 combined across proxy/ordering/table/columns/dataset**, incl. `test_dataset_multidim_string_column`; MS lifecycle + example_ms work end-to-end (`tests/daskms_smoke.py`). Added: chunked `putcolslice`, dict-form putcol (incl. numpy scalars and `{"shape","array"}` multidim strings split per row), logical-orientation fixed defaults, SSM multidim **string-array** cells (read+write via string buckets). Added: `addcols` (append columns to writable tables, incl. TiledColumnStMan layouts), TSM Bool tiles, Bool scalar storage verified as byte-per-row (bucket layout was wrongly bit-packing — fixed). Remaining: upstream dask-ms store dispatch (the `casacore.tables` shim already runs dask-ms's own suite green: 219 passed).
+- [~] Full dask-ms test suite passing against casacure — dask-ms 0.2.32's own tests via the `casacore.tables` shim: **test_table_proxy 14/14; ~82 combined across proxy/ordering/table/columns/dataset**, incl. `test_dataset_multidim_string_column`; MS lifecycle + example_ms work end-to-end (`tests/daskms_smoke.py`). Added: chunked `putcolslice`, dict-form putcol (incl. numpy scalars and `{"shape","array"}` multidim strings split per row), logical-orientation fixed defaults, SSM multidim **string-array** cells (read+write via string buckets). Added: `addcols` (append columns to writable tables, incl. TiledColumnStMan layouts), TSM Bool tiles, Bool scalar storage verified as byte-per-row (bucket layout was wrongly bit-packing — fixed). Upstream store dispatch — VALIDATED by a prototype: an env-gated
+`DASK_MS_BACKEND=casacure` alias in dask-ms's `__init__` routes `casacore.tables`
+to `casacure.tables`, and the full dask-ms 0.2.32 suite passes 219/219 with
+**no shim** (only `casacure` on the path). Remaining: submit that small backend
+selection patch to dask-ms upstream (real python-casacore, when installed,
+still wins by default).
 - [ ] Register as a store type in `fsspec_store.py`/`dask_ms.py` dispatch (upstream, later)
