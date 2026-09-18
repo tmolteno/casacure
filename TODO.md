@@ -52,9 +52,9 @@ Work areas follow `CASACORE_TO_CASA_RS.md` (tracked as GitHub issues).
 
 ## 6. MS schema / descriptors
 
-- [ ] Vendor canonical `required_ms_desc`/`complete_ms_desc` dicts as data (MS + 18 subtables)
-- [ ] `default_ms(path, tabdesc, dminfo)` with full subtable tree + keyword linkage
-- [ ] `default_ms_subtable`, `maketabdesc` (tests)
+- [X] Vendor canonical `required_ms_desc`/`complete_ms_desc` dicts as data (MS + 17 subtables)
+- [X] `default_ms(path, tabdesc, dminfo)` with full subtable tree + keyword linkage
+- [X] `default_ms_subtable`, `maketabdesc` (tests)
 
 ## 7. dask-ms integration
 

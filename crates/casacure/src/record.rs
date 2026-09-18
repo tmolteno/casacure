@@ -620,10 +620,13 @@ pub(crate) fn write_table_record(
     for field in &record.desc.fields {
         match field.data_type {
             dt if dt.is_array() => {
-                return Err(RecordError::LegacyKeywordSet(format!(
-                    "array field {}",
-                    field.name
-                )));
+                let Some(RecordValue::Array(a)) = record.get(&field.name) else {
+                    return Err(RecordError::LegacyKeywordSet(format!(
+                        "missing array value for {}",
+                        field.name
+                    )));
+                };
+                write_array_value(w, &a.shape, &a.data);
             }
             DataType::Record => {
                 let Some(RecordValue::Record(sub)) = record.get(&field.name) else {
@@ -645,6 +648,103 @@ pub(crate) fn write_table_record(
     }
     w.put_object_end(); // TableRecord
     Ok(())
+}
+
+/// Serialize a framed `"Array<...>"` v3 object (casacore `ArrayIO`),
+/// the inverse of `read_array`.
+pub fn write_array_value(w: &mut crate::aipsio::Writer, shape: &[u32], data: &ArrayData) {
+    let nelem = match data {
+        ArrayData::Bool(v) => v.len(),
+        ArrayData::UChar(v) => v.len(),
+        ArrayData::Short(v) => v.len(),
+        ArrayData::UShort(v) => v.len(),
+        ArrayData::Int(v) => v.len(),
+        ArrayData::UInt(v) => v.len(),
+        ArrayData::Int64(v) => v.len(),
+        ArrayData::Float(v) => v.len(),
+        ArrayData::Double(v) => v.len(),
+        ArrayData::Complex(v) => v.len(),
+        ArrayData::DComplex(v) => v.len(),
+        ArrayData::String(v) => v.len(),
+    };
+    w.put_object_start("Array<void>", 3);
+    w.put_u32(shape.len() as u32);
+    for d in shape {
+        w.put_u32(*d);
+    }
+    w.put_u32(nelem as u32);
+    match data {
+        ArrayData::Bool(v) => {
+            // Bit-packed, LSB first.
+            let mut packed = vec![0u8; v.len().div_ceil(8)];
+            for (i, b) in v.iter().enumerate() {
+                if *b {
+                    packed[i / 8] |= 1 << (i % 8);
+                }
+            }
+            for byte in packed {
+                w.put_u8(byte);
+            }
+        }
+        ArrayData::UChar(v) => {
+            for x in v {
+                w.put_u8(*x);
+            }
+        }
+        ArrayData::Short(v) => {
+            for x in v {
+                w.put_i16(*x);
+            }
+        }
+        ArrayData::UShort(v) => {
+            for x in v {
+                w.put_u16(*x);
+            }
+        }
+        ArrayData::Int(v) => {
+            for x in v {
+                w.put_i32(*x);
+            }
+        }
+        ArrayData::UInt(v) => {
+            for x in v {
+                w.put_u32(*x);
+            }
+        }
+        ArrayData::Int64(v) => {
+            for x in v {
+                w.put_i64(*x);
+            }
+        }
+        ArrayData::Float(v) => {
+            for x in v {
+                w.put_f32(*x);
+            }
+        }
+        ArrayData::Double(v) => {
+            for x in v {
+                w.put_f64(*x);
+            }
+        }
+        ArrayData::Complex(v) => {
+            for (re, im) in v {
+                w.put_f32(*re);
+                w.put_f32(*im);
+            }
+        }
+        ArrayData::DComplex(v) => {
+            for (re, im) in v {
+                w.put_f64(*re);
+                w.put_f64(*im);
+            }
+        }
+        ArrayData::String(v) => {
+            for s in v {
+                w.put_string(s);
+            }
+        }
+    }
+    w.put_object_end();
 }
 
 /// Write just the record-description object (for nested sub-records).
@@ -685,6 +785,9 @@ fn write_record_data_values(
                 } else {
                     write_record_data_values(w, sub)?;
                 }
+            }
+            RecordValue::Array(a) if field.data_type.is_array() => {
+                write_array_value(w, &a.shape, &a.data);
             }
             _ => write_scalar_value(w, field.data_type, value),
         }
@@ -929,6 +1032,367 @@ impl TableRecord {
         s
     }
 }
+/// Parse a JSON object into a `TableRecord` (`{"name": value, ...}`).
+/// This is the inverse of `TableRecord::to_json_string`: it reconstructs the
+/// typed keyword/descriptor structures from the dict representation
+/// python-casacore produces (used for the vendored MS schemas and for
+/// accepting dict inputs in the bindings layer).
+pub fn parse_json_record(input: &str) -> Result<TableRecord, RecordError> {
+    let mut p = JsonParser {
+        bytes: input.as_bytes(),
+        pos: 0,
+    };
+    p.skip_ws();
+    let (desc, values) = p.parse_object()?;
+    p.skip_ws();
+    if p.pos < p.bytes.len() {
+        return Err(RecordError::LegacyKeywordSet(
+            "trailing JSON after object".into(),
+        ));
+    }
+    Ok(TableRecord {
+        desc,
+        record_type: 0,
+        values,
+    })
+}
+
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn skip_ws(&mut self) {
+        while self.pos < self.bytes.len() && (self.bytes[self.pos] as char).is_whitespace() {
+            self.pos += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn expect(&mut self, c: u8) -> Result<(), RecordError> {
+        let got = self.peek().ok_or_else(|| {
+            RecordError::LegacyKeywordSet(format!("JSON: expected `{}`, found end", c as char))
+        })?;
+        if got != c {
+            return Err(RecordError::LegacyKeywordSet(format!(
+                "JSON: expected `{}`, found `{}`",
+                c as char, got as char
+            )));
+        }
+        self.pos += 1;
+        Ok(())
+    }
+
+    fn parse_object(&mut self) -> Result<(RecordDesc, Vec<RecordValue>), RecordError> {
+        self.expect(b'{')?;
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return Ok((RecordDesc { fields: Vec::new() }, Vec::new()));
+        }
+        let mut desc = RecordDesc { fields: Vec::new() };
+        let mut values = Vec::new();
+        loop {
+            self.skip_ws();
+            let name = self.parse_string()?;
+            self.skip_ws();
+            self.expect(b':')?;
+            self.skip_ws();
+            let (dt, sub_desc, value) = self.parse_value()?;
+            desc.fields.push(RecordDescField {
+                name,
+                data_type: dt,
+                sub_desc,
+                shape: None,
+                table_desc_name: None,
+                comment: String::new(),
+            });
+            values.push(value);
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b'}') => {
+                    self.pos += 1;
+                    break;
+                }
+                other => {
+                    return Err(RecordError::LegacyKeywordSet(format!(
+                        "JSON: expected `,` or `}}` in object, found {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok((desc, values))
+    }
+
+    fn parse_value(&mut self) -> Result<(DataType, Option<RecordDesc>, RecordValue), RecordError> {
+        self.skip_ws();
+        match self.peek() {
+            Some(b'"') => {
+                let s = self.parse_string()?;
+                Ok((DataType::String, None, RecordValue::String(s)))
+            }
+            Some(b'{') => {
+                let (sub_desc, values) = self.parse_object()?;
+                let rec = TableRecord {
+                    desc: sub_desc.clone(),
+                    record_type: 0,
+                    values,
+                };
+                Ok((DataType::Record, Some(sub_desc), RecordValue::Record(rec)))
+            }
+            Some(b'[') => self.parse_array(),
+            Some(b't') => {
+                self.expect_str("true")?;
+                Ok((DataType::Bool, None, RecordValue::Bool(true)))
+            }
+            Some(b'f') => {
+                self.expect_str("false")?;
+                Ok((DataType::Bool, None, RecordValue::Bool(false)))
+            }
+            Some(b'n') => {
+                self.expect_str("null")?;
+                Ok((DataType::String, None, RecordValue::String(String::new())))
+            }
+            Some(c) if c == b'-' || c.is_ascii_digit() => self.parse_number(),
+            other => Err(RecordError::LegacyKeywordSet(format!(
+                "JSON: unexpected value start {other:?}"
+            ))),
+        }
+    }
+
+    fn parse_array(&mut self) -> Result<(DataType, Option<RecordDesc>, RecordValue), RecordError> {
+        self.expect(b'[')?;
+        self.skip_ws();
+        let mut items = Vec::new();
+        let mut kind: Option<u8> = None;
+        loop {
+            self.skip_ws();
+            if self.peek() == Some(b']') {
+                self.pos += 1;
+                break;
+            }
+            let (_dt, _sub, v) = self.parse_value()?;
+            let item_kind = match &v {
+                RecordValue::Bool(_) => 4u8,
+                RecordValue::Int(_) | RecordValue::Int64(_) => 1u8,
+                RecordValue::Double(_) | RecordValue::Float(_) => 2u8,
+                RecordValue::String(_) => 3u8,
+                _ => 0u8,
+            };
+            if let Some(k) = kind {
+                if k != item_kind {
+                    return Err(RecordError::LegacyKeywordSet(
+                        "JSON: mixed-type array in keyword".into(),
+                    ));
+                }
+            } else {
+                kind = Some(item_kind);
+            }
+            items.push(v);
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.pos += 1;
+                }
+                Some(b']') => {
+                    self.pos += 1;
+                    break;
+                }
+                other => {
+                    return Err(RecordError::LegacyKeywordSet(format!(
+                        "JSON: expected `,` or `]` in array, found {other:?}"
+                    )));
+                }
+            }
+        }
+        let (dt, data) = match kind {
+            Some(1) => {
+                let vals: Vec<i64> = items
+                    .iter()
+                    .map(|v| match v {
+                        RecordValue::Int(i) => i64::from(*i),
+                        RecordValue::Int64(i) => *i,
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                if vals.iter().all(|&i| i32::try_from(i).is_ok()) {
+                    (
+                        DataType::ArrayInt,
+                        ArrayData::Int(vals.iter().map(|&i| i as i32).collect()),
+                    )
+                } else {
+                    (DataType::ArrayInt64, ArrayData::Int64(vals))
+                }
+            }
+            Some(2) => (
+                DataType::ArrayDouble,
+                ArrayData::Double(
+                    items
+                        .iter()
+                        .map(|v| match v {
+                            RecordValue::Double(d) => *d,
+                            RecordValue::Float(f) => f64::from(*f),
+                            _ => unreachable!(),
+                        })
+                        .collect(),
+                ),
+            ),
+            Some(3) => (
+                DataType::ArrayString,
+                ArrayData::String(
+                    items
+                        .iter()
+                        .map(|v| match v {
+                            RecordValue::String(s) => s.clone(),
+                            _ => unreachable!(),
+                        })
+                        .collect(),
+                ),
+            ),
+            Some(4) => (
+                DataType::ArrayBool,
+                ArrayData::Bool(
+                    items
+                        .iter()
+                        .map(|v| match v {
+                            RecordValue::Bool(b) => *b,
+                            _ => unreachable!(),
+                        })
+                        .collect(),
+                ),
+            ),
+            _ => (DataType::ArrayString, ArrayData::String(Vec::new())),
+        };
+        Ok((
+            dt,
+            None,
+            RecordValue::Array(ArrayValue {
+                shape: vec![items.len() as u32],
+                data,
+            }),
+        ))
+    }
+
+    fn parse_number(&mut self) -> Result<(DataType, Option<RecordDesc>, RecordValue), RecordError> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        while self.pos < self.bytes.len()
+            && ((self.bytes[self.pos] as char).is_ascii_digit()
+                || matches!(self.bytes[self.pos], b'.' | b'e' | b'E' | b'+' | b'-'))
+        {
+            self.pos += 1;
+        }
+        let text = std::str::from_utf8(&self.bytes[start..self.pos])
+            .map_err(|_| RecordError::LegacyKeywordSet("JSON: bad number".into()))?;
+        if text.contains('.') || text.contains('e') || text.contains('E') {
+            let f: f64 = text
+                .parse()
+                .map_err(|_| RecordError::LegacyKeywordSet("JSON: bad float".into()))?;
+            Ok((DataType::Double, None, RecordValue::Double(f)))
+        } else {
+            let i: i64 = text
+                .parse()
+                .map_err(|_| RecordError::LegacyKeywordSet("JSON: bad int".into()))?;
+            if let Ok(i32v) = i32::try_from(i) {
+                Ok((DataType::Int, None, RecordValue::Int(i32v)))
+            } else {
+                Ok((DataType::Int64, None, RecordValue::Int64(i)))
+            }
+        }
+    }
+
+    fn parse_string(&mut self) -> Result<String, RecordError> {
+        self.expect(b'"')?;
+        let mut s = String::new();
+        loop {
+            let c = self
+                .peek()
+                .ok_or_else(|| RecordError::LegacyKeywordSet("JSON: unterminated string".into()))?;
+            match c {
+                b'"' => {
+                    self.pos += 1;
+                    return Ok(s);
+                }
+                b'\\' => {
+                    self.pos += 1;
+                    let esc = self
+                        .peek()
+                        .ok_or_else(|| RecordError::LegacyKeywordSet("JSON: bad escape".into()))?;
+                    self.pos += 1;
+                    match esc {
+                        b'"' => s.push('"'),
+                        b'\\' => s.push('\\'),
+                        b'/' => s.push('/'),
+                        b'b' => s.push('\u{8}'),
+                        b'f' => s.push('\u{c}'),
+                        b'n' => s.push('\n'),
+                        b'r' => s.push('\r'),
+                        b't' => s.push('\t'),
+                        b'u' => {
+                            if self.pos + 4 > self.bytes.len() {
+                                return Err(RecordError::LegacyKeywordSet(
+                                    "JSON: bad \\u escape".into(),
+                                ));
+                            }
+                            let hex = std::str::from_utf8(&self.bytes[self.pos..self.pos + 4])
+                                .map_err(|_| {
+                                    RecordError::LegacyKeywordSet("JSON: bad \\u".into())
+                                })?;
+                            let code = u32::from_str_radix(hex, 16).map_err(|_| {
+                                RecordError::LegacyKeywordSet("JSON: bad \\u hex".into())
+                            })?;
+                            if let Some(ch) = char::from_u32(code) {
+                                s.push(ch);
+                            }
+                            self.pos += 4;
+                        }
+                        _ => {
+                            return Err(RecordError::LegacyKeywordSet(
+                                "JSON: unknown escape".into(),
+                            ));
+                        }
+                    }
+                }
+                b'\n' | b'\r' => {
+                    return Err(RecordError::LegacyKeywordSet(
+                        "JSON: newline in string".into(),
+                    ));
+                }
+                _ => {
+                    let ch = c as char;
+                    if ch.is_control() {
+                        return Err(RecordError::LegacyKeywordSet(
+                            "JSON: unescaped control char in string".into(),
+                        ));
+                    }
+                    s.push(ch);
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+
+    fn expect_str(&mut self, s: &str) -> Result<(), RecordError> {
+        if self.bytes[self.pos..].starts_with(s.as_bytes()) {
+            self.pos += s.len();
+            Ok(())
+        } else {
+            Err(RecordError::LegacyKeywordSet(format!(
+                "JSON: expected `{s}`"
+            )))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1035,6 +1499,33 @@ mod tests {
         ]
         .into();
         assert_eq!(vals, expected);
+    }
+
+    #[test]
+    fn json_parser_round_trip() {
+        // Keyword/descriptor dicts: scalars, strings, floats, arrays, and
+        // nested records round-trip through the JSON parser.
+        let json = r#"{"VER":"1.0","MAXROWS":1000,"MS_VERSION":2.0,"QS":["s","u"],"EMPTY":{},"NEST":{"HH":{"II":5},"S":"x"},"FLAG":true,"AR":[1,2,3]}"#;
+        let rec = parse_json_record(json).unwrap();
+        assert_eq!(
+            rec.to_json_string(),
+            r#"{"VER":"1.0","MAXROWS":1000,"MS_VERSION":2,"QS":{"shape":[2],"array":["s","u"]},"EMPTY":{},"NEST":{"HH":{"II":5},"S":"x"},"FLAG":true,"AR":{"shape":[3],"array":[1,2,3]}}"#
+        );
+        assert_eq!(rec.get("MAXROWS"), Some(&RecordValue::Int(1000)));
+        assert_eq!(rec.get("MS_VERSION"), Some(&RecordValue::Double(2.0)));
+        assert_eq!(rec.get("FLAG"), Some(&RecordValue::Bool(true)));
+        match rec.get("QS") {
+            Some(RecordValue::Array(a)) => {
+                assert_eq!(a.data, ArrayData::String(vec!["s".into(), "u".into()]));
+            }
+            other => panic!("QS: {other:?}"),
+        }
+        match rec.get("NEST") {
+            Some(RecordValue::Record(r)) => {
+                assert_eq!(r.to_json_string(), r#"{"HH":{"II":5},"S":"x"}"#);
+            }
+            other => panic!("NEST: {other:?}"),
+        }
     }
 
     #[test]

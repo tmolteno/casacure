@@ -452,7 +452,11 @@ fn build_ssm_data(
     let first_string_bucket = (data_buckets + index_buckets) as i32;
     let mut str_buckets = StringBuckets::new(l.bucket_size, first_string_bucket);
     let mut array_index: Vec<u8> = Vec::new();
-    let mut has_arrays = false;
+    // An array column creates the array-index file (`table.f0i`) even when
+    // the table has zero rows (casacore does the same).
+    let mut has_arrays = dm_cols
+        .iter()
+        .any(|&c| matches!(desc.columns[c].kind, crate::tabledesc::ColumnKind::Array));
     let mut has_strings = false;
 
     let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(dm_cols.len());

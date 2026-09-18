@@ -94,6 +94,185 @@ pub struct TableDesc {
 }
 
 impl TableDesc {
+    /// Build a `TableDesc` from the python-casacore table-desc dict (the
+    /// format `required_ms_desc`/`getdesc` produce): column keys plus the
+    /// `_define_hypercolumn_`/`_keywords_`/`_private_keywords_` entries.
+    pub fn from_desc_json(json: &str) -> Result<TableDesc, TableDescError> {
+        let record = crate::record::parse_json_record(json)?;
+        let mut desc = TableDesc {
+            name: String::new(),
+            version: String::new(),
+            comment: String::new(),
+            keywords: crate::record::TableRecord {
+                desc: Default::default(),
+                record_type: 0,
+                values: Vec::new(),
+            },
+            private_keywords: crate::record::TableRecord {
+                desc: Default::default(),
+                record_type: 0,
+                values: Vec::new(),
+            },
+            columns: Vec::new(),
+        };
+        for (field, value) in record.desc.fields.iter().zip(record.values.iter()) {
+            match field.name.as_str() {
+                "_define_hypercolumn_" => {}
+                "_keywords_" => {
+                    if let crate::record::RecordValue::Record(r) = value {
+                        desc.keywords = r.clone();
+                    }
+                }
+                "_private_keywords_" => {
+                    if let crate::record::RecordValue::Record(r) = value {
+                        desc.private_keywords = r.clone();
+                    }
+                }
+                name => {
+                    let col = column_from_desc_dict(name, value)?;
+                    desc.columns.push(col);
+                }
+            }
+        }
+        Ok(desc)
+    }
+}
+
+/// Convert one column's desc dict (a record value) to a `ColumnDesc`.
+pub(crate) fn column_from_desc_dict(
+    name: &str,
+    value: &crate::record::RecordValue,
+) -> Result<ColumnDesc, TableDescError> {
+    use crate::record::RecordValue;
+    use crate::types::ValueType;
+    let crate::record::RecordValue::Record(rec) = value else {
+        return Err(TableDescError::UnknownColumnClass(format!(
+            "column {name}: expected a desc dict, got {value:?}"
+        )));
+    };
+    let get = |key: &str| rec.get(key);
+    let data_type = match get("valueType") {
+        Some(RecordValue::String(s)) => {
+            let vt = ValueType::from_casa_name(s).map_err(|_| {
+                TableDescError::UnknownColumnClass(format!("column {name}: bad valueType {s}"))
+            })?;
+            match vt {
+                ValueType::Bool => DataType::Bool,
+                ValueType::Byte => DataType::UChar,
+                ValueType::Short => DataType::Short,
+                ValueType::UShort => DataType::UShort,
+                ValueType::Int => DataType::Int,
+                ValueType::UInt => DataType::UInt,
+                ValueType::Float => DataType::Float,
+                ValueType::Double => DataType::Double,
+                ValueType::Complex => DataType::Complex,
+                ValueType::DComplex => DataType::DComplex,
+                ValueType::String => DataType::String,
+            }
+        }
+        other => {
+            return Err(TableDescError::UnknownColumnClass(format!(
+                "column {name}: missing string valueType ({other:?})"
+            )));
+        }
+    };
+
+    let comment = match get("comment") {
+        Some(RecordValue::String(s)) => s.clone(),
+        _ => String::new(),
+    };
+    let data_manager_type = match get("dataManagerType") {
+        Some(RecordValue::String(s)) => s.clone(),
+        _ => "StandardStMan".to_string(),
+    };
+    let data_manager_group = match get("dataManagerGroup") {
+        Some(RecordValue::String(s)) => s.clone(),
+        _ => "StandardStMan".to_string(),
+    };
+    let options = match get("option") {
+        Some(RecordValue::Int(i)) => *i,
+        Some(RecordValue::Int64(i)) => *i as i32,
+        _ => 0,
+    };
+    let max_length = match get("maxlen") {
+        Some(RecordValue::Int(i)) => *i,
+        Some(RecordValue::Int64(i)) => *i as i32,
+        _ => 0,
+    };
+    let ndim = match get("ndim") {
+        Some(RecordValue::Int(i)) => *i,
+        Some(RecordValue::Int64(i)) => *i as i32,
+        _ => -1,
+    };
+    let shape = match get("shape") {
+        Some(RecordValue::Array(a)) => Some(
+            a.elements()
+                .iter()
+                .map(|e| match e {
+                    RecordValue::Int(i) => i64::from(*i),
+                    RecordValue::Int64(i) => *i,
+                    other => i64::from(match other {
+                        RecordValue::Int(i) => *i,
+                        _ => 0,
+                    }),
+                })
+                .collect::<Vec<i64>>(),
+        ),
+        _ => None,
+    };
+    let keywords = match get("keywords") {
+        Some(RecordValue::Record(r)) => r.clone(),
+        _ => crate::record::TableRecord {
+            desc: Default::default(),
+            record_type: 0,
+            values: Vec::new(),
+        },
+    };
+
+    // Scalar vs array: a column with an explicit `ndim >= 0` is an array
+    // column (fixed shape when `shape` is present, variable otherwise).
+    let kind = if ndim >= 0 {
+        ColumnKind::Array
+    } else {
+        ColumnKind::Scalar(default_scalar(data_type))
+    };
+
+    Ok(ColumnDesc {
+        name: name.to_string(),
+        comment,
+        data_type,
+        data_manager_type,
+        data_manager_group,
+        options,
+        ndim,
+        shape,
+        max_length,
+        keywords,
+        kind,
+    })
+}
+
+/// The zero default scalar for a column type.
+fn default_scalar(dt: DataType) -> RecordValue {
+    use crate::record::RecordValue as RV;
+    match dt {
+        DataType::Bool => RV::Bool(false),
+        DataType::UChar | DataType::Char => RV::UChar(0),
+        DataType::Short => RV::Short(0),
+        DataType::UShort => RV::UShort(0),
+        DataType::Int => RV::Int(0),
+        DataType::UInt => RV::UInt(0),
+        DataType::Int64 => RV::Int64(0),
+        DataType::Float => RV::Float(0.0),
+        DataType::Double => RV::Double(0.0),
+        DataType::Complex => RV::Complex(0.0, 0.0),
+        DataType::DComplex => RV::DComplex(0.0, 0.0),
+        DataType::String => RV::String(String::new()),
+        _ => RV::Int(0),
+    }
+}
+
+impl TableDesc {
     pub fn column(&self, name: &str) -> Option<&ColumnDesc> {
         self.columns.iter().find(|c| c.name == name)
     }

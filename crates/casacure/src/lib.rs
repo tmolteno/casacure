@@ -6,6 +6,8 @@
 pub mod aipsio;
 pub mod columnset;
 pub mod ism;
+pub mod ms;
+pub mod ms_schema;
 pub mod record;
 pub mod ssm;
 pub mod table;

@@ -9,7 +9,7 @@ Work areas are tracked as GitHub issues; subtasks live in `TODO.md`.
 
 | Suite | Command | Passing | Coverage |
 |---|---|---|---|
-| Rust unit + fixture tests | `cargo test` | 81/81 | type system, AipsIO read+write (both endians), `table.dat`, StandardStMan data file + `table.f0i` + string buckets, IncrementalStMan (interval index, multi-DM tables) — all read+write |
+| Rust unit + fixture tests | `cargo test` | 85/85 | type system, AipsIO read+write (both endians), `table.dat`, StandardStMan data file + `table.f0i` + string buckets, IncrementalStMan (interval index, multi-DM tables) — all read+write |
 | casacore comparison tests | `.venv/bin/python -m pytest tests/` | 5/5 | type system only |
 | write interop (manual) | `examples/create_sample_table.rs` + python-casacore | ✓ | casacure-write → casacore-read: SSM scalars, arrays, long strings, and ISM TIME/ANT1 in one 4-file table; 3-row and 100-row variants return exactly the written values |
 
@@ -23,7 +23,7 @@ Work areas are tracked as GitHub issues; subtasks live in `TODO.md`.
 | §4 Type system | ~90% | `ValueType` + numpy mapping done, verified against casacore 3.8.1 |
 | §5 Metadata & descriptors | ~85% | read + write done incl. subtable linkage: nrows/colnames/getcoldesc/getdesc, getkeywords/getcolkeywords, putkeyword/putcolkeyword/removekeyword/removecolkeyword (nested records), `TpTable` subtable keywords with `"Table: <path>"` resolution both ways |
 | §6 TaQL subset | ~80% | `taql` module: SELECT ($N / `'path'` / DDL), WHERE evaluator, ORDERBY/ROWID, GROUPBY+GROWID/GAGGR/GCOUNT, UNIQUE, subqueries, CREATE TABLE — verified against casacore ordering/grouping probes and casacore reading a casacure-built DDL table. `'path'` FROM + pyo3 surface still pending |
-| §7 MS schema / descriptors | 0% | not started |
+| §7 MS schema / descriptors | ~90% | vendored required/complete descs (MS + 17 subtables), default_ms with full subtable tree + TpTable linkage, default_ms_subtable, maketabdesc; casacore opens/writes/reads a casacure-created MS end-to-end |
 | dask-ms integration | 0% | not started |
 
 ## Known casacore behaviour discovered by the comparison tests

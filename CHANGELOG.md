@@ -228,6 +228,24 @@ subtasks are moved here.
   GROUPBY groups return logically correct (unpadded) arrays, diverging from
   casacore's fixed-shape zero-padding quirk. 7 unit tests; helpers added:
   `TableRecord`/`ArrayValue::elements` JSON plumbing, `WritableTable::desc`.
+- MS schema / descriptors (§6): `ms_schema.rs` vendors the canonical
+  `required_ms_desc`/`complete_ms_desc` dicts for the main MS and 17
+  subtables (generated from real casacore; `scripts/vendor_ms_schema.py`
+  regenerate step in the comments). `TableDesc::from_desc_json` and a
+  column-dict converter build descriptors from the python-casacore dict
+  format. `ms::default_ms(path, extra_desc)` creates the main table (21
+  required columns, MS_VERSION keyword, optional extra columns) plus the 12
+  standard subtable directories inside it, each linked from the main table
+  by `TpTable` keywords; `default_ms_subtable(name, path)` and
+  `maketabdesc_from_json` round out the API. A JSON parser
+  (`record::parse_json_record`) reconstructs typed `TableRecord`s from dict
+  JSON (also serving the bindings layer), and keyword writes now support
+  array fields (`write_array_value`, e.g. `QuantumUnits`). `table.f0i` is
+  created for array columns even at zero rows. Verified end-to-end: casacore
+  opens a casacure-created MS (MS_VERSION 2.0, 12 `Table:` links, TIME
+  `QuantumUnits: ['s']`), writes variable `DATA` and ANTENNA NAME/POSITION
+  into it and reads them back exactly. 6 new unit tests (70/70 unit + 15
+  fixture in this release).
 - `table` module: `parse_table_header` parses the `table.dat` root object
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit
