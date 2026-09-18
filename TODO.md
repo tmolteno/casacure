@@ -19,9 +19,9 @@ Work areas follow `CASACORE_TO_CASA_RS.md` (tracked as GitHub issues).
 
 ## 2. Table lifecycle and locking API
 
-- [ ] `table()` open + create
-- [ ] `lock()`/`unlock()` (advisory), `flush()`, `close()`
-- [ ] `iswritable()`, `name()`
+- [X] `table()` open + create
+- [X] `lock()`/`unlock()` (advisory), `flush()`, `close()`
+- [X] `iswritable()`, `name()`
 
 ## 3. Column data access (hot path)
 

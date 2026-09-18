@@ -11,7 +11,7 @@ Work areas are tracked as GitHub issues; subtasks live in `TODO.md`.
 
 | Suite | Command | Passing | Coverage |
 |---|---|---|---|
-| Rust unit + fixture tests | `cargo test` | 66/66 | type system, AipsIO read+write (both endians), `table.dat`, StandardStMan data file + `table.f0i` + string buckets, IncrementalStMan (interval index, multi-DM tables) — all read+write |
+| Rust unit + fixture tests | `cargo test` | 67/67 | type system, AipsIO read+write (both endians), `table.dat`, StandardStMan data file + `table.f0i` + string buckets, IncrementalStMan (interval index, multi-DM tables) — all read+write |
 | casacore comparison tests | `.venv/bin/python -m pytest tests/` | 5/5 | type system only |
 | write interop (manual) | `examples/create_sample_table.rs` + python-casacore | ✓ | casacure-write → casacore-read: SSM scalars, arrays, long strings, and ISM TIME/ANT1 in one 4-file table; 3-row and 100-row variants return exactly the written values |
 
@@ -20,7 +20,7 @@ Work areas are tracked as GitHub issues; subtasks live in `TODO.md`.
 | Area | Status | Notes |
 |---|---|---|
 | §1 CASA table on-disk format | DONE | `table.dat` fully parsed **and written** (multi-DM ColumnSet). StandardStMan (scalars, `table.f0i` arrays, string buckets), IncrementalStMan (interval index), and TiledColumnStMan (tile buckets, reversed-dim shapes) fully read **and written** — one table can mix all three across several files, and python-casacore round-trips every column exactly. `getdminfo()` matches casacore byte-for-byte (incl. SPEC records); managers grouped by type+group and named by group (the `_1` auto-suffix belongs to the future `addcols`). |
-| §2 Table lifecycle & locking | 0% | not started |
+| §2 Table lifecycle & locking | DONE | `Table` open/create, advisory lock/unlock, flush/close, iswritable/name, nrows/colnames; Send+Sync; eager DM-file loading |
 | §3 Column data access | 0% | not started |
 | §4 Type system | ~90% | `ValueType` + numpy mapping done, verified against casacore 3.8.1 |
 | §5 Metadata & descriptors | 0% | not started |

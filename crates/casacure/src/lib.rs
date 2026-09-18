@@ -25,7 +25,7 @@ pub use ssm::{
 };
 pub use table::{
     build_table_dat, create_table, get_dminfo, parse_table_dat, parse_table_header, DmInfo, DmSpec,
-    TableCreateError, TableDat, TableDatError, TableError, TableHeader, ROWS_PER_BUCKET,
+    Table, TableCreateError, TableDat, TableDatError, TableError, TableHeader, ROWS_PER_BUCKET,
 };
 pub use tabledesc::{
     parse_table_desc, write_table_desc, ColumnDesc, ColumnKind, TableDesc, TableDescError,

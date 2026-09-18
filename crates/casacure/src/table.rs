@@ -661,6 +661,136 @@ fn build_tsm_data(
     )
 }
 
+/// A CASA table: the parsed descriptor plus the opened data managers, with
+/// the table lifecycle API (`open`/`create`, advisory `lock`/`unlock`,
+/// `flush`, `close`, `is_writable`, `name`).
+///
+/// All file contents are owned, so a `Table` is `Send` + `Sync` and safe to
+/// hold across threads (dask-ms serializes access on its side).
+#[derive(Debug)]
+pub struct Table {
+    path: std::path::PathBuf,
+    writable: bool,
+    locked: bool,
+    pub dat: TableDat,
+    /// StandardStMan data files, keyed by DM sequence number.
+    pub ssm_files: Vec<(u32, crate::ssm::StandardStManFile)>,
+    /// IncrementalStMan data files, keyed by DM sequence number.
+    pub ism_files: Vec<(u32, crate::ism::IsmFile)>,
+    /// TiledColumnStMan storage managers, keyed by DM sequence number.
+    pub tsm_files: Vec<(u32, crate::tsm::TsmFile)>,
+}
+
+impl Table {
+    /// Open a table directory (`<dir>/table.dat` + data files).
+    pub fn open(
+        dir: impl Into<std::path::PathBuf>,
+        readonly: bool,
+    ) -> Result<Table, TableDatError> {
+        let path = dir.into();
+        let buf = std::fs::read(path.join("table.dat"))?;
+        let dat = parse_table_dat(&buf)?;
+        let big = dat.header.big_endian;
+        let mut ssm_files = Vec::new();
+        let mut ism_files = Vec::new();
+        let mut tsm_files = Vec::new();
+        for dm in &dat.column_set.data_managers {
+            match dm.type_name.as_str() {
+                "StandardStMan" => ssm_files.push((
+                    dm.sequence_nr,
+                    crate::ssm::StandardStManFile::open(&path, dm.sequence_nr, big)
+                        .map_err(|e| TableDatError::Storage(e.to_string()))?,
+                )),
+                "IncrementalStMan" => ism_files.push((
+                    dm.sequence_nr,
+                    crate::ism::IsmFile::open(&path, dm.sequence_nr, big)
+                        .map_err(|e| TableDatError::Storage(e.to_string()))?,
+                )),
+                "TiledColumnStMan" => tsm_files.push((
+                    dm.sequence_nr,
+                    crate::tsm::TsmFile::open(&path, dm.sequence_nr, big)
+                        .map_err(|e| TableDatError::Storage(e.to_string()))?,
+                )),
+                other => {
+                    return Err(TableDatError::Storage(format!(
+                        "unsupported data-manager type {other}"
+                    )))
+                }
+            }
+        }
+        Ok(Table {
+            path,
+            writable: !readonly,
+            locked: false,
+            dat,
+            ssm_files,
+            ism_files,
+            tsm_files,
+        })
+    }
+
+    /// Create a new table from a descriptor and column values, then open it
+    /// for writing.
+    pub fn create(
+        dir: impl Into<std::path::PathBuf>,
+        desc: &crate::tabledesc::TableDesc,
+        values: &[Vec<crate::record::RecordValue>],
+    ) -> Result<Table, TableDatError> {
+        let dir = dir.into();
+        create_table(&dir, desc, values).map_err(|e| TableDatError::Storage(e.to_string()))?;
+        Table::open(dir, false)
+    }
+
+    /// The table directory (casacore `table.name()`).
+    pub fn name(&self) -> &str {
+        self.path.to_str().unwrap_or_default()
+    }
+
+    /// Whether the table was opened for writing (casacore
+    /// `table.iswritable()`).
+    pub fn is_writable(&self) -> bool {
+        self.writable
+    }
+
+    /// Adversarial user lock (casacore `table.lock(write=True)`); internally
+    /// advisory as the replacement never holds OS locks.
+    pub fn lock(&mut self) {
+        self.locked = true;
+    }
+
+    /// Release the advisory lock (casacore `table.unlock()`).
+    pub fn unlock(&mut self) {
+        self.locked = false;
+    }
+
+    /// Whether an advisory lock is currently held.
+    pub fn is_locked(&self) -> bool {
+        self.locked
+    }
+
+    /// Flush pending writes. The current implementation writes eagerly
+    /// (`create_table`), so this is a no-op; kept for API compatibility.
+    pub fn flush(&mut self) {}
+
+    /// Close the table, releasing the data managers (casacore `table.close()`).
+    pub fn close(self) {}
+
+    /// Number of rows (casacore `table.nrows()`).
+    pub fn nrows(&self) -> u64 {
+        self.dat.header.nrow
+    }
+
+    /// Column names in column order (casacore `table.colnames()`).
+    pub fn colnames(&self) -> Vec<String> {
+        self.dat
+            .desc
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect()
+    }
+}
+
 /// A data-manager-info record as returned by casacore `table.getdminfo()`:
 /// `{"TYPE", "NAME", "SEQNR", "SPEC", "COLUMNS"}` (keys in that order).
 #[derive(Debug, Clone, PartialEq)]
@@ -1430,6 +1560,50 @@ mod tests {
             keywords: empty_record(),
             kind: ColumnKind::Array,
         }
+    }
+
+    #[test]
+    fn table_lifecycle_open_create_close() {
+        let mut desc = typed_desc();
+        desc.columns = vec![scalar_col("X", DataType::Int, 0)];
+        let values = vec![(0..10).map(RecordValue::Int).collect()];
+        let dir = temp_dir("lifecycle");
+
+        let mut t = Table::create(&dir, &desc, &values).unwrap();
+        assert!(t.is_writable());
+        assert_eq!(t.name(), dir.to_str().unwrap());
+        assert_eq!(t.nrows(), 10);
+        assert_eq!(t.colnames(), vec!["X"]);
+        // Advisory locking.
+        assert!(!t.is_locked());
+        t.lock();
+        assert!(t.is_locked());
+        t.unlock();
+        assert!(!t.is_locked());
+        t.flush();
+        // The data manager files were opened (SSM seq 0).
+        assert_eq!(t.ssm_files.len(), 1);
+        assert_eq!(t.ssm_files[0].0, 0);
+        t.close();
+
+        // Open the written table read-only.
+        let r = Table::open(&dir, true).unwrap();
+        assert!(!r.is_writable());
+        assert_eq!(r.nrows(), 10);
+        assert_eq!(r.colnames(), vec!["X"]);
+
+        // Read a value back through the opened StandardStMan file.
+        let ssm = &r.ssm_files[0].1;
+        let dm = &r.dat.column_set.data_managers[0];
+        let spec = match &dm.blob {
+            crate::columnset::DataManagerBlob::StandardStMan(s) => s,
+            _ => panic!("expected StandardStMan spec"),
+        };
+        let desc_x = r.dat.desc.column("X").unwrap();
+        assert_eq!(
+            ssm.read_scalar_cell(spec, 0, desc_x, 4).unwrap(),
+            RecordValue::Int(4)
+        );
     }
 
     #[test]

@@ -166,6 +166,15 @@ subtasks are moved here.
   tracked for the future column-management step); SSM/ISM/TSM spec names
   follow the group. Full multi-DM interop re-verified (SSM + ISM + TSM in
   one table, all values exact; dminfo NAME now e.g. `TiledData_GROUP`).
+- Table lifecycle (§2): a `Table` object tied to a table directory with
+  `open(dir, readonly)` / `create(dir, desc, values)`, advisory
+  `lock`/`unlock` (internally no-op — no OS locks are held, as the crate
+  never needs them), `flush`/`close`, `is_writable()`, `name()`, plus
+  `nrows()` and `colnames()`. All content is owned, so a `Table` is
+  `Send + Sync` and safe across threads; opening eagerly loads every data
+  manager (SSM/ISM/TSM files by sequence number) so later column reads have
+  the files ready. `lockoptions="user"` semantics are covered by the
+  advisory lock.
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit
   tests plus a manifest-driven fixture test asserting the header of the real
