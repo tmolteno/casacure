@@ -611,15 +611,20 @@ pub(crate) fn pyobject_to_record(py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResu
     if let Ok(s) = v.downcast::<PyString>() {
         return Ok(RecordValue::String(s.to_str()?.to_string()));
     }
-    if v.downcast::<PyInt>().is_ok() {
-        let big: i128 = v.extract()?;
-        if let Ok(x) = i32::try_from(big) {
+    // Integers (python ints and numpy integer scalars, which expose
+    // `__index__`).
+    if let Ok(n) = v.extract::<i128>() {
+        if let Ok(x) = i32::try_from(n) {
             return Ok(RecordValue::Int(x));
         }
-        return Ok(RecordValue::Int64(big as i64));
+        return Ok(RecordValue::Int64(n as i64));
     }
     if let Ok(f) = v.downcast::<PyFloat>() {
         return Ok(RecordValue::Double(f.value()));
+    }
+    // numpy floating scalars (expose `__float__`).
+    if let Ok(f) = v.extract::<f64>() {
+        return Ok(RecordValue::Double(f));
     }
     if let Ok(d) = v.downcast::<PyDict>() {
         return Ok(RecordValue::Record(dict_to_table_record(py, d)?));
@@ -808,5 +813,152 @@ pub(crate) fn record_data_type(v: &RecordValue) -> Option<DataType> {
             ArrayData::String(_) => DT::ArrayString,
         },
         RecordValue::Record(_) => DT::Record,
+    })
+}
+
+/// Flatten logical coords over a C-order shape.
+pub(crate) fn flatten_coords(coords: &[usize], shape: &[usize]) -> usize {
+    let mut idx = 0usize;
+    for (c, d) in coords.iter().zip(shape.iter()) {
+        idx = idx * (*d).max(1) + c;
+    }
+    idx
+}
+
+/// Unflatten a C-order flat index into logical coords.
+pub(crate) fn unflatten(idx: usize, shape: &[usize]) -> Vec<usize> {
+    let mut out = vec![0usize; shape.len()];
+    let mut x = idx;
+    for k in (0..shape.len()).rev() {
+        let d = shape[k].max(1);
+        out[k] = x % d;
+        x /= d;
+    }
+    out
+}
+
+/// Read a whole numpy array (any supported numeric dtype) into flat
+/// `RecordValue`s in C order.
+pub(crate) fn numpy_to_record_flat(value: &Bound<'_, PyAny>) -> Option<PyResult<Vec<RecordValue>>> {
+    macro_rules! try_num {
+        ($ty:ty, $f:expr) => {{
+            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<$ty>>() {
+                let readonly = arr.readonly();
+                let mut out = Vec::with_capacity(readonly.as_array().len());
+                for e in readonly.as_array().iter() {
+                    out.push($f(e));
+                }
+                return Some(Ok(out));
+            }
+        }};
+    }
+    try_num!(f64, |e: &f64| RecordValue::Double(*e));
+    try_num!(f32, |e: &f32| RecordValue::Float(*e));
+    try_num!(i64, |e: &i64| RecordValue::Int64(*e));
+    try_num!(i32, |e: &i32| RecordValue::Int(*e));
+    try_num!(u8, |e: &u8| RecordValue::UChar(*e));
+    try_num!(u16, |e: &u16| RecordValue::UShort(*e));
+    try_num!(bool, |e: &bool| RecordValue::Bool(*e));
+    try_num!(Complex64, |e: &Complex64| RecordValue::DComplex(e.re, e.im));
+    try_num!(Complex32, |e: &Complex32| RecordValue::Complex(e.re, e.im));
+    None
+}
+
+/// The flat logical element values of a cell as stored (cells are stored in
+/// the shape they were given).
+pub(crate) fn cell_logical_flat(cell: &RecordValue) -> Vec<RecordValue> {
+    match cell {
+        RecordValue::Array(a) => a.elements(),
+        other => vec![other.clone()],
+    }
+}
+
+/// Rebuild a stored-array cell (as-given shape, C order) from flat logical
+/// values.
+pub(crate) fn cell_from_logical(flat: Vec<RecordValue>, shape: &[usize]) -> RecordValue {
+    use casacure::record::{ArrayData, ArrayValue};
+    let data = match flat.first() {
+        Some(RecordValue::Double(_)) => ArrayData::Double(
+            flat.iter()
+                .map(|v| match v {
+                    RecordValue::Double(d) => *d,
+                    _ => 0.0,
+                })
+                .collect(),
+        ),
+        Some(RecordValue::Float(_)) => ArrayData::Float(
+            flat.iter()
+                .map(|v| match v {
+                    RecordValue::Float(f) => *f,
+                    _ => 0.0,
+                })
+                .collect(),
+        ),
+        Some(RecordValue::Int(_)) => ArrayData::Int(
+            flat.iter()
+                .map(|v| match v {
+                    RecordValue::Int(i) => *i,
+                    _ => 0,
+                })
+                .collect(),
+        ),
+        Some(RecordValue::Int64(_)) => ArrayData::Int64(
+            flat.iter()
+                .map(|v| match v {
+                    RecordValue::Int64(i) => *i,
+                    _ => 0,
+                })
+                .collect(),
+        ),
+        Some(RecordValue::UChar(_)) => ArrayData::UChar(
+            flat.iter()
+                .map(|v| match v {
+                    RecordValue::UChar(u) => *u,
+                    _ => 0,
+                })
+                .collect(),
+        ),
+        Some(RecordValue::UShort(_)) => ArrayData::UShort(
+            flat.iter()
+                .map(|v| match v {
+                    RecordValue::UShort(u) => *u,
+                    _ => 0,
+                })
+                .collect(),
+        ),
+        Some(RecordValue::Bool(_)) => ArrayData::Bool(
+            flat.iter()
+                .map(|v| matches!(v, RecordValue::Bool(true)))
+                .collect(),
+        ),
+        Some(RecordValue::Complex(_, _)) => ArrayData::Complex(
+            flat.iter()
+                .map(|v| match v {
+                    RecordValue::Complex(re, im) => (*re, *im),
+                    _ => (0.0, 0.0),
+                })
+                .collect(),
+        ),
+        Some(RecordValue::DComplex(_, _)) => ArrayData::DComplex(
+            flat.iter()
+                .map(|v| match v {
+                    RecordValue::DComplex(re, im) => (*re, *im),
+                    _ => (0.0, 0.0),
+                })
+                .collect(),
+        ),
+        Some(RecordValue::String(_)) | Some(RecordValue::Table(_)) => ArrayData::String(
+            flat.iter()
+                .map(|v| match v {
+                    RecordValue::String(s) | RecordValue::Table(s) => s.clone(),
+                    _ => String::new(),
+                })
+                .collect(),
+        ),
+        _ => ArrayData::Double(Vec::new()),
+    };
+    RecordValue::Array(ArrayValue {
+        shape: shape.iter().map(|&d| d as u32).collect(),
+        data,
     })
 }

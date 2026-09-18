@@ -291,6 +291,13 @@ subtasks are moved here.
   complex64). Bindings gained `ms::SUBTABLE` path syntax, int64/UInt array
   `putcol` support, and `default_ms` now returns a writable context-manager
   main table.
+- dask-ms chunked/sliced and varcol writes (§7): `putcolslice` now overlays
+  a chan/corr-chunked array into the fixed cell at logical blc..trc (the
+  multi-call pattern dask-ms uses for data written in slices) —
+  `test_dataset_create_table` passes; default cells for fixed-shape array
+  columns are built in the logical (as-given) orientation to match real
+  cells; `putcol` accepts the `{"rN": value}` dict form and numpy numeric
+  scalars (np.int64 etc.) so dask-ms's SPW/row-grouping setup code runs.
 - `table` module: `parse_table_header` parses the `table.dat` root object
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit

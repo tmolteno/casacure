@@ -1425,7 +1425,10 @@ fn default_cell_value(cd: &crate::tabledesc::ColumnDesc) -> Option<RecordValue> 
     match &cd.kind {
         crate::tabledesc::ColumnKind::Scalar(default) => Some(default.clone()),
         crate::tabledesc::ColumnKind::Array => {
-            let shape = cd.shape.clone().unwrap_or_default();
+            // Default cells are in the as-given (logical) orientation: the
+            // descriptor stores the reversed shape.
+            let mut shape: Vec<i64> = cd.shape.clone().unwrap_or_default();
+            shape.reverse();
             let n = shape.iter().map(|&d| d.max(0) as usize).product();
             let data = match cd.data_type {
                 crate::record::DataType::Bool => ArrayData::Bool(vec![false; n]),

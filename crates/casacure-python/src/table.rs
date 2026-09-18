@@ -529,6 +529,34 @@ impl Table {
     ) -> PyResult<()> {
         let col_idx = self.col_index(column)?;
         let startrow = startrow.max(0) as u64;
+        // Dict form: `{"rN": value, ...}` — per-row scalar/array writes
+        // (dask-ms writes scalar varcols this way).
+        if value.downcast::<PyDict>().is_ok() {
+            let mut rows: Vec<(u64, Bound<'_, PyAny>)> = Vec::new();
+            for (k, v) in value.downcast::<PyDict>().unwrap().iter() {
+                let s = k.extract::<String>()?;
+                if let Some(n) = s.strip_prefix('r') {
+                    let idx: u64 = n
+                        .parse()
+                        .map_err(|_| PyValueError::new_err(format!("bad row key {s}")))?;
+                    rows.push((idx, v));
+                }
+            }
+            rows.sort_by_key(|(n, _)| *n);
+            for (i, (row_offset, v)) in rows.into_iter().enumerate() {
+                let row = startrow + row_offset;
+                let desc = self.desc();
+                let is_array_col = matches!(
+                    desc.columns[col_idx].kind,
+                    core::tabledesc::ColumnKind::Array
+                );
+                let mut cells = self.value_to_cells(py, col_idx, &v, 1, is_array_col)?;
+                let rec = cells.pop().unwrap_or(RecordValue::Int(0));
+                self.put_cell(col_idx, row, rec)?;
+                let _ = i;
+            }
+            return Ok(());
+        }
         let nrow = if nrow <= 0 {
             value.len()? as u64
         } else {
@@ -610,11 +638,95 @@ impl Table {
         startrow: i64,
         nrow: i64,
     ) -> PyResult<()> {
-        // Simplify: full-cell writes only for slices where blc/trc cover the
-        // whole cell (the common dask-ms case is chunked row ranges).
-        let full_slice = blc.iter().all(|&b| b <= 0) && trc.is_empty();
-        let _ = full_slice;
-        self.putcol(py, column, value, startrow, nrow)
+        let _ = py;
+        let col_idx = self.col_index(column)?;
+        let startrow = startrow.max(0) as u64;
+        let nrow = if nrow <= 0 {
+            value.len()? as u64
+        } else {
+            nrow as u64
+        };
+        // Full-cell slice (blc=0.., trc=-1) -> plain putcol.
+        let full =
+            blc.iter().all(|&b| b <= 0) && trc.len() == blc.len() && trc.iter().all(|&t| t < 0);
+        if full {
+            return self.putcol(py, column, value, startrow as i64, nrow as i64);
+        }
+        // Overlay `value[nrow, sub...]` into each fixed cell at logical
+        // blc..trc. The numpy array is `(nrow, s0, s1, ...)` in C order.
+        let flat = convert::numpy_to_record_flat(value)
+            .ok_or_else(|| PyTypeError::new_err("putcolslice: unsupported element type"))??;
+        let shape_obj = value.getattr("shape")?;
+        let shape: Vec<usize> = shape_obj.extract()?;
+        if shape.is_empty() {
+            return Err(PyValueError::new_err("putcolslice: empty value"));
+        }
+        let sub: Vec<usize> = shape[1..].to_vec();
+        let sub_cell = sub.iter().product::<usize>().max(1);
+        let starts: Vec<usize> = blc.iter().map(|&b| b.max(0) as usize).collect();
+        // inclusive full-cell ends; -1 means "to the end of the sub-slice".
+        let ends: Vec<usize> = trc
+            .iter()
+            .zip(starts.iter())
+            .zip(sub.iter())
+            .map(|((&t, &s), &subd)| {
+                if t < 0 {
+                    s + subd - 1
+                } else {
+                    t.max(0) as usize
+                }
+            })
+            .collect();
+
+        for r in 0..nrow as usize {
+            let row = startrow + r as u64;
+            let mut cell = match self.read_cell(col_idx, row) {
+                Ok(c) => c,
+                Err(_) => RecordValue::Int(0),
+            };
+            // Cell's stored (as-given) shape; default for a missing cell.
+            let cshape: Vec<usize> = match &cell {
+                RecordValue::Array(a) => a.shape.iter().map(|&d| d as usize).collect(),
+                _ => {
+                    // Build a zero default of the fixed shape when present.
+                    let desc = self.desc();
+                    let fixed: Vec<usize> = desc.columns[col_idx]
+                        .shape
+                        .clone()
+                        .map(|s| s.iter().rev().map(|&d| d.max(0) as usize).collect())
+                        .unwrap_or_default();
+                    let n = fixed.iter().product::<usize>().max(1);
+                    let dt = desc.columns[col_idx].data_type;
+                    cell = RecordValue::Array(core::record::ArrayValue {
+                        shape: fixed.iter().map(|&d| d as u32).collect(),
+                        data: zero_elements(dt, n),
+                    });
+                    let _ = n;
+                    fixed
+                }
+            };
+            let mut grid = convert::cell_logical_flat(&cell);
+            let base = r * sub_cell;
+            for idx in 0..sub_cell {
+                let coords = convert::unflatten(idx, &sub);
+                let mut loc = vec![0usize; coords.len()];
+                for k in 0..coords.len() {
+                    let s = starts[k];
+                    let span = ends[k].saturating_sub(s) + 1;
+                    if coords[k] >= span {
+                        continue;
+                    }
+                    loc[k] = s + coords[k];
+                }
+                let lf = convert::flatten_coords(&loc, &cshape);
+                if lf < grid.len() && base + idx < flat.len() {
+                    grid[lf] = flat[base + idx].clone();
+                }
+            }
+            let stored = convert::cell_from_logical(grid, &cshape);
+            self.put_cell(col_idx, row, stored)?;
+        }
+        Ok(())
     }
 
     /// `putkeyword(name, value)`.
@@ -923,7 +1035,14 @@ impl Table {
         scalar_num!(bool, |e: &bool| RecordValue::Bool(*e));
         scalar_num!(Complex64, |e: &Complex64| RecordValue::DComplex(e.re, e.im));
         scalar_num!(Complex32, |e: &Complex32| RecordValue::Complex(e.re, e.im));
-        Err(PyTypeError::new_err("putcol: unsupported scalar data"))
+        // Fall back to a single-value conversion (numpy scalars, etc.).
+        let rec = convert::pyobject_to_record(py, value)?;
+        if matches!(rec, RecordValue::Array(_)) {
+            return Err(PyTypeError::new_err(
+                "putcol: unexpected array for a scalar column",
+            ));
+        }
+        Ok(vec![rec])
     }
 
     /// Serialize a column range to the python-visible form.
