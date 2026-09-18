@@ -211,6 +211,23 @@ subtasks are moved here.
   directory), recursively into nested records. New `subs` fixture covers
   same-dir / subdir / outside cases; casacore reads casacure-written subtable
   links back exactly (incl. nested) and opens the linked tables (74/74 tests).
+- TaQL subset (§5): a `taql` module with a tokenizer, recursive-descent
+  parser and expression evaluator covering the dialect dask-ms generates and
+  a DDL subset. `SELECT [UNIQUE] expr [AS name] FROM \$N [WHERE ...]
+  [ORDERBY ... [DESC]] [GROUPBY ...] [LIMIT n]`, `SELECT *`, `ROWID()`,
+  multi-key stable `ORDERBY` (DESC flips equal-key tie order like casacore),
+  `WHERE` with word/operator `AND`/`OR`/`NOT` and arithmetic/comparison/
+  functions over arbitrary user expressions, `GROUPBY` with `GROWID()`,
+  `GROWID()[i]`, `GCOUNT()`, `GAGGR(col)`, `SELECT UNIQUE` (first-occurrence
+  order), scalar subqueries `[SELECT ...]` and row lookups
+  `[SELECT ...][expr]`, and DDL `CREATE TABLE path [NAME TYPE
+  [NDIM=n, SHAPE=[...]] ...] LIMIT n` (casacore's type codes incl. I4/C8/S)
+  for fixtures. Semantics verified against real casacore on the ordering
+  probe (ORDERBY rowids, GROUPBY groups/aggregates, UNIQUE, subquery lookup)
+  and via a DDL-created table that casacore reads back exactly; `ragged`
+  GROUPBY groups return logically correct (unpadded) arrays, diverging from
+  casacore's fixed-shape zero-padding quirk. 7 unit tests; helpers added:
+  `TableRecord`/`ArrayValue::elements` JSON plumbing, `WritableTable::desc`.
 - `table` module: `parse_table_header` parses the `table.dat` root object
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit

@@ -10,6 +10,7 @@ pub mod record;
 pub mod ssm;
 pub mod table;
 pub mod tabledesc;
+pub mod taql;
 pub mod tsm;
 pub mod types;
 

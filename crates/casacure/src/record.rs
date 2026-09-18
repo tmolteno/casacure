@@ -209,6 +209,33 @@ pub struct ArrayValue {
     pub data: ArrayData,
 }
 
+impl ArrayValue {
+    /// The flat element values in row-major order.
+    pub fn elements(&self) -> Vec<RecordValue> {
+        let d = &self.data;
+        match d {
+            ArrayData::Bool(v) => v.iter().map(|b| RecordValue::Bool(*b)).collect(),
+            ArrayData::UChar(v) => v.iter().map(|x| RecordValue::UChar(*x)).collect(),
+            ArrayData::Short(v) => v.iter().map(|x| RecordValue::Short(*x)).collect(),
+            ArrayData::UShort(v) => v.iter().map(|x| RecordValue::UShort(*x)).collect(),
+            ArrayData::Int(v) => v.iter().map(|x| RecordValue::Int(*x)).collect(),
+            ArrayData::UInt(v) => v.iter().map(|x| RecordValue::UInt(*x)).collect(),
+            ArrayData::Int64(v) => v.iter().map(|x| RecordValue::Int64(*x)).collect(),
+            ArrayData::Float(v) => v.iter().map(|x| RecordValue::Float(*x)).collect(),
+            ArrayData::Double(v) => v.iter().map(|x| RecordValue::Double(*x)).collect(),
+            ArrayData::Complex(v) => v
+                .iter()
+                .map(|(re, im)| RecordValue::Complex(*re, *im))
+                .collect(),
+            ArrayData::DComplex(v) => v
+                .iter()
+                .map(|(re, im)| RecordValue::DComplex(*re, *im))
+                .collect(),
+            ArrayData::String(v) => v.iter().map(|x| RecordValue::String(x.clone())).collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ArrayData {
     Bool(Vec<bool>),

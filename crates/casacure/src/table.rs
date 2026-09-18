@@ -1326,6 +1326,11 @@ impl WritableTable {
         self.desc.keywords.to_json_string()
     }
 
+    /// The schema being built (columns, keywords, storage managers).
+    pub fn desc(&self) -> &crate::tabledesc::TableDesc {
+        &self.desc
+    }
+
     /// Set a column keyword (`putcolkeyword`).
     pub fn putcolkeyword(
         &mut self,

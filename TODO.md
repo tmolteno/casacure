@@ -43,12 +43,12 @@ Work areas follow `CASACORE_TO_CASA_RS.md` (tracked as GitHub issues).
 
 ## 5. TaQL subset
 
-- [ ] `SELECT ... FROM $N` with `$N` table references
-- [ ] `WHERE` expression evaluator (user `taql_where` passthrough)
-- [ ] `ORDERBY`, `ROWID()`
-- [ ] `GROUPBY` + `GROWID()`/`GAGGR()`/`GCOUNT()`
-- [ ] `SELECT UNIQUE col`, scalar subqueries
-- [ ] DDL: `CREATE TABLE ... LIMIT n` for test fixtures
+- [X] `SELECT ... FROM $N` with `$N` table references
+- [X] `WHERE` expression evaluator (user `taql_where` passthrough)
+- [X] `ORDERBY`, `ROWID()`
+- [X] `GROUPBY` + `GROWID()`/`GAGGR()`/`GCOUNT()`
+- [X] `SELECT UNIQUE col`, scalar subqueries
+- [X] DDL: `CREATE TABLE ... LIMIT n` for test fixtures
 
 ## 6. MS schema / descriptors
 
