@@ -6,15 +6,47 @@ build-backend = "maturin"
 name = "casacure"
 description = "A Rust replacement for the casacore table system, pip installable on any machine"
 readme = "README.md"
-license = { text = "LGPL-3.0-or-later" }
-requires-python = ">=3.9"
+requires-python = ">=3.9,<3.14"
+license = "LGPL-3.0-or-later"
+license-files = ["LICENSE*", "COPYING*", "NOTICE*"]
+authors = [{ name = "Tim Molteno", email = "tim@molteno.net" }]
+keywords = [
+    "casacore",
+    "measurement-set",
+    "radio-astronomy",
+    "CASA",
+    "AIPS",
+    "taql",
+    "fits",
+    "scientific-data",
+]
 classifiers = [
-    "Programming Language :: Rust",
-    "Programming Language :: Python :: 3",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU Lesser General Public License v3 or later (LGPLv3+)",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Astronomy",
 ]
+dependencies = []
 dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/tmolteno/casacure"
+Repository = "https://github.com/tmolteno/casacure"
+Changelog = "https://github.com/tmolteno/casacure/blob/main/CHANGELOG.md"
+Issues = "https://github.com/tmolteno/casacure/issues"
 
 [tool.maturin]
 manifest-path = "crates/casacure-python/Cargo.toml"
