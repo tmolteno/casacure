@@ -168,6 +168,7 @@ pub(crate) fn column_from_desc_dict(
                 ValueType::Complex => DataType::Complex,
                 ValueType::DComplex => DataType::DComplex,
                 ValueType::String => DataType::String,
+                ValueType::Record => DataType::Record,
             }
         }
         other => {
@@ -199,6 +200,10 @@ pub(crate) fn column_from_desc_dict(
         Some(RecordValue::Int64(i)) => *i as i32,
         _ => 0,
     };
+    // `ndim` present at all (any value, incl. -1) means an ARRAY column in
+    // casacore: -1 = unconstrained variable-shape, >= 0 = declared dims
+    // (variable unless `shape` is fixed). Absent means a scalar column.
+    let ndim_present = get("ndim").is_some();
     let ndim = match get("ndim") {
         Some(RecordValue::Int(i)) => *i,
         Some(RecordValue::Int64(i)) => *i as i32,
@@ -245,8 +250,11 @@ pub(crate) fn column_from_desc_dict(
     };
 
     // Scalar vs array: a column with an explicit `ndim >= 0` is an array
-    // column (fixed shape when `shape` is present, variable otherwise).
-    let kind = if ndim >= 0 {
+    // column (fixed shape when `shape` is present, variable otherwise);
+    // `record` columns are scalar records with no stored default.
+    let kind = if data_type == DataType::Record {
+        ColumnKind::Record
+    } else if ndim_present {
         ColumnKind::Array
     } else {
         ColumnKind::Scalar(default_scalar(data_type))

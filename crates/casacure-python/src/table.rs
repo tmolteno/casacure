@@ -18,14 +18,51 @@ use crate::convert;
 /// The backing state of a bound table.
 #[allow(clippy::large_enum_variant)]
 enum Inner {
-    /// Read-only access to an existing table.
-    Read(::casacure::Table),
-    /// Read + buffered writes; `read` serves metadata, `wt` holds cells.
+    /// Read-only access to an existing table. Holds the table DIR; opened
+    /// (re-parsed) fresh on every read so long-lived handles see later
+    /// writes, like casacore's live data managers.
+    Read(std::path::PathBuf),
+    /// Read + buffered writes backed by the process-shared record for the
+    /// table's directory.
     Write {
-        read: ::casacure::Table,
-        wt: core::WritableTable,
+        shared: std::sync::Arc<std::sync::Mutex<WriteData>>,
         dirty: bool,
     },
+}
+
+/// A writable table's shared process-wide state: all handles of a path share
+/// one materialised cell store + one read snapshot so concurrent column
+/// writes merge instead of one handle's flush clobbering another's.
+struct WriteData {
+    read: ::casacure::Table,
+    wt: core::WritableTable,
+}
+
+/// Live writable backing per table directory (weak: closed tables may be
+/// re-materialised by the next writable open).
+static WRITE_REGISTRY: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<std::path::PathBuf, std::sync::Arc<std::sync::Mutex<WriteData>>>,
+    >,
+> = std::sync::OnceLock::new();
+
+fn write_registry() -> &'static std::sync::Mutex<
+    std::collections::HashMap<std::path::PathBuf, std::sync::Arc<std::sync::Mutex<WriteData>>>,
+> {
+    WRITE_REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Link `dir` to `shared`, replacing any earlier backing (so a table
+/// re-created in this process gets fresh state).
+fn register_write(dir: &std::path::Path, shared: &std::sync::Arc<std::sync::Mutex<WriteData>>) {
+    let mut reg = write_registry().lock().unwrap();
+    reg.insert(dir.to_path_buf(), std::sync::Arc::clone(shared));
+}
+
+/// The shared backing for `dir` created earlier in this process (strong refs:
+/// stays live so later writable handles accumulate into the one cell store).
+fn find_write(dir: &std::path::Path) -> Option<std::sync::Arc<std::sync::Mutex<WriteData>>> {
+    write_registry().lock().unwrap().get(dir).cloned()
 }
 
 /// python-casacore-compatible `table` object.
@@ -123,12 +160,13 @@ impl Table {
             }
             let _ = wt.flush().map_err(err)?;
             let read = ::casacure::Table::open(&dir, false).map_err(err)?;
+            let shared = std::sync::Arc::new(std::sync::Mutex::new(WriteData { read, wt }));
+            register_write(&dir, &shared);
             return Ok(Table {
                 path: path.to_string(),
                 writable,
                 inner: Mutex::new(Inner::Write {
-                    read,
-                    wt,
+                    shared,
                     dirty: false,
                 }),
             });
@@ -138,7 +176,20 @@ impl Table {
             return Ok(Table {
                 path: path.to_string(),
                 writable: false,
-                inner: Mutex::new(Inner::Read(read)),
+                inner: Mutex::new(Inner::Read(dir)),
+            });
+        }
+        // Reuse a live shared backing for this directory so concurrent
+        // writable handles accumulate into one cell store (a second flush of
+        // a stale snapshot must not clobber the first handle's writes).
+        if let Some(shared) = find_write(&dir) {
+            return Ok(Table {
+                path: path.to_string(),
+                writable: true,
+                inner: Mutex::new(Inner::Write {
+                    shared,
+                    dirty: false,
+                }),
             });
         }
         // Materialise the current cells into a writable backing.
@@ -153,12 +204,13 @@ impl Table {
                 wt.putcell(j, r as u64, v.clone()).map_err(err)?;
             }
         }
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(WriteData { read, wt }));
+        register_write(&dir, &shared);
         Ok(Table {
             path: path.to_string(),
             writable: true,
             inner: Mutex::new(Inner::Write {
-                read,
-                wt,
+                shared,
                 dirty: false,
             }),
         })
@@ -168,11 +220,15 @@ impl Table {
     fn read_col(&self, col_idx: usize, startrow: u64, nrow: u64) -> PyResult<Vec<RecordValue>> {
         let inner = self.inner.lock().unwrap();
         match &*inner {
-            Inner::Read(t) => column_cells(t, col_idx, startrow, nrow),
-            Inner::Write { wt, .. } => {
+            Inner::Read(dir) => {
+                let t = ::casacure::Table::open(dir, false).map_err(err)?;
+                column_cells(&t, col_idx, startrow, nrow)
+            }
+            Inner::Write { shared, .. } => {
+                let s = shared.lock().unwrap();
                 let mut out = Vec::with_capacity(nrow as usize);
                 for r in startrow..startrow + nrow {
-                    match wt.cell(col_idx, r) {
+                    match s.wt.cell(col_idx, r) {
                         Some(v) => out.push(v.clone()),
                         None => {
                             return Err(PyValueError::new_err(format!(
@@ -189,16 +245,42 @@ impl Table {
     fn desc(&self) -> core::tabledesc::TableDesc {
         let inner = self.inner.lock().unwrap();
         match &*inner {
-            Inner::Read(t) => t.dat.desc.clone(),
-            Inner::Write { wt, .. } => wt.desc().clone(),
+            Inner::Read(dir) => match ::casacure::Table::open(dir, false) {
+                Ok(t) => t.dat.desc.clone(),
+                Err(_) => core::tabledesc::TableDesc {
+                    name: String::new(),
+                    version: String::new(),
+                    comment: String::new(),
+                    keywords: core::record::TableRecord {
+                        desc: Default::default(),
+                        record_type: 0,
+                        values: Vec::new(),
+                    },
+                    private_keywords: core::record::TableRecord {
+                        desc: Default::default(),
+                        record_type: 0,
+                        values: Vec::new(),
+                    },
+                    columns: Vec::new(),
+                },
+            },
+            Inner::Write { shared, .. } => {
+                let s = shared.lock().unwrap();
+                s.wt.desc().clone()
+            }
         }
     }
 
     fn row_count(&self) -> u64 {
         let inner = self.inner.lock().unwrap();
         match &*inner {
-            Inner::Read(t) => t.nrows(),
-            Inner::Write { wt, .. } => wt.col_len(0) as u64,
+            Inner::Read(dir) => ::casacure::Table::open(dir, false)
+                .map(|t| t.nrows())
+                .unwrap_or(0),
+            Inner::Write { shared, .. } => {
+                let s = shared.lock().unwrap();
+                s.wt.col_len(0) as u64
+            }
         }
     }
 }
@@ -267,15 +349,23 @@ impl Table {
     fn getkeywords(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.lock().unwrap();
         let rec = match &*inner {
-            Inner::Read(t) => &t.dat.desc.keywords,
-            Inner::Write { wt, .. } => &wt.desc().keywords,
+            Inner::Read(dir) => ::casacure::Table::open(dir, false)
+                .map(|t| t.dat.desc.keywords.clone())
+                .unwrap_or_else(|_| core::record::TableRecord {
+                    desc: Default::default(),
+                    record_type: 0,
+                    values: Vec::new(),
+                }),
+            Inner::Write { shared, .. } => shared.lock().unwrap().wt.desc().keywords.clone(),
         };
         let base = std::path::Path::new(&self.path)
             .parent()
             .map(|p| p.to_path_buf());
-        Ok(convert::table_record_to_dict_ctx(py, rec, base.as_deref())?
-            .into_any()
-            .unbind())
+        Ok(
+            convert::table_record_to_dict_ctx(py, &rec, base.as_deref())?
+                .into_any()
+                .unbind(),
+        )
     }
 
     /// `getcolkeywords(column)` -> dict.
@@ -298,11 +388,17 @@ impl Table {
     /// `getdminfo()` -> dict.
     fn getdminfo(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.lock().unwrap();
-        let (dir, dat) = match &*inner {
-            Inner::Read(t) => (PathBuf::from(t.name()), &t.dat),
-            Inner::Write { read, .. } => (PathBuf::from(read.name()), &read.dat),
+        let info = match &*inner {
+            Inner::Read(dir) => {
+                let t = ::casacure::Table::open(dir, false).map_err(err)?;
+                core::get_dminfo(dir, &t.dat).map_err(err)?
+            }
+            Inner::Write { shared, .. } => {
+                let s = shared.lock().unwrap();
+                let dir = PathBuf::from(s.read.name());
+                core::get_dminfo(&dir, &s.read.dat).map_err(err)?
+            }
         };
-        let info = core::get_dminfo(&dir, dat).map_err(err)?;
         let out = PyDict::new(py);
         for (key, dm) in &info {
             let d = PyDict::new(py);
@@ -326,38 +422,46 @@ impl Table {
         dminfo: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let _ = dminfo;
-        let mut inner = self.inner.lock().unwrap();
-        match &mut *inner {
-            Inner::Write { wt, dirty, .. } => {
-                // Pull the desc's columns out (they live in a dict of
-                // {colname: coldesc}).
-                let json = {
-                    let rec = convert::dict_to_table_record(py, coldesc)?;
-                    rec.to_json_string()
-                };
+        {
+            let mut inner = self.inner.lock().unwrap();
+            match &mut *inner {
+                Inner::Write { shared, dirty, .. } => {
+                    // Pull the desc's columns out (they live in a dict of
+                    // {colname: coldesc}).
+                    let json = {
+                        let rec = convert::dict_to_table_record(py, coldesc)?;
+                        rec.to_json_string()
+                    };
 
-                let parsed = core::tabledesc::TableDesc::from_desc_json(&json).map_err(err)?;
-                for cd in parsed.columns {
-                    wt.addcol(cd);
+                    let parsed = core::tabledesc::TableDesc::from_desc_json(&json).map_err(err)?;
+                    let mut s = shared.lock().unwrap();
+                    for cd in parsed.columns {
+                        s.wt.addcol(cd);
+                    }
+                    *dirty = true;
                 }
-                *dirty = true;
-                Ok(())
+                _ => return Err(PyValueError::new_err("table is not writable")),
             }
-            _ => Err(PyValueError::new_err("table is not writable")),
         }
+        self.flush()?;
+        Ok(())
     }
 
     /// `addrows(n)`; grows the table by `n` empty rows.
     fn addrows(&self, n: u64) -> PyResult<()> {
-        let mut inner = self.inner.lock().unwrap();
-        match &mut *inner {
-            Inner::Write { wt, dirty, .. } => {
-                wt.addrows(n);
-                *dirty = true;
-                Ok(())
+        {
+            let mut inner = self.inner.lock().unwrap();
+            match &mut *inner {
+                Inner::Write { shared, dirty, .. } => {
+                    let mut s = shared.lock().unwrap();
+                    s.wt.addrows(n);
+                    *dirty = true;
+                }
+                _ => return Err(PyValueError::new_err("table is not writable")),
             }
-            _ => Err(PyValueError::new_err("table is not writable")),
         }
+        self.flush()?;
+        Ok(())
     }
 
     /// `lock(write=False)` — advisory only in the replacement.
@@ -373,9 +477,10 @@ impl Table {
 
     fn flush(&self) -> PyResult<()> {
         let mut inner = self.inner.lock().unwrap();
-        if let Inner::Write { wt, dirty, read } = &mut *inner {
-            let dir = wt.flush().map_err(err)?;
-            *read = ::casacure::Table::open(&dir, false).map_err(err)?;
+        if let Inner::Write { shared, dirty } = &mut *inner {
+            let mut s = shared.lock().unwrap();
+            let dir = s.wt.flush().map_err(err)?;
+            s.read = ::casacure::Table::open(&dir, false).map_err(err)?;
             *dirty = false;
         }
         Ok(())
@@ -571,7 +676,9 @@ impl Table {
     ) -> PyResult<()> {
         let col_idx = self.col_index(column)?;
         let rec = convert::pyobject_to_record(py, value)?;
-        self.put_cell(col_idx, row, rec)
+        self.put_cell(col_idx, row, rec)?;
+        self.flush()?;
+        Ok(())
     }
 
     /// `putcol(column, value, startrow=0, nrow=0)` — ndarray or list.
@@ -619,6 +726,7 @@ impl Table {
                 });
                 self.put_cell(col_idx, startrow + r as u64, rec)?;
             }
+            self.flush()?;
             return Ok(());
         }
         // Dict form: `{"rN": value, ...}` — per-row scalar/array writes
@@ -647,6 +755,7 @@ impl Table {
                 self.put_cell(col_idx, row, rec)?;
                 let _ = i;
             }
+            self.flush()?;
             return Ok(());
         }
         let nrow = if nrow <= 0 {
@@ -663,6 +772,7 @@ impl Table {
         for (i, v) in values.into_iter().enumerate() {
             self.put_cell(col_idx, startrow + i as u64, v)?;
         }
+        self.flush()?;
         Ok(())
     }
 
@@ -714,6 +824,7 @@ impl Table {
             let rec = cells.pop().unwrap_or(RecordValue::Int(0));
             self.put_cell(col_idx, row, rec)?;
         }
+        self.flush()?;
         Ok(())
     }
 
@@ -818,21 +929,26 @@ impl Table {
             let stored = convert::cell_from_logical(grid, &cshape);
             self.put_cell(col_idx, row, stored)?;
         }
+        self.flush()?;
         Ok(())
     }
 
     /// `putkeyword(name, value)`.
     fn putkeyword(&self, py: Python<'_>, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
         let rec = convert::pyobject_to_record(py, value)?;
-        let mut inner = self.inner.lock().unwrap();
-        match &mut *inner {
-            Inner::Write { wt, dirty, .. } => {
-                wt.putkeyword(name, rec);
-                *dirty = true;
-                Ok(())
+        {
+            let mut inner = self.inner.lock().unwrap();
+            match &mut *inner {
+                Inner::Write { shared, dirty, .. } => {
+                    let mut s = shared.lock().unwrap();
+                    s.wt.putkeyword(name, rec);
+                    *dirty = true;
+                }
+                _ => return Err(PyValueError::new_err("table is not writable")),
             }
-            _ => Err(PyValueError::new_err("table is not writable")),
         }
+        self.flush()?;
+        Ok(())
     }
 
     /// `putkeywords(dict)`.
@@ -846,15 +962,19 @@ impl Table {
 
     /// `removekeyword(name)`.
     fn removekeyword(&self, name: &str) -> PyResult<()> {
-        let mut inner = self.inner.lock().unwrap();
-        match &mut *inner {
-            Inner::Write { wt, dirty, .. } => {
-                wt.removekeyword(name);
-                *dirty = true;
-                Ok(())
+        {
+            let mut inner = self.inner.lock().unwrap();
+            match &mut *inner {
+                Inner::Write { shared, dirty, .. } => {
+                    let mut s = shared.lock().unwrap();
+                    s.wt.removekeyword(name);
+                    *dirty = true;
+                }
+                _ => return Err(PyValueError::new_err("table is not writable")),
             }
-            _ => Err(PyValueError::new_err("table is not writable")),
         }
+        self.flush()?;
+        Ok(())
     }
 
     /// `putcolkeyword(column, name, value)`.
@@ -867,15 +987,19 @@ impl Table {
     ) -> PyResult<()> {
         let col_idx = self.col_index(column)?;
         let rec = convert::pyobject_to_record(py, value)?;
-        let mut inner = self.inner.lock().unwrap();
-        match &mut *inner {
-            Inner::Write { wt, dirty, .. } => {
-                wt.putcolkeyword(col_idx, name, rec).map_err(err)?;
-                *dirty = true;
-                Ok(())
+        {
+            let mut inner = self.inner.lock().unwrap();
+            match &mut *inner {
+                Inner::Write { shared, dirty, .. } => {
+                    let mut s = shared.lock().unwrap();
+                    s.wt.putcolkeyword(col_idx, name, rec).map_err(err)?;
+                    *dirty = true;
+                }
+                _ => return Err(PyValueError::new_err("table is not writable")),
             }
-            _ => Err(PyValueError::new_err("table is not writable")),
         }
+        self.flush()?;
+        Ok(())
     }
 
     /// `putcolkeywords(column, dict)`.
@@ -895,15 +1019,19 @@ impl Table {
     /// `removecolkeyword(column, name)`.
     fn removecolkeyword(&self, column: &str, name: &str) -> PyResult<()> {
         let col_idx = self.col_index(column)?;
-        let mut inner = self.inner.lock().unwrap();
-        match &mut *inner {
-            Inner::Write { wt, dirty, .. } => {
-                wt.removecolkeyword(col_idx, name).map_err(err)?;
-                *dirty = true;
-                Ok(())
+        {
+            let mut inner = self.inner.lock().unwrap();
+            match &mut *inner {
+                Inner::Write { shared, dirty, .. } => {
+                    let mut s = shared.lock().unwrap();
+                    s.wt.removecolkeyword(col_idx, name).map_err(err)?;
+                    *dirty = true;
+                }
+                _ => return Err(PyValueError::new_err("table is not writable")),
             }
-            _ => Err(PyValueError::new_err("table is not writable")),
         }
+        self.flush()?;
+        Ok(())
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -952,11 +1080,16 @@ impl Table {
     fn read_cell(&self, col_idx: usize, row: u64) -> PyResult<RecordValue> {
         let inner = self.inner.lock().unwrap();
         match &*inner {
-            Inner::Read(t) => t.getcell(col_idx, row).map_err(err),
-            Inner::Write { wt, .. } => wt
-                .cell(col_idx, row)
-                .cloned()
-                .ok_or_else(|| PyValueError::new_err(format!("cell ({col_idx}, {row}) not set"))),
+            Inner::Read(dir) => {
+                let t = ::casacure::Table::open(dir, false).map_err(err)?;
+                t.getcell(col_idx, row).map_err(err)
+            }
+            Inner::Write { shared, .. } => {
+                let s = shared.lock().unwrap();
+                s.wt.cell(col_idx, row).cloned().ok_or_else(|| {
+                    PyValueError::new_err(format!("cell ({col_idx}, {row}) not set"))
+                })
+            }
         }
     }
 
@@ -969,11 +1102,17 @@ impl Table {
     ) -> PyResult<RecordValue> {
         let inner = self.inner.lock().unwrap();
         match &*inner {
-            Inner::Read(t) => t.getcellslice(col_idx, row, blc, trc).map_err(err),
-            Inner::Write { wt, .. } => match wt.cell(col_idx, row) {
-                Some(v) => Ok(v.clone()),
-                None => Err(PyValueError::new_err("cell not set")),
-            },
+            Inner::Read(dir) => {
+                let t = ::casacure::Table::open(dir, false).map_err(err)?;
+                t.getcellslice(col_idx, row, blc, trc).map_err(err)
+            }
+            Inner::Write { shared, .. } => {
+                let s = shared.lock().unwrap();
+                match s.wt.cell(col_idx, row) {
+                    Some(v) => Ok(v.clone()),
+                    None => Err(PyValueError::new_err("cell not set")),
+                }
+            }
         }
     }
 
@@ -987,13 +1126,16 @@ impl Table {
     ) -> PyResult<Vec<RecordValue>> {
         let inner = self.inner.lock().unwrap();
         match &*inner {
-            Inner::Read(t) => t
-                .getcolslice(col_idx, blc, trc, startrow, nrow)
-                .map_err(err),
-            Inner::Write { wt, .. } => {
+            Inner::Read(dir) => {
+                let t = ::casacure::Table::open(dir, false).map_err(err)?;
+                t.getcolslice(col_idx, blc, trc, startrow, nrow)
+                    .map_err(err)
+            }
+            Inner::Write { shared, .. } => {
+                let s = shared.lock().unwrap();
                 let mut out = Vec::with_capacity(nrow as usize);
                 for r in startrow..startrow + nrow {
-                    match wt.cell(col_idx, r) {
+                    match s.wt.cell(col_idx, r) {
                         Some(v) => out.push(v.clone()),
                         None => return Err(PyValueError::new_err("cell not set")),
                     }
@@ -1006,8 +1148,9 @@ impl Table {
     fn put_cell(&self, col_idx: usize, row: u64, value: RecordValue) -> PyResult<()> {
         let mut inner = self.inner.lock().unwrap();
         match &mut *inner {
-            Inner::Write { wt, dirty, .. } => {
-                wt.putcell(col_idx, row, value).map_err(err)?;
+            Inner::Write { shared, dirty, .. } => {
+                let mut s = shared.lock().unwrap();
+                s.wt.putcell(col_idx, row, value).map_err(err)?;
                 *dirty = true;
                 Ok(())
             }
@@ -1025,11 +1168,53 @@ impl Table {
         is_array_col: bool,
         varcol: bool,
     ) -> PyResult<Vec<RecordValue>> {
+        // Coerce numeric ndarrays to the column's element type (casacore
+        // casts, e.g. complex64 -> dcomplex when the column is C8).
+        let mut coerced: Option<Bound<'_, PyAny>> = None;
+        if is_array_col {
+            if let Some(npd) = core::record::data_type_to_np(
+                self.desc().columns.get(_col_idx).map(|c| &c.data_type),
+            ) {
+                // Any ndarray (typed ndarrays don't all downcast to the
+                // `PyArrayDyn<PyAny>` form, e.g. complex64).
+                if value.getattr("dtype").is_ok()
+                    && value.downcast::<PyList>().is_err()
+                    && value.downcast::<PyDict>().is_err()
+                {
+                    let dtype = value.getattr("dtype")?;
+                    let kind: String = dtype.getattr("kind")?.extract()?;
+                    let itemsize: i64 = dtype.getattr("itemsize")?.extract()?;
+                    let have = core::record::np_kind_itemsize(&kind, itemsize);
+                    if have != Some(npd) {
+                        coerced = Some(value.call_method1("astype", (npd,))?);
+                    }
+                }
+            }
+        }
+        let value = match &coerced {
+            Some(c) => c,
+            None => value,
+        };
         if is_array_col {
             // Accept a 2-D+ ndarray or a list of row-arrays.
             if value.downcast::<PyDict>().is_ok() {
                 let rec = convert::py_to_string_array(py, value)?;
                 return Ok(vec![rec]);
+            }
+            // Complex arrays (the coercion above has already matched the
+            // array to the column precision); numpy 0.26 names: Complex32 =
+            // c64 (float32 complex), Complex64 = c128 (float64 complex).
+            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<numpy::Complex32>>() {
+                let readonly = arr.readonly();
+                return ndarray_cells(&readonly, nrow, varcol, |e| {
+                    RecordValue::Complex(e.re, e.im)
+                });
+            }
+            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<numpy::Complex64>>() {
+                let readonly = arr.readonly();
+                return ndarray_cells(&readonly, nrow, varcol, |e| {
+                    RecordValue::DComplex(e.re, e.im)
+                });
             }
             if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<Py<PyAny>>>() {
                 let readonly = arr.readonly();
@@ -1165,8 +1350,8 @@ impl Table {
         let first = cells.iter().find(|c| !matches!(c, RecordValue::String(_)));
         let is_array_col = matches!(first, Some(RecordValue::Array(_)));
         if !is_array_col {
-            // Strings: plain list; numbers: 1-D numpy array.
-            if let RecordValue::String(_) | RecordValue::Table(_) = cells.first().unwrap() {
+            // Empty cells (e.g. a taql result with no rows): return empty.
+            if let Some(RecordValue::String(_) | RecordValue::Table(_)) = cells.first() {
                 let list = PyList::empty(py);
                 for v in cells {
                     let s = match v {
@@ -1357,8 +1542,8 @@ fn self_coldesc<'py>(
                 let logical: Vec<i64> = shape.iter().rev().copied().collect();
                 d.set_item("shape", logical)?;
             }
-            d.set_item("_c_order", true)?;
         }
+        d.set_item("_c_order", true)?;
     }
     d.set_item(
         "keywords",
@@ -1484,6 +1669,8 @@ pub fn taql(
         // tables stay borrowed.
         let objects: Vec<PyRef<'_, Table>>;
         let locks: Vec<std::sync::MutexGuard<'_, Inner>>;
+        let shared_guards: Vec<Option<std::sync::MutexGuard<'_, WriteData>>>;
+        let read_tables: Vec<::casacure::Table>;
         let core_refs: Vec<&::casacure::Table>;
         if let Some(ts) = tables {
             objects = ts
@@ -1494,19 +1681,40 @@ pub fn taql(
                 })
                 .collect::<PyResult<_>>()?;
             locks = objects.iter().map(|t| t.inner.lock().unwrap()).collect();
-            core_refs = locks
+            read_tables = locks
+                .iter()
+                .filter_map(|g| match &**g {
+                    Inner::Read(dir) => Some(::casacure::Table::open(dir, false)),
+                    _ => None,
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(err)?;
+            shared_guards = locks
                 .iter()
                 .map(|g| match &**g {
-                    Inner::Read(r) => r,
-                    Inner::Write { read, .. } => read,
+                    Inner::Write { shared, .. } => Some(shared.lock().unwrap()),
+                    _ => None,
+                })
+                .collect();
+            let mut read_it = read_tables.iter();
+            core_refs = locks
+                .iter()
+                .zip(shared_guards.iter())
+                .map(|(g, sg)| match &**g {
+                    Inner::Read(_) => read_it.next().expect("read table iterator exhausted"),
+                    Inner::Write { .. } => {
+                        &sg.as_ref().expect("write table has a shared guard").read
+                    }
                 })
                 .collect();
         } else {
             objects = Vec::new();
             locks = Vec::new();
+            read_tables = Vec::new();
+            shared_guards = Vec::new();
             core_refs = Vec::new();
-            // objects/locks only exist to keep the borrows alive.
-            let _ = (&objects, &locks);
+            // objects/locks/guards only exist to keep borrows alive.
+            let _ = (&objects, &locks, &read_tables, &shared_guards);
         }
         let result = core::taql::execute(query, &core_refs).map_err(err)?;
         return match result {
@@ -1620,12 +1828,13 @@ fn taql_result_to_table(_py: Python<'_>, out: core::taql::TaqlTable) -> PyResult
     }
     let _ = wt.flush().map_err(err)?;
     let read = ::casacure::Table::open(&dir, false).map_err(err)?;
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(WriteData { read, wt }));
+    register_write(&dir, &shared);
     Ok(Table {
         path: dir.display().to_string(),
         writable: true,
         inner: Mutex::new(Inner::Write {
-            read,
-            wt,
+            shared,
             dirty: false,
         }),
     })

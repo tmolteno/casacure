@@ -187,24 +187,3 @@ pub static SCHEMAS: &[(&str, bool, &str)] = &[
         r##"{"ANTENNA_ID":{"valueType":"int","dataManagerType":"StandardStMan","dataManagerGroup":"StandardStMan","option":0,"maxlen":0,"comment":"Antenna number","keywords":{}},"INTERVAL":{"valueType":"double","dataManagerType":"StandardStMan","dataManagerGroup":"StandardStMan","option":0,"maxlen":0,"comment":"Interval over which data is relevant","keywords":{"QuantumUnits":["s"]}},"TIME":{"valueType":"double","dataManagerType":"StandardStMan","dataManagerGroup":"StandardStMan","option":0,"maxlen":0,"comment":"An MEpoch specifying the midpoint of the time forwhich data is relevant","keywords":{"QuantumUnits":["s"],"MEASINFO":{"type":"epoch","Ref":"UTC"}}},"_define_hypercolumn_":{},"_keywords_":{},"_private_keywords_":{}}"##,
     ),
 ];
-
-/// All subtable names known to the canonical schema.
-pub static SUBTABLES: &[&str] = &[
-    "ANTENNA",
-    "DATA_DESCRIPTION",
-    "DOPPLER",
-    "FEED",
-    "FIELD",
-    "FLAG_CMD",
-    "FREQ_OFFSET",
-    "HISTORY",
-    "OBSERVATION",
-    "POINTING",
-    "POLARIZATION",
-    "PROCESSOR",
-    "SOURCE",
-    "SPECTRAL_WINDOW",
-    "STATE",
-    "SYSCAL",
-    "WEATHER",
-];

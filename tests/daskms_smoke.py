@@ -147,6 +147,10 @@ def main():
     # Write back doubled DATA, keeping the graph lazy.
     xds = xds_from_table(path)[0]
     orig = xds.DATA.data
+    # Snapshot the expected pre-write values: with live data-manager reads
+    # (like real casacore) `orig.compute()` after the write would re-read the
+    # already-doubled table.
+    expected = np.asarray(orig.compute()) * 2
     xds2 = xds.assign(DATA=(xds.DATA.dims, orig * 2))
     dask.compute(xds_to_table(xds2, path, ["DATA"]))
     print("dask-ms write: OK")
@@ -157,7 +161,7 @@ def main():
 
         t = casacore_table(path, ack=False)
         assert np.allclose(
-            t.getcol("DATA"), orig.compute() * 2
+            t.getcol("DATA"), expected
         ), "write-back DATA mismatch"
         assert list(t.getcol("TIME")) == [0.0, 1.5, 3.0], "TIME clobbered"
         print("casacore cross-check: OK")

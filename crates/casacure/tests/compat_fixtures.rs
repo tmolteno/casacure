@@ -85,6 +85,7 @@ fn expected_getcol_dtype(vt: ValueType) -> &'static str {
         ValueType::Complex => "<c8",
         ValueType::DComplex => "<c16",
         ValueType::String => "list",
+        ValueType::Record => "record",
     }
 }
 

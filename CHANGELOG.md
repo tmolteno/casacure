@@ -341,6 +341,42 @@ subtasks are moved here.
     so `MS_VERSION` stays a float) and resolve `TpTable` fields to
     `"Table: <abs-path>"` like python-casacore (`test_dataset_keywords` 10/10).
 
+- **dask-ms's entire test suite passes**: **219 passed / 0 failed**
+  (all of `daskms/tests/` via the `casacore.tables` shim: dataset, keywords,
+  ordering, table, columns, table_proxy, ms_creation, ms_read_and_update,
+  dataset_schema, columns, array_api_utils, storage, stress, patterns,
+  optimisation, optional, multiton, utils, table_schemas). Major changes that
+  closed the last gaps:
+  - **live data-manager reads**: read-only `table()` handles re-parse the disk
+    on every read instead of serving a stale snapshot (a long-lived read
+    handle now sees later writes, like casacore) — `test_ms_update`'s
+    write-then-read cycles pass.
+  - **process-wide shared writable state**: all writable handles of a table
+    directory share one materialised cell store + read snapshot (strong refs
+    in a global registry), so dask-ms's parallel per-chunk column writes merge
+    instead of one flush clobbering another's — `test_ms_update`/`ms_creation`
+    pass.
+  - **eager persistence**: every mutating binding call (putcell/putcol/
+    putvarcol/putcolslice/addrows/addcols/keywords) flushes immediately, so
+    writes survive without an explicit `close()` (python-casacore proxy
+    `putcol` does not flush) — `test_ms_update` passes.
+  - **numeric dtype coercion in putcol**: incoming ndarrays are cast to the
+    column element type (complex64 -> dcomplex etc., like casacore); complex
+    arrays previously fell into the string write path and corrupted the SSM —
+    `test_array_protocol_write`/`test_fake_{cupy,torch}_gpu_write` pass.
+  - **taql SELECT projections** copy array/record cells verbatim (TqValue
+    could not round-trip complex/array cells — it flattened shapes and erased
+    values) — `test_ms_read` passes; empty taql results no longer panic.
+  - **record columns** (`SOURCE_MODEL`, valueType "record"): descriptor
+    parsing, `default_ms_subtable` creating from the provided desc and
+    returning a context manager, and SSM storage of serialised record cells —
+    `test_ms_create` passes.
+  - **`ndim: -1` = variable array column** (casacore semantics: any `ndim`
+    key, including -1, marks an array column); `getcell` strips the leading
+    row singleton when it restores the declared rank; the vendored `ms_schema`
+    regenerated from real casacore with correct `ndim`/`_c_order` on all
+    array columns.
+
 - `table` module: `parse_table_header` parses the `table.dat` root object
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit

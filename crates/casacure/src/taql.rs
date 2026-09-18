@@ -970,8 +970,15 @@ fn run_group(ctx: &EvalCtx<'_>, sel: &Select) -> TResult<TaqlTable> {
     for (e, _name) in &cols {
         let mut vals = Vec::with_capacity(groups.len());
         for group in &groups {
-            let v = ctx.eval_group(e, group)?;
-            vals.push(v.to_record());
+            let v = match e {
+                // Bare columns in a grouped query: the group's members share
+                // the value only when singleton; keep the first cell verbatim.
+                Expr::Name(n) if !n.eq_ignore_ascii_case("rowid") && group.len() == 1 => {
+                    ctx.cell(n, group[0])?
+                }
+                _ => ctx.eval_group(e, group)?.to_record(),
+            };
+            vals.push(v);
         }
         out_cols.push(vals);
     }
@@ -1022,8 +1029,11 @@ fn project_rows(ctx: &EvalCtx<'_>, sel: &Select, rows: &[i64]) -> TResult<TaqlTa
     for (e, _name) in &cols {
         let mut vals = Vec::with_capacity(rows.len());
         for &r in rows {
-            let v = ctx.eval_row(e, r)?;
-            vals.push(v.to_record());
+            let v = match e {
+                Expr::Name(n) if !n.eq_ignore_ascii_case("rowid") => ctx.cell(n, r)?,
+                _ => ctx.eval_row(e, r)?.to_record(),
+            };
+            vals.push(v);
         }
         out_cols.push(vals);
     }
@@ -1099,6 +1109,22 @@ impl<'a> EvalCtx<'a> {
             .get(row as usize)
             .cloned()
             .unwrap_or(TqValue::Int(0)))
+    }
+
+    /// The raw cell for a bare column reference, cloned verbatim from the
+    /// source table. Array / record cells (complexes, multidim shapes) do not
+    /// survive the `TqValue` round-trip, so projections keep them intact.
+    fn cell(&self, name: &str, row: i64) -> TResult<RecordValue> {
+        let idx = *self
+            .colidx
+            .get(name)
+            .ok_or_else(|| TaqlError::NoSuchAttribute {
+                what: "table".to_string(),
+                field: name.to_string(),
+            })?;
+        self.table
+            .getcell(idx, row as u64)
+            .map_err(|e| TaqlError::Eval(format!("getcell {name}[{row}]: {e}")))
     }
 
     /// Evaluate in a row context.

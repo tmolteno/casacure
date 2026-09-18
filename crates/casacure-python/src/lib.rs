@@ -77,14 +77,28 @@ fn default_ms(
 #[pyfunction]
 #[pyo3(signature = (name, path, tabdesc = None, dminfo = None))]
 fn default_ms_subtable(
+    py: Python<'_>,
     name: &str,
     path: &str,
     tabdesc: Option<&Bound<'_, PyAny>>,
     dminfo: Option<&Bound<'_, PyAny>>,
-) -> PyResult<()> {
-    let _ = (tabdesc, dminfo);
-    ::casacure::ms::default_ms_subtable(name, std::path::Path::new(path))
-        .map_err(|e| PyValueError::new_err(e.to_string()))
+) -> PyResult<Py<PyAny>> {
+    // Create the subtable at `path` from the provided desc (like the
+    // python-casacore `default_ms_subtable`, which honours the given
+    // tabdesc) and return it as a context manager (`with ...:`).
+    let t = table::table(
+        py,
+        path,
+        tabdesc,
+        0,
+        dminfo,
+        false,
+        true,
+        &PyTuple::empty(py),
+        None,
+    )?;
+    let _ = name;
+    Ok(t.into_pyobject(py)?.into_any().unbind())
 }
 
 /// `required_ms_desc(name=None)` -> the descriptor dict.

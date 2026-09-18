@@ -1398,6 +1398,47 @@ impl<'a> JsonParser<'a> {
     }
 }
 
+/// Map a CASA `DataType` to the numpy dtype string casacore would coerce an
+/// incoming numeric array to (None for string/record columns).
+pub fn data_type_to_np(dt: Option<&DataType>) -> Option<&'static str> {
+    use DataType::*;
+    match dt? {
+        Bool => Some("bool"),
+        UChar => Some("uint8"),
+        Short => Some("int16"),
+        UShort => Some("uint16"),
+        Int => Some("int32"),
+        UInt => Some("uint32"),
+        Int64 => Some("int64"),
+        Float => Some("float32"),
+        Double => Some("float64"),
+        Complex => Some("complex64"),
+        DComplex => Some("complex128"),
+        _ => None,
+    }
+}
+
+/// The numpy dtype string matching a `(kind, itemsize)` pair from numpy's
+/// `dtype.kind` / `dtype.itemsize`.
+pub fn np_kind_itemsize(kind: &str, itemsize: i64) -> Option<&'static str> {
+    match (kind, itemsize) {
+        ("b", _) => Some("bool"),
+        ("u", 1) => Some("uint8"),
+        ("u", 2) => Some("uint16"),
+        ("u", 4) => Some("uint32"),
+        ("u", 8) => Some("uint64"),
+        ("i", 1) => Some("int8"),
+        ("i", 2) => Some("int16"),
+        ("i", 4) => Some("int32"),
+        ("i", 8) => Some("int64"),
+        ("f", 4) => Some("float32"),
+        ("f", 8) => Some("float64"),
+        ("c", 8) => Some("complex64"),
+        ("c", 16) => Some("complex128"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -33,6 +33,8 @@ pub enum ValueType {
     DComplex,
     /// `STRING` — numpy `object`
     String,
+    /// `RECORD` — a nested record (e.g. the MS `SOURCE_MODEL` column).
+    Record,
 }
 
 /// Errors from parsing type names.
@@ -42,7 +44,7 @@ pub struct UnknownValueType(pub String);
 
 impl ValueType {
     /// All value types, in declaration order.
-    pub const ALL: [ValueType; 11] = [
+    pub const ALL: [ValueType; 12] = [
         ValueType::Bool,
         ValueType::Byte,
         ValueType::Short,
@@ -54,6 +56,7 @@ impl ValueType {
         ValueType::Complex,
         ValueType::DComplex,
         ValueType::String,
+        ValueType::Record,
     ];
 
     /// Canonical (uppercase) casacore name, as used in column descriptors.
@@ -70,6 +73,7 @@ impl ValueType {
             ValueType::Complex => "COMPLEX",
             ValueType::DComplex => "DCOMPLEX",
             ValueType::String => "STRING",
+            ValueType::Record => "RECORD",
         }
     }
 
@@ -89,6 +93,7 @@ impl ValueType {
             ValueType::Complex => "Complex",
             ValueType::DComplex => "DComplex",
             ValueType::String => "String",
+            ValueType::Record => "Record",
         }
     }
 
@@ -107,6 +112,7 @@ impl ValueType {
             "FCOMPLEX" | "COMPLEX" => ValueType::Complex,
             "DCOMPLEX" => ValueType::DComplex,
             "STRING" => ValueType::String,
+            "RECORD" => ValueType::Record,
             _ => return Err(UnknownValueType(name.to_string())),
         })
     }
@@ -125,6 +131,7 @@ impl ValueType {
             ValueType::Complex => "complex64",
             ValueType::DComplex => "complex128",
             ValueType::String => "object",
+            ValueType::Record => "record",
         }
     }
 
@@ -142,6 +149,7 @@ impl ValueType {
             ValueType::Complex => Some(8),
             ValueType::DComplex => Some(16),
             ValueType::String => None,
+            ValueType::Record => None,
         }
     }
 }

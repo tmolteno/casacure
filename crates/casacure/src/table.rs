@@ -446,7 +446,10 @@ fn build_ssm_data(
                 }
             }
             crate::tabledesc::ColumnKind::Record => {
-                return Err(TableCreateError::NotScalar(cd.name.clone()))
+                // Scalar record cells are stored like variable strings: a
+                // 12-byte (bucket, offset, len) reference into the string
+                // buckets holding the serialized record.
+                (12, 8 * 12)
             }
         };
         cell_bits.push(bits);
@@ -564,7 +567,30 @@ fn build_ssm_data(
                     has_arrays = true;
                     array_index.extend_from_slice(&record);
                 }
-                crate::tabledesc::ColumnKind::Record => unreachable!(),
+                crate::tabledesc::ColumnKind::Record => {
+                    let content = match value {
+                        RecordValue::Record(r) => r.to_json_string().into_bytes(),
+                        other => {
+                            return Err(TableCreateError::NotScalar(format!(
+                                "{}.{}: expected a record cell, got {other:?}",
+                                desc.name, cd.name
+                            )))
+                        }
+                    };
+                    let (bucket, offset) = str_buckets.put(&content);
+                    has_strings = true;
+                    let mut cell = vec![0u8; 12];
+                    if big_endian {
+                        cell[0..4].copy_from_slice(&bucket.to_be_bytes());
+                        cell[4..8].copy_from_slice(&offset.to_be_bytes());
+                        cell[8..12].copy_from_slice(&(content.len() as i32).to_be_bytes());
+                    } else {
+                        cell[0..4].copy_from_slice(&bucket.to_le_bytes());
+                        cell[4..8].copy_from_slice(&offset.to_le_bytes());
+                        cell[8..12].copy_from_slice(&(content.len() as i32).to_le_bytes());
+                    }
+                    bytes.extend_from_slice(&cell);
+                }
             }
         }
         encoded.push(bytes);
@@ -963,6 +989,7 @@ pub fn casa_value_type(dt: crate::record::DataType) -> &'static str {
         DataType::Complex => "complex",
         DataType::DComplex => "dcomplex",
         DataType::String => "string",
+        DataType::Record => "record",
         _ => "unknown",
     }
 }
@@ -1497,7 +1524,13 @@ fn default_cell_value(cd: &crate::tabledesc::ColumnDesc) -> Option<RecordValue> 
                 data,
             }))
         }
-        crate::tabledesc::ColumnKind::Record => None,
+        crate::tabledesc::ColumnKind::Record => {
+            Some(RecordValue::Record(crate::record::TableRecord {
+                desc: Default::default(),
+                record_type: 0,
+                values: Vec::new(),
+            }))
+        }
     }
 }
 
