@@ -184,6 +184,7 @@ subtasks are moved here.
   to array cells (the casacore `getcolslice` semantics). Verified on the real
   fixtures (typed scalars+strings, tsm DATA slices, ism interval columns);
   `setmaxcachesize` is intrinsically a no-op (no caches).
+- Column writes (§3): `WritableTable` builds a table incrementally — `create(schema)`, `addrows(n)`, `putcol`/`putcell` batches (the dask-ms MS-writing pattern, incl. per-row arrays for `putvarcol`), `setmaxcachesize` no-op, and `flush()` which assembles the on-disk files via `create_table`, filling missing scalar cells with their defaults. Since the Rust layer takes `RecordValue`s directly, the python-casacore object-array segfault wart is lifted by construction (the binding just converts). Verified: build an SSM+ISM+TSM table via addrows/putcol and read every value back.
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit
   tests plus a manifest-driven fixture test asserting the header of the real

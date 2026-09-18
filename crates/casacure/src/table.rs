@@ -1056,6 +1056,137 @@ pub fn slice_array_value(
     })
 }
 
+/// A writable table built incrementally (`addrows` + `putcol`/`putcell`
+/// batches, then `flush`) — the dask-ms MS-writing pattern. The final
+/// `flush` assembles the on-disk files via `create_table` for the given
+/// schema; missing cells use the column's scalar default.
+#[derive(Debug)]
+pub struct WritableTable {
+    dir: std::path::PathBuf,
+    desc: crate::tabledesc::TableDesc,
+    /// `cells[col][row]`.
+    cells: Vec<Vec<Option<RecordValue>>>,
+}
+
+/// Errors from building a table incrementally.
+#[derive(Debug, Error)]
+pub enum WriteTableError {
+    #[error("row {row} is out of range (table has {nrow} rows)")]
+    RowOutOfRange { row: u64, nrow: u64 },
+    #[error("column {name} does not exist")]
+    NoSuchColumn { name: String },
+    #[error("column {name} has no default value (fill every cell of array columns)")]
+    NoDefault { name: String },
+    #[error(transparent)]
+    Create(#[from] TableCreateError),
+    #[error("storage error: {0}")]
+    Storage(String),
+}
+
+impl WritableTable {
+    /// Start a new table with the given schema and no rows.
+    pub fn create(
+        dir: impl Into<std::path::PathBuf>,
+        desc: crate::tabledesc::TableDesc,
+    ) -> WritableTable {
+        let cells = vec![Vec::new(); desc.columns.len()];
+        WritableTable {
+            dir: dir.into(),
+            desc,
+            cells,
+        }
+    }
+
+    /// Append `n` empty rows (`addrows`).
+    pub fn addrows(&mut self, n: u64) {
+        for col in &mut self.cells {
+            col.resize(col.len() + n as usize, None);
+        }
+    }
+
+    /// Set one cell (`putcell`).
+    pub fn putcell(
+        &mut self,
+        col_idx: usize,
+        row: u64,
+        value: RecordValue,
+    ) -> Result<(), WriteTableError> {
+        let name = self
+            .desc
+            .columns
+            .get(col_idx)
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        let col = self
+            .cells
+            .get_mut(col_idx)
+            .ok_or(WriteTableError::NoSuchColumn { name })?;
+        let nrow = col.len() as u64;
+        let slot = col
+            .get_mut(row as usize)
+            .ok_or(WriteTableError::RowOutOfRange { row, nrow })?;
+        *slot = Some(value);
+        Ok(())
+    }
+
+    /// Write cells starting at `startrow` (`putcol`; also the home of the
+    /// dask-ms object-array path — Rust accepts values already converted).
+    pub fn putcol(
+        &mut self,
+        col_idx: usize,
+        startrow: u64,
+        values: &[RecordValue],
+    ) -> Result<(), WriteTableError> {
+        for (i, v) in values.iter().enumerate() {
+            self.putcell(col_idx, startrow + i as u64, v.clone())?;
+        }
+        Ok(())
+    }
+
+    /// No-op, as casacore's `setmaxcachesize` should be for the replacement
+    /// (no caches exist).
+    pub fn setmaxcachesize(&mut self, _col_idx: usize, _size: usize) {}
+
+    /// Number of rows written so far.
+    pub fn nrows(&self) -> u64 {
+        self.cells.first().map_or(0, Vec::len) as u64
+    }
+
+    /// Assemble the on-disk table from the buffered cells, filling missing
+    /// scalar cells with their defaults; returns the table directory.
+    pub fn flush(self) -> Result<std::path::PathBuf, WriteTableError> {
+        let mut values: Vec<Vec<RecordValue>> = Vec::with_capacity(self.cells.len());
+        for (col_idx, col) in self.cells.iter().enumerate() {
+            let cd = &self.desc.columns[col_idx];
+            let mut list = Vec::with_capacity(col.len());
+            for cell in col {
+                match cell {
+                    Some(v) => list.push(v.clone()),
+                    None => list.push(default_cell_value(cd).ok_or_else(|| {
+                        WriteTableError::NoDefault {
+                            name: cd.name.clone(),
+                        }
+                    })?),
+                }
+            }
+            values.push(list);
+        }
+        let dir = self.dir.clone();
+        create_table(&dir, &self.desc, &values)?;
+        Ok(dir)
+    }
+}
+
+/// The default value for an unfilled cell of `desc` (scalar columns store
+/// their default; variable strings default to empty).
+fn default_cell_value(cd: &crate::tabledesc::ColumnDesc) -> Option<RecordValue> {
+    match &cd.kind {
+        crate::tabledesc::ColumnKind::Scalar(default) => Some(default.clone()),
+        crate::tabledesc::ColumnKind::Array => None,
+        crate::tabledesc::ColumnKind::Record => None,
+    }
+}
+
 /// A data-manager-info record as returned by casacore `table.getdminfo()`:
 /// `{"TYPE", "NAME", "SEQNR", "SPEC", "COLUMNS"}` (keys in that order).
 #[derive(Debug, Clone, PartialEq)]
@@ -2035,6 +2166,87 @@ mod tests {
             (0..4)
                 .map(|i| RecordValue::Double(i as f64 / 2.0))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn writable_table_addrows_putcol_flush() {
+        use crate::record::{ArrayData, ArrayValue};
+        // MS-style schema: ISM index columns + TSM DATA + SSM scalar/string.
+        let mut desc = typed_desc();
+        desc.columns = vec![
+            ism_col("TIME", DataType::Double, 1),
+            ism_col("ANT1", DataType::Int, 1),
+            tsm_arr_col("DATA", DataType::DComplex, vec![2, 3]),
+            scalar_col("NAME", DataType::String, 0),
+        ];
+        let mut wt = WritableTable::create(temp_dir("wtable"), desc);
+        wt.addrows(4);
+        wt.putcol(
+            0,
+            0,
+            &(0..4)
+                .map(|i| RecordValue::Double(i as f64 / 2.0))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        wt.putcol(
+            1,
+            0,
+            &[0, 0, 1, 1]
+                .into_iter()
+                .map(RecordValue::Int)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        for row in 0..4u64 {
+            wt.putcell(
+                2,
+                row,
+                RecordValue::Array(ArrayValue {
+                    shape: vec![2, 3],
+                    data: ArrayData::DComplex((1..=6).map(|k| (row as f64, k as f64)).collect()),
+                }),
+            )
+            .unwrap();
+        }
+        wt.putcol(
+            3,
+            0,
+            &(0..4)
+                .map(|i| RecordValue::String(format!("row{i} long label")))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let dir = wt.flush().unwrap();
+
+        // Reopen and read back.
+        let t = Table::open(&dir, true).unwrap();
+        assert_eq!(t.nrows(), 4);
+        assert_eq!(t.getcol(0, 0, 4).unwrap()[3], RecordValue::Double(1.5));
+        assert_eq!(
+            t.getcol(1, 0, 4).unwrap(),
+            [0, 0, 1, 1]
+                .into_iter()
+                .map(RecordValue::Int)
+                .collect::<Vec<_>>()
+        );
+        match t.getcell(2, 2).unwrap() {
+            RecordValue::Array(a) => {
+                assert_eq!(a.shape, vec![2, 3]);
+                match &a.data {
+                    ArrayData::DComplex(v) => {
+                        let expect: Vec<(f64, f64)> = (1..=6).map(|k| (2.0, k as f64)).collect();
+                        assert_eq!(&v[..], &expect[..]);
+                    }
+                    other => panic!("expected dcomplex, got {other:?}"),
+                }
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+        assert_eq!(
+            t.getcell(3, 3).unwrap(),
+            RecordValue::String("row3 long label".into())
         );
     }
 
