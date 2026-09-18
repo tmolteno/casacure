@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/casacure", "crates/casacure-python"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-3.0-or-later"
+repository = "https://github.com/tmolteno/casacure"
+description = "A Rust replacement for the casacore table system, with Python bindings"
+
+[profile.release]
+lto = true

@@ -1,0 +1,15 @@
+[package]
+name = "casacure-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "casacure"
+crate-type = ["cdylib"]
+
+[dependencies]
+casacure = { path = "../casacure" }
+pyo3 = { version = "0.26", features = ["extension-module"] }
+numpy = "0.26"

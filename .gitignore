@@ -1,0 +1,7 @@
+/target/
+/.venv/
+/tests/fixtures/
+__pycache__/
+*.py[cod]
+/dist/
+*.egg-info/
