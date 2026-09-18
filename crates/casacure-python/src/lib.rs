@@ -8,7 +8,7 @@ mod table;
 use ::casacure::ValueType;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyDict, PyList, PyTuple};
 
 /// Map a CASA type name (any alias) to its numpy dtype name.
 ///
@@ -115,6 +115,13 @@ fn tables_submodule(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(default_ms_subtable, &m)?)?;
     m.add_function(wrap_pyfunction!(required_ms_desc, &m)?)?;
     m.add_function(wrap_pyfunction!(complete_ms_desc, &m)?)?;
+    m.add_function(wrap_pyfunction!(tablefromascii, &m)?)?;
+    // Give the factories a resolvable `__module__` so dask-ms can pickle the
+    // TableProxy (which pickles the factory callable).
+    for name in ["table", "taql", "default_ms", "default_ms_subtable"] {
+        let f = m.getattr(name)?;
+        f.setattr("__module__", "casacure.tables")?;
+    }
     parent.add_submodule(&m)?;
     parent
         .py()
@@ -131,4 +138,124 @@ fn casacure(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(casa_type, m)?)?;
     tables_submodule(m)?;
     Ok(())
+}
+
+/// `tablefromascii(path, ascii_desc)` — create a table from a simple ASCII
+/// table description (dask-ms's test-only path): a header line of column
+/// names, a line of type letters (`R` float, `D` double, `I` int,
+/// `X<base>,<digits>` complex), then whitespace-separated data rows.
+#[pyfunction]
+#[pyo3(signature = (path, ascii_file, ack = true))]
+fn tablefromascii(py: Python<'_>, path: &str, ascii_file: &str, ack: bool) -> PyResult<Py<PyAny>> {
+    let _ = ack;
+    use numpy::Complex64;
+    let text = std::fs::read_to_string(ascii_file)
+        .map_err(|e| PyValueError::new_err(format!("cannot read {ascii_file}: {e}")))?;
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let header = lines
+        .next()
+        .ok_or_else(|| PyValueError::new_err("empty ascii table"))?;
+    let types = lines
+        .next()
+        .ok_or_else(|| PyValueError::new_err("missing type line"))?;
+    let names: Vec<String> = header.split_whitespace().map(str::to_string).collect();
+    let types: Vec<String> = types.split_whitespace().map(str::to_string).collect();
+    if names.len() != types.len() {
+        return Err(PyValueError::new_err("header/type column count mismatch"));
+    }
+
+    // Column descriptors (valueType per type letter).
+    let desc = PyDict::new(py);
+    for (name, ty) in names.iter().zip(types.iter()) {
+        let vt = match ty.chars().next() {
+            Some('R') => "float",
+            Some('D') => "double",
+            Some('I') => "int",
+            Some('X') => "dcomplex",
+            Some('S') => "string",
+            _ => return Err(PyValueError::new_err(format!("unknown ascii type {ty}"))),
+        };
+        let col = PyDict::new(py);
+        col.set_item("valueType", vt)?;
+        col.set_item("dataManagerType", "StandardStMan")?;
+        col.set_item("dataManagerGroup", "StandardStMan")?;
+        col.set_item("option", 0)?;
+        col.set_item("maxlen", 0)?;
+        col.set_item("comment", "")?;
+        let kw = PyDict::new(py);
+        col.set_item("keywords", kw)?;
+        desc.set_item(name, col)?;
+    }
+    let tdesc = desc.into_any();
+    let t = table::table(
+        py,
+        path,
+        Some(&tdesc),
+        0,
+        None,
+        false,
+        true,
+        &PyTuple::empty(py),
+        None,
+    )?;
+
+    // Data rows -> one typed numpy array per column.
+    let rows: Vec<&str> = lines.collect();
+    let toks: Vec<Vec<&str>> = rows
+        .iter()
+        .map(|r| r.split_whitespace().collect())
+        .collect();
+    // Per-column start token offset: complex columns consume two tokens.
+    let widths: Vec<usize> = types
+        .iter()
+        .map(|ty| if ty.starts_with('X') { 2 } else { 1 })
+        .collect();
+    let mut starts = Vec::with_capacity(widths.len());
+    let mut off = 0usize;
+    for w in &widths {
+        starts.push(off);
+        off += w;
+    }
+    let tobj = t.into_pyobject(py)?;
+    if !rows.is_empty() {
+        tobj.call_method1("addrows", (rows.len(),))?;
+    }
+    for (ci, (name, ty)) in names.iter().zip(types.iter()).enumerate() {
+        let first = ty.chars().next().unwrap_or('S');
+        let start = starts[ci];
+        let width = widths[ci];
+        let obj: Py<PyAny> = match first {
+            'I' => {
+                let vals: Vec<i32> = toks.iter().map(|k| k[start].parse().unwrap_or(0)).collect();
+                numpy::PyArray1::from_vec(py, vals).into_any().unbind()
+            }
+            'R' | 'D' => {
+                let vals: Vec<f64> = toks
+                    .iter()
+                    .map(|k| k[start].parse().unwrap_or(0.0))
+                    .collect();
+                numpy::PyArray1::from_vec(py, vals).into_any().unbind()
+            }
+            'X' => {
+                let vals: Vec<Complex64> = toks
+                    .iter()
+                    .map(|k| {
+                        let re: f64 = k[start].parse().unwrap_or(0.0);
+                        let im: f64 = k[start + 1].parse().unwrap_or(0.0);
+                        Complex64::new(re, im)
+                    })
+                    .collect();
+                numpy::PyArray1::from_vec(py, vals).into_any().unbind()
+            }
+            _ => {
+                let vals: Vec<String> = toks.iter().map(|k| k[start].to_string()).collect();
+                let list = PyList::new(py, vals)?;
+                list.into_any().unbind()
+            }
+        };
+        let _ = width;
+        tobj.call_method1("putcol", (name, obj, 0, 0))?;
+    }
+    tobj.call_method0("flush")?;
+    Ok(tobj.into_any().unbind())
 }

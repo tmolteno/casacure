@@ -26,8 +26,9 @@ pub(crate) fn fill_flat<T: Copy + Default>(
     for (r, c) in cells.iter().enumerate() {
         if let RecordValue::Array(a) = c {
             let base = r * cell;
+            let n = array_len(&a.data);
             for i in 0..cell {
-                if base + i < buf.len() {
+                if base + i < buf.len() && i < n {
                     buf[base + i] = map(&a.data, i);
                 }
             }
@@ -260,6 +261,23 @@ fn string_list<'py>(py: Python<'py>, cells: &[RecordValue]) -> PyResult<Bound<'p
         list.append(s)?;
     }
     Ok(list)
+}
+
+fn array_len(d: &ArrayData) -> usize {
+    match d {
+        ArrayData::Bool(v) => v.len(),
+        ArrayData::UChar(v) => v.len(),
+        ArrayData::Short(v) => v.len(),
+        ArrayData::UShort(v) => v.len(),
+        ArrayData::Int(v) => v.len(),
+        ArrayData::UInt(v) => v.len(),
+        ArrayData::Int64(v) => v.len(),
+        ArrayData::Float(v) => v.len(),
+        ArrayData::Double(v) => v.len(),
+        ArrayData::Complex(v) => v.len(),
+        ArrayData::DComplex(v) => v.len(),
+        ArrayData::String(v) => v.len(),
+    }
 }
 
 fn scalar_f64(v: &RecordValue) -> f64 {

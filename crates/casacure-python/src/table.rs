@@ -345,7 +345,7 @@ impl Table {
         Ok(())
     }
 
-    fn setmaxcachesize(&self, _col: i64, _size: i64) -> PyResult<()> {
+    fn setmaxcachesize(&self, _col: &str, _size: i64) -> PyResult<()> {
         Ok(())
     }
 
@@ -559,15 +559,17 @@ impl Table {
         self.putcol(py, column, value, startrow, nrow)
     }
 
-    /// `putvarcol(column, dict_of_rows, startrow=0, nrow=0)`.
-    #[pyo3(signature = (column, rows, startrow = 0))]
+    /// `putvarcol(column, dict_of_rows, startrow=0, nrow=-1)`.
+    #[pyo3(signature = (column, rows, startrow = 0, nrow = -1))]
     fn putvarcol(
         &self,
         py: Python<'_>,
         column: &str,
         rows: &Bound<'_, PyDict>,
         startrow: i64,
+        nrow: i64,
     ) -> PyResult<()> {
+        let _ = nrow;
         let col_idx = self.col_index(column)?;
         let startrow = startrow.max(0) as u64;
         let desc = self.desc();
@@ -713,6 +715,15 @@ impl Table {
         // python-casacore's `with table(...)` closes (flushing) on exit.
         self.flush()?;
         Ok(())
+    }
+
+    /// Private python-casacore `table._getdesc(actual=True)` — the full
+    /// table-description dict. dask-ms calls it for keyword reads.
+    #[pyo3(signature = (actual = true))]
+    fn _getdesc(&self, py: Python<'_>, actual: bool) -> PyResult<Py<PyAny>> {
+        let _ = actual;
+        let desc = self.desc();
+        Ok(desc_to_pydict(py, &desc)?.into_any().unbind())
     }
 
     fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
@@ -1202,6 +1213,24 @@ pub fn taql(
     _readonly: Option<bool>,
 ) -> PyResult<Py<PyAny>> {
     let _ = style;
+    // DDL: CREATE TABLE ... -> create the table and return it writable.
+    if query
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("create")
+    {
+        match core::taql::execute(query, &[]).map_err(err)? {
+            core::taql::TaqlResult::Created(path) => {
+                let t = Table::open_or_create(py, &path.display().to_string(), None, 0, true)?;
+                return Ok(t.into_pyobject(py)?.into_any().unbind());
+            }
+            other => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "taql: expected created table, got {other:?}"
+                )));
+            }
+        }
+    }
     // Collect the wrapped core tables from any `casacure.tables.table`
     // arguments.
     if query

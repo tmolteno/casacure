@@ -869,20 +869,22 @@ pub fn execute(query: &str, tables: &[&Table]) -> TResult<TaqlResult> {
     Ok(TaqlResult::Query(out))
 }
 
-fn table_of<'a>(sel: &Select, tables: &[&'a Table]) -> TResult<&'a Table> {
-    match &sel.table {
-        TableRef::Table(n) => tables
-            .get(*n - 1)
-            .copied()
-            .ok_or(TaqlError::NoSuchTable(*n)),
-        TableRef::Path(path) => Err(TaqlError::Eval(format!(
-            "cannot open table from path in this context: {path}"
-        ))),
-    }
-}
-
 fn run_select(sel: &Select, tables: &[&Table]) -> TResult<TaqlTable> {
-    let table = table_of(sel, tables)?;
+    // A `'path'` FROM clause opens the table for the duration of the query.
+    let owned: Option<Table>;
+    let table: &Table = match &sel.table {
+        TableRef::Table(n) => tables
+            .get(n.saturating_sub(1))
+            .copied()
+            .ok_or(TaqlError::NoSuchTable(*n))?,
+        TableRef::Path(path) => {
+            owned = Some(
+                Table::open(path, false)
+                    .map_err(|e| TaqlError::Eval(format!("cannot open table {path}: {e}")))?,
+            );
+            owned.as_ref().unwrap()
+        }
+    };
     let colidx: HashMap<String, usize> = table
         .colnames()
         .into_iter()
