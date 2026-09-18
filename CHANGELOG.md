@@ -76,6 +76,26 @@ subtasks are moved here.
 - 11 new writer unit tests (layout vs fixture, table.dat round-trip,
   create→read-back of all 10 typed values, multi-bucket row distribution,
   long-string rejection).
+- Fixed-shape array columns (StandardStMan): the array sub-format is now
+  read **and** written. Bucket cells hold an `Int64` byte reference into
+  `table.f0i` (StManArrayFile / StManAipsIO): files start with
+  `[u32 version][1-byte length]` and hold one record per row of
+  `[ndim][CASA-order dims][element data]` — dims are reversed relative to
+  the logical row-major shape (discovered from the casacore fixture: a 2x3
+  complex array stores `[3,2]`). `ColumnSet` array bindings carry the same
+  CASA-order `IPosition` shape (`columnset::parse_column_set` previously
+  misread this as a string). Element types: all numerics + bit-packed Bool
+  arrays; string arrays not yet.
+- `read_array_cell` / `encode_array_record` + `create_table` array-column
+  support (bucket region = 8-byte refs, fanning out to `table.f0i`).
+- `tests/make_fixtures.py` gains an `array.tab` fixture (2x3 complex `ARR`
+  + scalar `IDX`, 2 rows). Fixture test verifies the real casacore
+  `array.tab` array/index layout (offsets `[0,256]`, CASA shape, complex
+  values, the `StManArrayFile` double-index-bucket copy at offset 8 vs 196).
+- Array write-interop proven: python-casacore reads casacure-written
+  fixed-shape array columns exactly (`getcoldesc` option 4, logical shape
+  `[2,3]`, all values; 3 rows and 100 rows across multiple buckets).
+- `examples/create_sample_table.rs` now writes an array column too.
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit
   tests plus a manifest-driven fixture test asserting the header of the real

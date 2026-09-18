@@ -3,21 +3,21 @@
 Overall progress towards replacing casacore as the dask-ms I/O backend.
 Work areas are tracked as GitHub issues; subtasks live in `TODO.md`.
 
-**Verdict: NOT YET CURED** — StandardStMan scalar column read **and** write work (interop proven both ways); arrays, string buckets, and MS creation not yet.
+**Verdict: NOT YET CURED** — StandardStMan scalar **and fixed-shape array** columns read+write with proven two-way interop; string buckets, MS creation not yet.
 
 ## Test status
 
 | Suite | Command | Passing | Coverage |
 |---|---|---|---|
-| Rust unit + fixture tests | `cargo test` | 54/54 | type system, AipsIO read+write (both endians), `table.dat` (header, TableDesc, records, ColumnSet + SSM spec), StandardStMan data-file read **and write** (round-trips, multi-bucket, values), writer layout vs casacore |
+| Rust unit + fixture tests | `cargo test` | 56/56 | type system, AipsIO read+write (both endians), `table.dat` (header, TableDesc, records, ColumnSet + SSM spec), StandardStMan data file + array index file (`table.f0i`) read+write (scalars, arrays, multi-bucket, values) |
 | casacore comparison tests | `.venv/bin/python -m pytest tests/` | 5/5 | type system only |
-| write interop (manual) | `examples/create_sample_table.rs` + python-casacore | ✓ | casacure-write → casacore-read: 3-row and 100-row multi-bucket tables return exactly the written values |
+| write interop (manual) | `examples/create_sample_table.rs` + python-casacore | ✓ | casacure-write → casacore-read: 3-row and 100-row tables (scalar + fixed-shape array) return exactly the written values |
 
 ## Progress by area (per CASACORE_TO_CASA_RS.md)
 
 | Area | Status | Notes |
 |---|---|---|
-| §1 CASA table on-disk format | ~65% | `table.dat` fully parsed **and written** (header, TableDesc, ColumnDesc, ColumnSet + SSM spec); StandardStMan data files fully read **and written** for scalar columns — header, index buckets, SSMIndex, all scalar cell types incl. bit-packed Bool and inline short strings. `create_table` produces files whose bucket layout matches casacore's exactly (fixture offsets/bucket size reproduced). Read and write interop proven against real casacore both ways. Gaps: array columns, string buckets (>8 chars), Incremental/Tiled managers. |
+| §1 CASA table on-disk format | ~75% | `table.dat` fully parsed **and written** (header, TableDesc, ColumnDesc incl. fixed-shape arrays, ColumnSet + SSM spec). StandardStMan data files fully read **and written** for scalar **and fixed-shape array** columns, including the `table.f0i` (StManArrayFile) sub-format with per-row refs and CASA-order shapes. Read and write interop proven against real casacore both ways (scalars + arrays, multi-bucket). Gaps: variable string buckets (>8 chars), Incremental/Tiled managers, dminfo round-trips. |
 | §2 Table lifecycle & locking | 0% | not started |
 | §3 Column data access | 0% | not started |
 | §4 Type system | ~90% | `ValueType` + numpy mapping done, verified against casacore 3.8.1 |

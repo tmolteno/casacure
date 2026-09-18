@@ -47,8 +47,11 @@ pub struct ColumnInfo {
     pub original_name: String,
     /// Sequence number of the data manager storing the column data.
     pub data_manager_seq: u32,
-    /// Name of the companion shape column for variable-shape array columns.
-    pub shape_column: Option<String>,
+    /// Fixed shape written in the data-manager binding
+    /// (`ArrayColumnData::setShapeColumn`; CASA dim order, i.e. reversed
+    /// relative to the logical row-major shape). `None` for scalar and
+    /// variable-shape columns.
+    pub shape: Option<Vec<i64>>,
 }
 
 /// A data manager listed in the ColumnSet, with its spec blob.
@@ -162,9 +165,11 @@ pub fn parse_column_set(
         let data_manager_seq = r.read_u32()?;
         let shape_column = match desc.kind {
             ColumnKind::Array => {
-                let has_shape_col = r.read_bool()?;
-                if has_shape_col {
-                    Some(r.read_string()?)
+                let has_shape = r.read_bool()?;
+                if has_shape {
+                    // ArrayColumnData::putFileDerived writes the fixed shape
+                    // as an IPosition (CASA dim order).
+                    Some(r.read_iposition()?)
                 } else {
                     None
                 }
@@ -174,7 +179,7 @@ pub fn parse_column_set(
         column_info.push(ColumnInfo {
             original_name,
             data_manager_seq,
-            shape_column,
+            shape: shape_column,
         });
     }
 
@@ -288,7 +293,19 @@ pub fn write_column_set(
                 w.put_u32(0); // data-manager sequence number
             }
             ColumnKind::Array => {
-                unimplemented!("array columns are not writable yet")
+                // ArrayColumnData::putFileDerived: class version, the
+                // data-manager sequence, and the fixed shape as an
+                // IPosition in CASA (reversed logical) dim order.
+                w.put_u32(1);
+                w.put_u32(0);
+                w.put_bool(true);
+                w.put_object_start("IPosition", 1);
+                let shape = desc.shape.as_deref().unwrap_or(&[]);
+                w.put_u32(shape.len() as u32);
+                for d in shape {
+                    w.put_i32(*d as i32);
+                }
+                w.put_object_end();
             }
         }
     }
@@ -348,15 +365,23 @@ mod tests {
         payload
     }
 
-    fn array_column(name: &str, seq: u32, shape_col: Option<&str>) -> Vec<u8> {
+    fn position_bytes(dims: &[i64]) -> Vec<u8> {
+        let mut payload = (dims.len() as u32).to_be_bytes().to_vec();
+        for d in dims {
+            payload.extend_from_slice(&(*d as i32).to_be_bytes());
+        }
+        framed("IPosition", 1, &payload)
+    }
+
+    fn array_column(name: &str, seq: u32, shape: Option<&[i64]>) -> Vec<u8> {
         let mut payload = 2u32.to_be_bytes().to_vec();
         payload.extend_from_slice(&string_bytes(name));
         payload.extend_from_slice(&1u32.to_be_bytes());
         payload.extend_from_slice(&seq.to_be_bytes());
-        match shape_col {
-            Some(s) => {
+        match shape {
+            Some(dims) => {
                 payload.push(1);
-                payload.extend_from_slice(&string_bytes(s));
+                payload.extend_from_slice(&position_bytes(dims));
             }
             None => payload.push(0),
         }
@@ -422,7 +447,7 @@ mod tests {
             vec![ColumnInfo {
                 original_name: "COL".into(),
                 data_manager_seq: 0,
-                shape_column: None,
+                shape: None,
             }]
         );
         let dm = cs.data_manager_for(&cs.columns[0]).unwrap();
@@ -471,7 +496,7 @@ mod tests {
         payload.extend_from_slice(&1u32.to_be_bytes()); // nr
         payload.extend_from_slice(&string_bytes("StandardStMan"));
         payload.extend_from_slice(&0u32.to_be_bytes());
-        payload.extend_from_slice(&array_column("ARR", 0, Some("ARR_IDX")));
+        payload.extend_from_slice(&array_column("ARR", 0, Some(&[3, 2])));
         payload.extend_from_slice(&opaque(&ssm_blob("S", &[0], &[0])));
 
         let mut r = Reader::new(&payload);
@@ -481,7 +506,7 @@ mod tests {
             vec![ColumnInfo {
                 original_name: "ARR".into(),
                 data_manager_seq: 0,
-                shape_column: Some("ARR_IDX".into()),
+                shape: Some(vec![3, 2]),
             }]
         );
     }
@@ -500,7 +525,7 @@ mod tests {
 
         let mut r = Reader::new(&payload);
         let cs = parse_column_set(&mut r, &[desc("ARR", ColumnKind::Array)]).unwrap();
-        assert_eq!(cs.columns[0].shape_column, None);
+        assert_eq!(cs.columns[0].shape, None);
     }
 
     #[test]

@@ -167,6 +167,7 @@ pub fn create_table(
     desc: &crate::tabledesc::TableDesc,
     values: &[Vec<crate::record::RecordValue>],
 ) -> Result<Vec<std::path::PathBuf>, TableCreateError> {
+    use crate::record::RecordValue;
     use crate::ssm::{layout, write_standard_stman_file, WriteColumn};
     if desc.columns.len() != values.len() {
         return Err(TableCreateError::MissingValues(format!(
@@ -185,8 +186,13 @@ pub fn create_table(
             });
         }
     }
-    // (little endian; matches casacore on any little-endian host)
+    // Little endian, matching casacore on any little-endian host.
     let big_endian = false;
+
+    // Array-column data goes into `table.f0i` as per-row records; the SSM
+    // buckets hold an Int64 reference per row.
+    let mut array_index: Vec<u8> = Vec::new();
+    let mut has_arrays = false;
 
     let mut cell_bits = Vec::with_capacity(desc.columns.len());
     let mut cell_bytes = Vec::with_capacity(desc.columns.len());
@@ -196,29 +202,72 @@ pub fn create_table(
         if cd.data_manager_type != "StandardStMan" {
             return Err(TableCreateError::NotStandardStMan(cd.name.clone()));
         }
-        if !matches!(cd.kind, crate::tabledesc::ColumnKind::Scalar(_)) {
-            return Err(TableCreateError::NotScalar(cd.name.clone()));
-        }
-        let size = crate::ssm::scalar_cell_size(cd);
+        let (size, bits) = match cd.kind {
+            crate::tabledesc::ColumnKind::Scalar(_) => {
+                let size = crate::ssm::scalar_cell_size(cd);
+                let bits = if cd.data_type == crate::record::DataType::Bool {
+                    1
+                } else {
+                    8 * size
+                };
+                (size, bits)
+            }
+            crate::tabledesc::ColumnKind::Array => {
+                // The bucket cell is an Int64 reference into `table.f0i`.
+                has_arrays = true;
+                (crate::ssm::ARRAY_REF_SIZE, 8 * crate::ssm::ARRAY_REF_SIZE)
+            }
+            crate::tabledesc::ColumnKind::Record => {
+                return Err(TableCreateError::NotScalar(cd.name.clone()))
+            }
+        };
         let mut bytes = Vec::with_capacity(list.len() * size as usize);
         for value in list {
-            bytes.extend_from_slice(
-                &crate::ssm::encode_scalar_cell(big_endian, cd, value).map_err(|e| match e {
-                    crate::ssm::SsmError::StringBucketUnsupported { .. } => {
-                        TableCreateError::LongString(cd.name.clone())
+            match &cd.kind {
+                crate::tabledesc::ColumnKind::Scalar(_) => {
+                    bytes.extend_from_slice(
+                        &crate::ssm::encode_scalar_cell(big_endian, cd, value).map_err(
+                            |e| match e {
+                                crate::ssm::SsmError::StringBucketUnsupported { .. } => {
+                                    TableCreateError::LongString(cd.name.clone())
+                                }
+                                other => TableCreateError::Io(std::io::Error::other(format!(
+                                    "encode {}.{}: {other}",
+                                    desc.name, cd.name
+                                ))),
+                            },
+                        )?,
+                    );
+                }
+                crate::tabledesc::ColumnKind::Array => {
+                    let RecordValue::Array(arr) = value else {
+                        return Err(TableCreateError::NotScalar(format!(
+                            "{}.{}: expected an array value for an array column",
+                            desc.name, cd.name
+                        )));
+                    };
+                    let record = crate::ssm::encode_array_record(big_endian, cd.data_type, arr)
+                        .map_err(|e| {
+                            TableCreateError::Io(std::io::Error::other(format!(
+                                "encode {}.{}: {e}",
+                                desc.name, cd.name
+                            )))
+                        })?;
+                    // Records live after the 16-byte `table.f0i` header
+                    // (`[u32 version][1-byte length][padding]`); a 0
+                    // reference means "no array" to casacore.
+                    let offset = 16 + array_index.len() as i64;
+                    if big_endian {
+                        bytes.extend_from_slice(&offset.to_be_bytes());
+                    } else {
+                        bytes.extend_from_slice(&offset.to_le_bytes());
                     }
-                    other => TableCreateError::Io(std::io::Error::other(format!(
-                        "encode {}.{}: {other}",
-                        desc.name, cd.name
-                    ))),
-                })?,
-            );
+                    array_index.extend_from_slice(&record);
+                }
+                crate::tabledesc::ColumnKind::Record => unreachable!(),
+            }
         }
-        cell_bits.push(if cd.data_type == crate::record::DataType::Bool {
-            1
-        } else {
-            8 * size
-        });
+        cell_bits.push(bits);
         cell_bytes.push(size);
         encoded.push(bytes);
     }
@@ -247,7 +296,17 @@ pub fn create_table(
     std::fs::write(&dat_path, table_dat)?;
     let f0_path = table_dir.join("table.f0");
     std::fs::write(&f0_path, data_file)?;
-    Ok(vec![dat_path, f0_path])
+    let mut written = vec![dat_path, f0_path];
+    if has_arrays {
+        // `table.f0i`: [u32 version 0][u8 length] then records at offset 16.
+        let mut f0i = vec![0u8; 16];
+        f0i[4] = (16 + array_index.len()) as u8;
+        f0i.extend_from_slice(&array_index);
+        let f0i_path = table_dir.join("table.f0i");
+        std::fs::write(&f0i_path, f0i)?;
+        written.push(f0i_path);
+    }
+    Ok(written)
 }
 #[cfg(test)]
 mod tests {
@@ -539,6 +598,95 @@ mod tests {
         assert_eq!(
             file.read_scalar_cell(spec, 0, col, 99).unwrap(),
             RecordValue::Int(99)
+        );
+    }
+
+    fn array_col(name: &str, dt: DataType, option: i32, casa_shape: Vec<i64>) -> ColumnDesc {
+        ColumnDesc {
+            name: name.into(),
+            comment: String::new(),
+            data_type: dt,
+            data_manager_type: "StandardStMan".into(),
+            data_manager_group: "StandardStMan".into(),
+            options: option,
+            ndim: casa_shape.len() as i32,
+            shape: Some(casa_shape),
+            max_length: 0,
+            keywords: empty_record(),
+            kind: ColumnKind::Array,
+        }
+    }
+
+    #[test]
+    fn create_table_with_array_column_reads_back() {
+        use crate::record::{ArrayData, ArrayValue};
+        // A fixed-shape 2x3 complex array column + a scalar int column.
+        let mut desc = typed_desc();
+        desc.columns = vec![
+            array_col("ARR", DataType::Complex, 4, vec![3, 2]),
+            scalar_col("IDX", DataType::Int, 0),
+        ];
+        let arr = |base: i32| {
+            RecordValue::Array(ArrayValue {
+                shape: vec![2, 3],
+                data: ArrayData::Complex((1..=6).map(|k| (base as f32, k as f32)).collect()),
+            })
+        };
+        let values = vec![
+            vec![arr(0), arr(10)],
+            vec![RecordValue::Int(0), RecordValue::Int(1)],
+        ];
+        let dir = temp_dir("arraynp");
+        create_table(&dir, &desc, &values).unwrap();
+
+        let dat_bytes = std::fs::read(dir.join("table.dat")).unwrap();
+        let dat = parse_table_dat(&dat_bytes).unwrap();
+        assert_eq!(dat.header.nrow, 2);
+        let arr_desc = dat.desc.column("ARR").unwrap();
+        assert!(matches!(arr_desc.kind, ColumnKind::Array));
+        assert_eq!(arr_desc.shape.as_deref(), Some(&[3i64, 2][..]));
+        assert_eq!(arr_desc.options & 4, 4, "FixedShape option");
+        // The SSM spec: ARR bucket cells are 8-byte refs -> region 32*8=256.
+        let dm = &dat.column_set.data_managers[0];
+        let spec = match &dm.blob {
+            crate::columnset::DataManagerBlob::StandardStMan(s) => s,
+            _ => panic!("expected StandardStMan spec"),
+        };
+        assert_eq!(spec.column_offset, vec![0, 256], "layout offsets");
+        // Array binding carries the CASA-order shape.
+        assert_eq!(
+            dat.column_set.columns[0].shape.as_deref(),
+            Some(&[3i64, 2][..]),
+            "binding shape"
+        );
+
+        let file = crate::ssm::StandardStManFile::open(&dir, 0, dat.header.big_endian).unwrap();
+        assert!(file.f0i().is_some());
+        for (row, base) in [(0u64, 0f32), (1, 10.0)] {
+            let cell = crate::ssm::read_array_cell(&file, spec, 0, arr_desc, row).unwrap();
+            match cell {
+                RecordValue::Array(a) => {
+                    assert_eq!(a.shape, vec![2, 3], "logical shape row {row}");
+                    match &a.data {
+                        ArrayData::Complex(v) => {
+                            let expect: Vec<(f32, f32)> =
+                                (1..=6).map(|k| (base, k as f32)).collect();
+                            assert_eq!(&v[..], &expect[..], "values row {row}");
+                        }
+                        other => panic!("expected complex, got {other:?}"),
+                    }
+                }
+                other => panic!("expected array, got {other:?}"),
+            }
+        }
+        let idx = dat.desc.column("IDX").unwrap();
+        assert_eq!(
+            file.read_scalar_cell(spec, 1, idx, 0).unwrap(),
+            RecordValue::Int(0)
+        );
+        assert_eq!(
+            file.read_scalar_cell(spec, 1, idx, 1).unwrap(),
+            RecordValue::Int(1)
         );
     }
 

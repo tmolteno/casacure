@@ -62,6 +62,46 @@ def make_typed_table(fixtures: Path) -> dict:
     }
 
 
+def make_array_table(fixtures: Path) -> dict:
+    """A table with a fixed-shape (2x3 complex) array column plus a scalar
+    int column, across several rows — byte ground truth for array columns."""
+    import numpy as np
+
+    path = fixtures / "array.tab"
+    taql(f"CREATE TABLE {path} [ARR C4 [NDIM=2, SHAPE=[2,3]], IDX I4] LIMIT 2")
+    with table(str(path), readonly=False, ack=False) as t:
+        for row in range(2):
+            base = 10 * row
+            cells = np.array(
+                [
+                    [base + 1j, base + 2j, base + 3j],
+                    [base + 4j, base + 5j, base + 6j],
+                ],
+                dtype=np.complex64,
+            )
+            t.putcell("ARR", row, cells)
+            t.putcell("IDX", row, row)
+        nrows = t.nrows()
+        first = t.getcell("ARR", 0)
+        return {
+            "path": path.name,
+            "nrows": nrows,
+            "big_endian": sys.byteorder == "big",
+            "array_shape": list(first.shape),
+            "array_dtype": first.dtype.str,
+            "columns": {
+                "ARR": {
+                    "value_type": t.getcoldesc("ARR")["valueType"],
+                    "getcol_dtype": first.dtype.str,
+                },
+                "IDX": {
+                    "value_type": t.getcoldesc("IDX")["valueType"],
+                    "getcol_dtype": t.getcol("IDX").dtype.str,
+                },
+            },
+        }
+
+
 def main() -> None:
     if FIXTURES.exists():
         shutil.rmtree(FIXTURES)
@@ -70,7 +110,10 @@ def main() -> None:
 
     manifest = {
         "casacore_version": casacore.__version__,
-        "tables": {"typed": make_typed_table(FIXTURES)},
+        "tables": {
+            "typed": make_typed_table(FIXTURES),
+            "array": make_array_table(FIXTURES),
+        },
     }
     (FIXTURES / "manifest.json").write_text(json.dumps(manifest, indent=2))
     print(f"wrote {FIXTURES / 'manifest.json'} (casacore {manifest['casacore_version']})")

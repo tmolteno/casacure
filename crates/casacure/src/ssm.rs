@@ -56,6 +56,14 @@ pub enum SsmError {
     ArrayColumn(String),
     #[error("column {0} has no StandardStMan data (data-manager type {1})")]
     NotStandardStMan(String, String),
+    #[error("array column {0} needs the {1} array index file, which is missing")]
+    MissingArrayFile(String, String),
+    #[error("row {row} of {column} has no array (empty reference)")]
+    EmptyArray { row: u64, column: String },
+    #[error("array reference {offset} falls outside the array index file (len {len})")]
+    BadArrayRef { offset: i64, len: usize },
+    #[error("array elements of type {0:?} are not supported in the array index file yet")]
+    UnsupportedArrayType(DataType),
 }
 
 /// The `StandardStMan` header at the start of the data file
@@ -129,6 +137,8 @@ pub struct StandardStManFile {
     pub header: StandardStManHeader,
     pub indices: Vec<SsmIndex>,
     data: Vec<u8>,
+    /// Optional `table.f*{seq}i` array index file (StandardStMan arrays).
+    f0i: Option<Vec<u8>>,
 }
 
 impl StandardStManFile {
@@ -138,8 +148,16 @@ impl StandardStManFile {
         seq_nr: u32,
         table_big_endian: bool,
     ) -> Result<StandardStManFile, SsmError> {
-        let data = std::fs::read(table_dir.as_ref().join(format!("table.f{seq_nr}")))?;
-        StandardStManFile::parse(&data, table_big_endian)
+        let dir = table_dir.as_ref();
+        let data = std::fs::read(dir.join(format!("table.f{seq_nr}")))?;
+        let mut file = StandardStManFile::parse(&data, table_big_endian)?;
+        // The array index file (`table.f{seq}i`) only exists for tables with
+        // StandardStMan array columns.
+        let f0i_path = dir.join(format!("table.f{seq_nr}i"));
+        if f0i_path.is_file() {
+            file.f0i = Some(std::fs::read(f0i_path)?);
+        }
+        Ok(file)
     }
 
     /// Parse a StandardStMan data file. `table_big_endian` is the data-file
@@ -182,7 +200,13 @@ impl StandardStManFile {
             header,
             indices,
             data: data.to_vec(),
+            f0i: None,
         })
+    }
+
+    /// The optional array index file (`table.f0i`) contents, if present.
+    pub fn f0i(&self) -> Option<&[u8]> {
+        self.f0i.as_deref()
     }
 
     /// Raw bytes of data bucket `number`.
@@ -290,6 +314,209 @@ impl StandardStManFile {
             })?;
         let cell = self.cell_bytes(index_nr, *column_offset, row, scalar_cell_size(desc))?;
         decode_scalar(cell, desc, self.header.big_endian)
+    }
+}
+
+/// Bytes per row of an array column's cell in the bucket: always an
+/// `Int64` reference into the array index file (`table.f0i`).
+pub const ARRAY_REF_SIZE: u32 = 8;
+
+/// Decode one array cell for `column` (table column index `col_idx`) at
+/// `row`, returning the logical (row-major) shape and element values.
+///
+/// The bucket cell holds an `Int64` byte offset into the array index file;
+/// there the record is `[ndim][CASA-order dims][element data]` (with a
+/// reference count in front when the file version > 0) — see
+/// `SSMIndColumn::getShape`/`StIndArray`, `StManArrayFile::getShape`.
+pub fn read_array_cell(
+    file: &StandardStManFile,
+    spec: &crate::columnset::StandardStMan,
+    col_idx: usize,
+    desc: &ColumnDesc,
+    row: u64,
+) -> Result<RecordValue, SsmError> {
+    use crate::record::{ArrayData, ArrayValue};
+    if !matches!(desc.kind, ColumnKind::Array) {
+        return Err(SsmError::ArrayColumn(desc.name.clone()));
+    }
+    let index_nr = spec
+        .col_index_map
+        .get(col_idx)
+        .copied()
+        .ok_or(SsmError::IndexMissing {
+            index: col_idx,
+            count: spec.col_index_map.len(),
+        })? as usize;
+    let column_offset = spec
+        .column_offset
+        .get(col_idx)
+        .ok_or(SsmError::IndexMissing {
+            index: col_idx,
+            count: spec.column_offset.len(),
+        })?;
+    // The reference cell is an Int64 in the data-file byte order.
+    let cell = file.cell_bytes(index_nr, *column_offset, row, ARRAY_REF_SIZE)?;
+    let offset = if file.header.big_endian {
+        i64::from_be_bytes(cell[0..8].try_into().unwrap())
+    } else {
+        i64::from_le_bytes(cell[0..8].try_into().unwrap())
+    };
+    if offset == 0 {
+        return Err(SsmError::EmptyArray {
+            row,
+            column: desc.name.clone(),
+        });
+    }
+    let f0i = file
+        .f0i
+        .as_deref()
+        .ok_or_else(|| SsmError::MissingArrayFile(desc.name.clone(), "table.f0i".into()))?;
+    let off = usize::try_from(offset).map_err(|_| SsmError::BadArrayRef {
+        offset,
+        len: f0i.len(),
+    })?;
+    if off >= f0i.len() {
+        return Err(SsmError::BadArrayRef {
+            offset,
+            len: f0i.len(),
+        });
+    }
+    let version = u32_from(f0i, 0, file.header.big_endian);
+    let mut p = off;
+    if version > 0 {
+        let _ref_count = u32_at(f0i, p, file.header.big_endian)?;
+        p += 4;
+    }
+    let ndim = u32_at(f0i, p, file.header.big_endian)? as usize;
+    p += 4;
+    let mut casa_dims: Vec<u32> = Vec::with_capacity(ndim);
+    for _ in 0..ndim {
+        let d = u32_at(f0i, p, file.header.big_endian)?;
+        p += 4;
+        casa_dims.push(d);
+    }
+    let logical: Vec<u32> = casa_dims.iter().rev().copied().collect();
+    let nelem: usize = casa_dims.iter().map(|&d| d as usize).product();
+    let elem = desc.data_type;
+    // StManArrayFile: Bool elements are bit-packed; others store one
+    // element per `array_elem_size` bytes.
+    let region_size = if elem == DataType::Bool {
+        nelem.div_ceil(8)
+    } else {
+        nelem
+            .checked_mul(array_elem_size(elem))
+            .ok_or(SsmError::BadArrayRef {
+                offset,
+                len: f0i.len(),
+            })?
+    };
+    let data_start = p;
+    let data_end = data_start
+        .checked_add(region_size)
+        .ok_or(SsmError::BadArrayRef {
+            offset,
+            len: f0i.len(),
+        })?;
+    if data_end > f0i.len() {
+        return Err(SsmError::BadArrayRef {
+            offset,
+            len: f0i.len(),
+        });
+    }
+    let data = &f0i[data_start..data_end];
+    let mut r = reader(data, file.header.big_endian);
+    let array_data = match elem {
+        DataType::Bool => {
+            let nbytes = nelem.div_ceil(8);
+            let mut packed = Vec::with_capacity(nbytes);
+            for _ in 0..nbytes {
+                packed.push(r.read_u8()?);
+            }
+            ArrayData::Bool(
+                (0..nelem)
+                    .map(|i| packed[i / 8] >> (i % 8) & 1 != 0)
+                    .collect(),
+            )
+        }
+        DataType::Char | DataType::UChar => {
+            ArrayData::UChar((0..nelem).map(|_| r.read_u8()).collect::<Result<_, _>>()?)
+        }
+        DataType::Short => {
+            ArrayData::Short((0..nelem).map(|_| r.read_i16()).collect::<Result<_, _>>()?)
+        }
+        DataType::UShort => {
+            ArrayData::UShort((0..nelem).map(|_| r.read_u16()).collect::<Result<_, _>>()?)
+        }
+        DataType::Int => {
+            ArrayData::Int((0..nelem).map(|_| r.read_i32()).collect::<Result<_, _>>()?)
+        }
+        DataType::UInt => {
+            ArrayData::UInt((0..nelem).map(|_| r.read_u32()).collect::<Result<_, _>>()?)
+        }
+        DataType::Int64 => {
+            ArrayData::Int64((0..nelem).map(|_| r.read_i64()).collect::<Result<_, _>>()?)
+        }
+        DataType::Float => {
+            ArrayData::Float((0..nelem).map(|_| r.read_f32()).collect::<Result<_, _>>()?)
+        }
+        DataType::Double => {
+            ArrayData::Double((0..nelem).map(|_| r.read_f64()).collect::<Result<_, _>>()?)
+        }
+        DataType::Complex => ArrayData::Complex({
+            let mut v = Vec::with_capacity(nelem);
+            for _ in 0..nelem {
+                v.push((r.read_f32()?, r.read_f32()?));
+            }
+            v
+        }),
+        DataType::DComplex => ArrayData::DComplex({
+            let mut v = Vec::with_capacity(nelem);
+            for _ in 0..nelem {
+                v.push((r.read_f64()?, r.read_f64()?));
+            }
+            v
+        }),
+        dt => return Err(SsmError::UnsupportedArrayType(dt)),
+    };
+    Ok(RecordValue::Array(ArrayValue {
+        shape: logical,
+        data: array_data,
+    }))
+}
+
+fn u32_from(data: &[u8], off: usize, big_endian: bool) -> u32 {
+    let b = data[off..off + 4].try_into().unwrap();
+    if big_endian {
+        u32::from_be_bytes(b)
+    } else {
+        u32::from_le_bytes(b)
+    }
+}
+
+fn u32_at(data: &[u8], off: usize, big_endian: bool) -> Result<u32, SsmError> {
+    let b = data.get(off..off + 4).ok_or(SsmError::CellOutOfRange {
+        bucket: 0,
+        offset: off as u64,
+        len: 4,
+    })?;
+    Ok(if big_endian {
+        u32::from_be_bytes(b.try_into().unwrap())
+    } else {
+        u32::from_le_bytes(b.try_into().unwrap())
+    })
+}
+
+/// Bytes of one array element in the index file (Bool is bit-packed only
+/// across a row's whole array, so its size is 1 here per `copyArrayBool`).
+fn array_elem_size(dt: DataType) -> usize {
+    match dt {
+        DataType::Bool => 1,
+        DataType::Char | DataType::UChar => 1,
+        DataType::Short | DataType::UShort => 2,
+        DataType::Int | DataType::UInt | DataType::Float => 4,
+        DataType::Int64 | DataType::Double | DataType::Complex => 8,
+        DataType::DComplex => 16,
+        _ => 8,
     }
 }
 
@@ -780,6 +1007,167 @@ fn put_scalar_ints(dst: &mut [u8], v: i32, big_endian: bool) {
     } else {
         dst.copy_from_slice(&v.to_le_bytes());
     }
+}
+
+/// Encode one array value into its `table.f0i` record: `[ndim][CASA-order
+/// dims][element data]` (byte-identical to `StManArrayFile::putShape` +
+/// the element writes, for the table's data-file endianness).
+pub fn encode_array_record(
+    big_endian: bool,
+    elem: DataType,
+    value: &crate::record::ArrayValue,
+) -> Result<Vec<u8>, SsmError> {
+    use crate::aipsio::Writer;
+    use crate::record::ArrayData;
+    if elem == DataType::String {
+        return Err(SsmError::UnsupportedArrayType(DataType::String));
+    }
+    let mut w = if big_endian {
+        Writer::new()
+    } else {
+        Writer::new_le()
+    };
+    w.put_u32(value.shape.len() as u32);
+    for d in value.shape.iter().rev() {
+        w.put_i32(*d as i32); // CASA dim order = reversed logical
+    }
+    let mut body = w.into_bytes();
+    let mut push = |bytes: &[u8]| body.extend_from_slice(bytes);
+    match &value.data {
+        ArrayData::Bool(bits) => {
+            let nbytes = bits.len().div_ceil(8);
+            let mut packed = vec![0u8; nbytes];
+            for (i, b) in bits.iter().enumerate() {
+                if *b {
+                    packed[i / 8] |= 1 << (i % 8);
+                }
+            }
+            push(&packed);
+        }
+        ArrayData::UChar(v) => push(&v.to_vec()),
+        ArrayData::Short(v) => {
+            let mut b = vec![0u8; v.len() * 2];
+            for (i, x) in v.iter().enumerate() {
+                let bytes = if big_endian {
+                    x.to_be_bytes()
+                } else {
+                    x.to_le_bytes()
+                };
+                b[i * 2..i * 2 + 2].copy_from_slice(&bytes);
+            }
+            push(&b);
+        }
+        ArrayData::UShort(v) => {
+            let mut b = vec![0u8; v.len() * 2];
+            for (i, x) in v.iter().enumerate() {
+                let bytes = if big_endian {
+                    x.to_be_bytes()
+                } else {
+                    x.to_le_bytes()
+                };
+                b[i * 2..i * 2 + 2].copy_from_slice(&bytes);
+            }
+            push(&b);
+        }
+        ArrayData::Int(v) => {
+            let mut b = vec![0u8; v.len() * 4];
+            for (i, x) in v.iter().enumerate() {
+                let bytes = if big_endian {
+                    x.to_be_bytes()
+                } else {
+                    x.to_le_bytes()
+                };
+                b[i * 4..i * 4 + 4].copy_from_slice(&bytes);
+            }
+            push(&b);
+        }
+        ArrayData::UInt(v) => {
+            let mut b = vec![0u8; v.len() * 4];
+            for (i, x) in v.iter().enumerate() {
+                let bytes = if big_endian {
+                    x.to_be_bytes()
+                } else {
+                    x.to_le_bytes()
+                };
+                b[i * 4..i * 4 + 4].copy_from_slice(&bytes);
+            }
+            push(&b);
+        }
+        ArrayData::Int64(v) => {
+            let mut b = vec![0u8; v.len() * 8];
+            for (i, x) in v.iter().enumerate() {
+                let bytes = if big_endian {
+                    x.to_be_bytes()
+                } else {
+                    x.to_le_bytes()
+                };
+                b[i * 8..i * 8 + 8].copy_from_slice(&bytes);
+            }
+            push(&b);
+        }
+        ArrayData::Float(v) => {
+            let mut b = vec![0u8; v.len() * 4];
+            for (i, x) in v.iter().enumerate() {
+                let bytes = if big_endian {
+                    x.to_bits().to_be_bytes()
+                } else {
+                    x.to_bits().to_le_bytes()
+                };
+                b[i * 4..i * 4 + 4].copy_from_slice(&bytes);
+            }
+            push(&b);
+        }
+        ArrayData::Double(v) => {
+            let mut b = vec![0u8; v.len() * 8];
+            for (i, x) in v.iter().enumerate() {
+                let bytes = if big_endian {
+                    x.to_bits().to_be_bytes()
+                } else {
+                    x.to_bits().to_le_bytes()
+                };
+                b[i * 8..i * 8 + 8].copy_from_slice(&bytes);
+            }
+            push(&b);
+        }
+        ArrayData::Complex(v) => {
+            let mut b = vec![0u8; v.len() * 8];
+            for (i, (re, im)) in v.iter().enumerate() {
+                let reb = if big_endian {
+                    re.to_bits().to_be_bytes()
+                } else {
+                    re.to_bits().to_le_bytes()
+                };
+                let imb = if big_endian {
+                    im.to_bits().to_be_bytes()
+                } else {
+                    im.to_bits().to_le_bytes()
+                };
+                b[i * 8..i * 8 + 4].copy_from_slice(&reb);
+                b[i * 8 + 4..i * 8 + 8].copy_from_slice(&imb);
+            }
+            push(&b);
+        }
+        ArrayData::DComplex(v) => {
+            let mut b = vec![0u8; v.len() * 16];
+            for (i, (re, im)) in v.iter().enumerate() {
+                let reb = if big_endian {
+                    re.to_bits().to_be_bytes()
+                } else {
+                    re.to_bits().to_le_bytes()
+                };
+                let imb = if big_endian {
+                    im.to_bits().to_be_bytes()
+                } else {
+                    im.to_bits().to_le_bytes()
+                };
+                b[i * 16..i * 16 + 8].copy_from_slice(&reb);
+                b[i * 16 + 8..i * 16 + 16].copy_from_slice(&imb);
+            }
+            push(&b);
+        }
+        ArrayData::String(_) => unreachable!("string arrays rejected above"),
+    }
+    Ok(body)
 }
 
 #[cfg(test)]

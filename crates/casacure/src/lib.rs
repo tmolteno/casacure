@@ -16,8 +16,9 @@ pub use columnset::{
     ColumnSet, ColumnSetError, DataManager, DataManagerBlob, StandardStMan,
 };
 pub use ssm::{
-    encode_scalar_cell, layout, scalar_cell_size, write_standard_stman_file, SsmError, SsmIndex,
-    StandardStManFile, StandardStManHeader, StandardStManLayout, WriteColumn,
+    encode_scalar_cell, layout, read_array_cell, scalar_cell_size, write_standard_stman_file,
+    SsmError, SsmIndex, StandardStManFile, StandardStManHeader, StandardStManLayout, WriteColumn,
+    ARRAY_REF_SIZE,
 };
 pub use table::{
     build_table_dat, create_table, parse_table_dat, parse_table_header, TableCreateError, TableDat,

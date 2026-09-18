@@ -184,6 +184,11 @@ fn fixture_standard_stman_column_values_read() {
     };
     let fixtures_dir = manifest_path().parent().unwrap().to_path_buf();
     for (name, table) in &manifest.tables {
+        // Pins the scalar `typed.tab` values; the array table is covered by
+        // `fixture_array_column_read`.
+        if name != "typed" {
+            continue;
+        }
         let buf = std::fs::read(fixtures_dir.join(&table.path).join("table.dat"))
             .expect("cannot read table.dat");
         let dat = casacure::parse_table_dat(&buf)
@@ -233,6 +238,9 @@ fn fixture_column_sets_parse() {
     };
     let fixtures_dir = manifest_path().parent().unwrap().to_path_buf();
     for (name, table) in &manifest.tables {
+        if name != "typed" {
+            continue; // offset table / index-map constants are typed-specific
+        }
         let buf = std::fs::read(fixtures_dir.join(&table.path).join("table.dat"))
             .expect("cannot read table.dat");
         let dat = casacure::parse_table_dat(&buf)
@@ -253,7 +261,7 @@ fn fixture_column_sets_parse() {
         assert_eq!(cs.columns.len(), table.columns.len());
         for info in &cs.columns {
             assert_eq!(info.data_manager_seq, 0, "{name}: wrong DM binding");
-            assert_eq!(info.shape_column, None, "{name}: scalar columns only");
+            assert_eq!(info.shape, None, "{name}: scalar columns only");
         }
 
         let ssm = match &dm.blob {
@@ -305,10 +313,102 @@ fn fixture_table_descs_parse() {
                 desc.data_manager_type, "StandardStMan",
                 "{name}.{col_name}: wrong data manager"
             );
-            assert!(
-                matches!(desc.kind, casacure::ColumnKind::Scalar(_)),
-                "{name}.{col_name}: expected scalar column"
-            );
+            match &desc.kind {
+                casacure::ColumnKind::Scalar(_) => {}
+                casacure::ColumnKind::Array => {
+                    // Fixed-shape array: descriptor carries the CASA-order
+                    // (reversed logical) shape and the FixedShape option.
+                    assert!(
+                        desc.shape.is_some(),
+                        "{name}.{col_name}: array column has no shape"
+                    );
+                    assert_eq!(desc.ndim, 2, "{name}.{col_name}: wrong ndim");
+                    assert_eq!(desc.options & 4, 4, "{name}.{col_name}: not fixed shape");
+                    if col_name == "ARR" {
+                        assert_eq!(
+                            desc.shape
+                                .as_deref()
+                                .map(|s| s.iter().map(|&d| d as i32).collect::<Vec<_>>()),
+                            Some(vec![3, 2]),
+                            "{name}.{col_name}: wrong CASA-order shape"
+                        );
+                    }
+                }
+                casacure::ColumnKind::Record => {
+                    panic!("{name}.{col_name}: unexpected record column")
+                }
+            }
         }
     }
+}
+
+/// Reads the real casacore-written `array.tab`: the fixed-shape (2x3
+/// complex) `ARR` column via its `table.f0i` array index file, and the
+/// scalar `IDX` column from the data buckets.
+#[test]
+fn fixture_array_column_read() {
+    use casacure::record::{ArrayData, RecordValue};
+    let Some(manifest) = load_manifest() else {
+        return;
+    };
+    let Some(array) = manifest.tables.get("array") else {
+        return;
+    };
+    let fixtures_dir = manifest_path().parent().unwrap().to_path_buf();
+    let dir = fixtures_dir.join(&array.path);
+    let dat_bytes = std::fs::read(dir.join("table.dat")).expect("cannot read table.dat");
+    let dat = casacure::parse_table_dat(&dat_bytes)
+        .unwrap_or_else(|e| panic!("array: table.dat failed to parse: {e}"));
+
+    let file = casacure::StandardStManFile::open(&dir, 0, dat.header.big_endian)
+        .unwrap_or_else(|e| panic!("array: data file failed to open: {e}"));
+    // ARR uses the array index file; IDX is in the buckets.
+    assert!(file.f0i().is_some(), "array.tab should have a table.f0i");
+    assert_eq!(
+        file.indices[0].last_row,
+        vec![1],
+        "array: one bucket, 2 rows"
+    );
+
+    let dm = &dat.column_set.data_managers[0];
+    let spec = match &dm.blob {
+        casacure::DataManagerBlob::StandardStMan(s) => s,
+        _ => panic!("array: expected StandardStMan spec"),
+    };
+    // The ARR binding carries the fixed CASA-order shape.
+    assert_eq!(
+        dat.column_set.columns[0].shape.as_deref(),
+        Some(&[3i64, 2][..]),
+        "array: ARR binding shape"
+    );
+    assert_eq!(spec.column_offset, vec![0, 256], "array: column offsets");
+
+    for (row, base) in [(0u64, 0i32), (1, 10)] {
+        let cell = casacure::read_array_cell(&file, spec, 0, &dat.desc.columns[0], row)
+            .unwrap_or_else(|e| panic!("array: ARR row {row} read failed: {e}"));
+        match cell {
+            RecordValue::Array(arr) => {
+                assert_eq!(arr.shape, vec![2, 3], "array: logical shape row {row}");
+                match &arr.data {
+                    ArrayData::Complex(vals) => {
+                        let expect: Vec<(f32, f32)> =
+                            (1..=6).map(|k| (base as f32, k as f32)).collect();
+                        assert_eq!(&vals[..], &expect[..], "array: values row {row}");
+                    }
+                    other => panic!("array: expected complex data, got {other:?}"),
+                }
+            }
+            other => panic!("array: expected array value, got {other:?}"),
+        }
+    }
+    // Scalar IDX column reads from the buckets as usual.
+    let idx = dat.desc.column("IDX").unwrap();
+    assert_eq!(
+        file.read_scalar_cell(spec, 1, idx, 0).unwrap(),
+        RecordValue::Int(0)
+    );
+    assert_eq!(
+        file.read_scalar_cell(spec, 1, idx, 1).unwrap(),
+        RecordValue::Int(1)
+    );
 }
