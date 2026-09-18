@@ -5,6 +5,26 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Added
+
+- Table selection API driven by DDFacet's casacore usage (DDFacet's MS data
+  path uses only `casacore.tables`: `getcol`/`putcol`/`addcols`/
+  `getcoldesc`/`colnames`/`nrows`/`getkeyword`/`query`/`sort`/`getcolslice`):
+  - `table.query(taql)` — rows matching a TaQL selection expression, as a
+    new table (DDFacet: `t.query("FIELD_ID==1")`);
+  - `table.sort(column)` — table sorted ascending by a column (DDFacet:
+    `t.query(...).sort("TIME")` in `ClassMS.GiveMainTable`);
+  - `table.select(taql)` — alias of `query` (casacore returns a
+    TableIterator; a filtered table suffices for DDFacet);
+  - `table.getkeyword(name)` — single keyword value (None when absent).
+  DDFacet's `pyrap.images.image` imports are astropy-backed (the `image`
+  module is only used via `image(...).getdata()` in a few test/mask paths and
+  `KeepCasa` is unimplemented), so no CASA-image subsystem is required; the
+  `pyrap.measures`/`quanta` usage appears only in the montblanc/utilities
+  paths (`GiveDate`), tracked as optional future work.
+
+## [Unreleased]
+
 ## [0.2.0] - 2026-09-19
 
 ### Changed

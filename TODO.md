@@ -68,3 +68,8 @@ still wins by default).
 - [ ] Register as a store type in `fsspec_store.py`/`dask_ms.py` dispatch (upstream, later)
 
 Python 3.14: supported (pyo3 0.27 / numpy 0.27; full dask-ms suite green on 3.14; requires-python >=3.9,<3.15).
+
+DDFacet survey (crates/casacure): DDFacet's MS data path uses only the tables
+API, now covered — added `table.query()`, `table.select()`, `table.sort()`,
+`table.getkeyword(name)`. Optional future work: `pyrap.measures`/`quanta` for
+DDFacet's montblanc/GiveDate utilities.

@@ -216,6 +216,21 @@ impl Table {
         })
     }
 
+    /// The resolved table directory (handles `ms::SUBTABLE` syntax).
+    fn dir_of(&self) -> std::path::PathBuf {
+        if let Some((base, sub)) = self.path.split_once("::") {
+            PathBuf::from(base).join(sub)
+        } else {
+            PathBuf::from(&self.path)
+        }
+    }
+
+    /// A fresh read-only core table for running TaQL against the current
+    /// on-disk state.
+    fn core_running(&self) -> PyResult<::casacure::Table> {
+        ::casacure::Table::open(self.dir_of(), false).map_err(err)
+    }
+
     /// Read cells for a column range from whichever backing is current.
     fn read_col(&self, col_idx: usize, startrow: u64, nrow: u64) -> PyResult<Vec<RecordValue>> {
         let inner = self.inner.lock().unwrap();
@@ -343,6 +358,79 @@ impl Table {
             .map(|p| p.to_path_buf());
         let vt = self_coldesc(py, col, base.as_deref())?;
         Ok(vt.into_any().unbind())
+    }
+
+    /// Run `sql` (a `SELECT * FROM $1 ...`) against this table and return
+    /// the result as a new `table`.
+    fn select_run(&self, py: Python<'_>, sql: &str) -> PyResult<Py<PyAny>> {
+        let core_t = self.core_running()?;
+        match core::taql::execute(sql, &[&core_t]).map_err(err)? {
+            core::taql::TaqlResult::Query(out) => Ok(taql_result_to_table(py, out)?
+                .into_pyobject(py)?
+                .into_any()
+                .unbind()),
+            other => Err(PyRuntimeError::new_err(format!(
+                "taql: expected a SELECT result, got {other:?}"
+            ))),
+        }
+    }
+
+    /// `table.query(query)` — select rows matching a TaQL selection
+    /// expression (casacore `Table::query`), returned as a new table.
+    /// DDFacet uses e.g. `t.query("FIELD_ID==1")`.
+    #[pyo3(signature = (query, _options = None))]
+    fn query(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        _options: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        self.select_run(py, &format!("SELECT * FROM $1 WHERE {query}"))
+    }
+
+    /// `table.select(query)` — alias of `query` (casacore returns a
+    /// TableIterator; a filtered table is sufficient for DDFacet's usage).
+    #[pyo3(signature = (query, _sort = false, _only_unnamed = false))]
+    fn select(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        _sort: bool,
+        _only_unnamed: bool,
+    ) -> PyResult<Py<PyAny>> {
+        self.query(py, query, None)
+    }
+
+    /// `table.sort(column)` — return the table sorted by `column` (ascending,
+    /// like casacore `Table::sort`). DDFacet: `t.query(...).sort("TIME")`.
+    #[pyo3(signature = (column, _addtoprefix = false))]
+    fn sort(&self, py: Python<'_>, column: &str, _addtoprefix: bool) -> PyResult<Py<PyAny>> {
+        self.select_run(py, &format!("SELECT * FROM $1 ORDERBY {column}"))
+    }
+
+    /// `getkeyword(name)` — a single keyword value (None when absent).
+    fn getkeyword(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
+        let rec = {
+            let inner = self.inner.lock().unwrap();
+            match &*inner {
+                Inner::Read(dir) => ::casacure::Table::open(dir, false)
+                    .map(|t| t.dat.desc.keywords.clone())
+                    .unwrap_or_else(|_| core::record::TableRecord {
+                        desc: Default::default(),
+                        record_type: 0,
+                        values: Vec::new(),
+                    }),
+                Inner::Write { shared, .. } => shared.lock().unwrap().wt.desc().keywords.clone(),
+            }
+        };
+        let base = std::path::Path::new(&self.path)
+            .parent()
+            .map(|p| p.to_path_buf());
+        let d = convert::table_record_to_dict_ctx(py, &rec, base.as_deref())?;
+        match d.get_item(name)? {
+            Some(v) => Ok(v.unbind()),
+            None => Ok(py.None()),
+        }
     }
 
     /// `getkeywords()` -> dict.
