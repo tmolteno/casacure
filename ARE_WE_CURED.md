@@ -13,6 +13,39 @@ Work areas are tracked as GitHub issues; subtasks live in `TODO.md`.
 | casacore comparison tests | `.venv/bin/python -m pytest tests/` | 5/5 | type system only |
 | write interop (manual) | `examples/create_sample_table.rs` + python-casacore | ✓ | casacure-write → casacore-read: SSM scalars, arrays, long strings, and ISM TIME/ANT1 in one 4-file table; 3-row and 100-row variants return exactly the written values |
 
+## Casacure-compatible packages
+
+Which packages that depend on casacore can run on casacure.
+
+| Package / tool | What it uses casacore for | Compatibility | How it is verified |
+|---|---|---|---|
+| **dask-ms** 0.2.32 | `casacore.tables` for Measurement Set read / write | **fully compatible** | its entire test suite passes **219/219** — via the `casacore` shim AND via the direct backend (`DASK_MS_BACKEND=casacure`, no shim) — on Python 3.13 and 3.14 |
+| **python-casacore** 3.8.1 | the interface casacure mirrors (`casacore.tables`) | **interface-compatible** | `casacure.tables` is a drop-in replacement; the type-system comparison (`tests/test_types_compat.py`) passes 5/5 against real python-casacore |
+| **casacore** (C++ library) | owns the on-disk table / MS format | **byte-compatible** | write / read round-trips both directions (casacure → casacore and casacore → casacure → casacore), incl. a full MS (main table + subtables) and multi-manager tables (SSM + ISM + TSM) |
+| **DDFacet** | `pyrap.tables` for its MS data path | **API-compatible (tables surface)** | survey of `../DDFacet` shows its load-bearing casacore use is the tables API — `getcol`/`putcol`/`addcols`/`getcoldesc`/`colnames`/`nrows`/`getkeyword`/`query`/`sort`/`getcolslice` — all provided by casacure; the `t.query(...).sort('TIME')` pattern (ClassMS) is exercised directly |
+
+### How compatibility is achieved
+
+- **Shim**: a two-file `casacore` package re-exporting `casacure.tables` on
+  `PYTHONPATH` ahead of any real python-casacore — exactly what
+  `tests/daskms_smoke.py` runs.
+- **Direct backend**: an env-gated `DASK_MS_BACKEND=casacure` that aliases
+  `casacore.tables` → `casacure.tables` in-process (prototype of the upstream
+  dask-ms store-dispatch change).
+- **Interface**: `pip install casacure` → `import casacure.tables` works as a
+  direct replacement for `import casacore.tables` on any package.
+
+### Not covered (casacore subsystems outside the table system)
+
+- **`images`**: casacore's CASA-image / FITS-image module. Not implemented —
+  DDFacet's image I/O is astropy-backed (`fits.PrimaryHDU`/`writeto`), so no
+  consumer here needs it.
+- **`measures` / `quanta`**: astronomical measure/quantity conversion,
+  used only in DDFacet's montblanc / utility paths (`GiveDate`, `ModRotate`).
+  Tracked in `TODO.md` as optional future work.
+- **`msfits` / `lofar`-style helpers** and other casacore subsystems: not
+  implemented.
+
 ## Progress by area (per CASACORE_TO_CASA_RS.md)
 
 | Area | Status | Notes |
