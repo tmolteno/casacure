@@ -1,23 +1,31 @@
-# casacure
+# casacure and python-casacure
 
-A pure-Rust implementation of the CASA table system (casacore), pip-installable
-on any machine as a Python package.
+This repository contains two user-facing packages that share one engine — a
+pure-Rust implementation of the CASA table system that reads and writes real
+casacore Measurement Sets and tables without needing the C++ casacore library:
 
-casacure reads and writes real casacore Measurement Sets and tables — the
-`StandardStMan`, `IncrementalStMan` and `TiledColumnStMan` on-disk formats,
-table metadata, keywords and subtable linkage, and a TaQL subset — without
-needing to build or link the C++ casacore library. It is fast to install
-(source or a prebuilt wheel), drops the multi-hour C++ dependency hell, and
-works everywhere a Rust `cdylib` can be built, including ARM (`aarch64`).
+| Package | Kind | Install | Entry point |
+|---|---|---|---|
+| **casacure** | Rust crate | `cargo add casacure` (crates.io) | `use casacure;` |
+| **python-casacure** | Python package | `pip install casacure` (PyPI) | `import casacure.tables` |
 
-The Python bindings expose **`casacure.tables`**, an interface-compatible
+"python-casacure" is the name of the Python package. Its published PyPI name
+stays **`casacure`** (module `casacure.tables`) — the Python package is
+**not** renamed. The Python package is built from the internal
+`crates/casacure-python` crate, which is not published to crates.io and is
+not intended for direct use.
+
+Both packages expose the same capabilities — the `StandardStMan`,
+`IncrementalStMan` and `TiledColumnStMan` on-disk formats, table metadata,
+keywords and subtable linkage, and a TaQL subset — without building or linking
+the C++ casacore library. Install is fast (a wheel or the crate), there is no
+multi-hour C++ dependency build, and it works everywhere a Rust `cdylib` can
+be built, including ARM (`aarch64`).
+
+The Python binding's **`casacure.tables`** is an interface-compatible
 replacement for `casacore.tables`, so existing tooling — most notably
-**dask-ms** — can run on casacure unchanged.
-
-- **Pure Rust core**: `crates/casacure` (the `casacure` crate on crates.io).
-- **Python bindings**: `crates/casacure-python` → `pip install casacure`
-  (CPython 3.9–3.14; wheels for Linux, macOS and Windows). Bring your own
-  Measurement Sets — casacure never modifies the upstream C++ source.
+**dask-ms** — can run on casacure unchanged (CPython 3.9–3.14; wheels for
+Linux, macOS and Windows).
 
 | | |
 |---|---|
