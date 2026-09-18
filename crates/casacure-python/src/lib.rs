@@ -8,7 +8,7 @@ mod table;
 use ::casacure::ValueType;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyTuple};
 
 /// Map a CASA type name (any alias) to its numpy dtype name.
 ///
@@ -33,16 +33,18 @@ fn casa_type(numpy_dtype: &str) -> PyResult<String> {
     Ok(vt.casa_name().to_string())
 }
 
-/// `default_ms(path, tabdesc=None)` — create the full MS tree (main table +
-/// the 12 standard subtables), mirroring casacore.
+/// `default_ms(path, tabdesc=None, dminfo=None)` — create the full MS tree
+/// (main table + the 12 standard subtables), mirroring casacore. Returns the
+/// main table (usable as a context manager).
 #[pyfunction]
-#[pyo3(signature = (path, tabdesc = None, _dminfo = None))]
+#[pyo3(signature = (path, tabdesc = None, dminfo = None))]
 fn default_ms(
     py: Python<'_>,
     path: &str,
     tabdesc: Option<&Bound<'_, PyAny>>,
-    _dminfo: Option<&Bound<'_, PyAny>>,
-) -> PyResult<()> {
+    dminfo: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Py<PyAny>> {
+    let _ = dminfo;
     let extra = match tabdesc {
         Some(d) if !d.is_none() => {
             if let Ok(dict) = d.downcast::<PyDict>() {
@@ -55,18 +57,39 @@ fn default_ms(
         _ => None,
     };
     ::casacure::ms::default_ms(std::path::Path::new(path), extra.as_deref())
-        .map_err(|e| PyValueError::new_err(e.to_string()))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let t = table::table(
+        py,
+        path,
+        None,
+        0,
+        None,
+        true,
+        true,
+        &PyTuple::empty(py),
+        None,
+    )?;
+    Ok(t.into_pyobject(py)?.into_any().unbind())
 }
 
-/// `default_ms_subtable(name, path)` — create one MS subtable table.
+/// `default_ms_subtable(name, path, tabdesc=None, dminfo=None)` — create one
+/// MS subtable table.
 #[pyfunction]
-fn default_ms_subtable(name: &str, path: &str) -> PyResult<()> {
+#[pyo3(signature = (name, path, tabdesc = None, dminfo = None))]
+fn default_ms_subtable(
+    name: &str,
+    path: &str,
+    tabdesc: Option<&Bound<'_, PyAny>>,
+    dminfo: Option<&Bound<'_, PyAny>>,
+) -> PyResult<()> {
+    let _ = (tabdesc, dminfo);
     ::casacure::ms::default_ms_subtable(name, std::path::Path::new(path))
         .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
 /// `required_ms_desc(name=None)` -> the descriptor dict.
 #[pyfunction]
+#[pyo3(signature = (name = None))]
 fn required_ms_desc(py: Python<'_>, name: Option<String>) -> PyResult<Py<PyAny>> {
     let desc = ::casacure::ms::required_ms_desc(name.as_deref())
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -75,6 +98,7 @@ fn required_ms_desc(py: Python<'_>, name: Option<String>) -> PyResult<Py<PyAny>>
 
 /// `complete_ms_desc(name=None)` -> the descriptor dict.
 #[pyfunction]
+#[pyo3(signature = (name = None))]
 fn complete_ms_desc(py: Python<'_>, name: Option<String>) -> PyResult<Py<PyAny>> {
     let desc = ::casacure::ms::complete_ms_desc(name.as_deref())
         .map_err(|e| PyValueError::new_err(e.to_string()))?;

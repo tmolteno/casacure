@@ -273,6 +273,17 @@ subtasks are moved here.
   GROUPBY partitioning path (GROWID/GCOUNT/GAGGR). Fixes surfaced: `getcell`
   returns just the cell shape (no leading row singleton, matching casacore);
   `getcolnp` maps scalar cells by the buffer dtype (was zero-filling them).
+- Full dask-ms MS lifecycle on casacure (§7): `xds_to_ms`/`xds_from_ms`
+  now work end-to-end — dask-ms creates an MS from scratch (via our
+  `default_ms`, which now returns a context-manager table and accepts the
+  `tabdesc=`/`dminfo=` kwargs dask-ms passes; `required/complete_ms_desc`
+  take an optional name), writes the dataset columns, and reads them back
+  through `xds_from_ms` (MS-schema dims + FIELD_ID/DATA_DESC_ID grouping),
+  cross-checked against real casacore (12 subtable dirs, correct values).
+  `WritableTable::flush` now fills unwritten array cells with casacore's
+  defaults (zeros for fixed shape, empty for variable) instead of failing —
+  required for dask-ms's addrows-before-putcol write pattern (was
+  `NoDefault`); 85/85 tests still pass.
 - `table` module: `parse_table_header` parses the `table.dat` root object
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit

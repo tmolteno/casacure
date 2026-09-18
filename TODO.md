@@ -59,5 +59,5 @@ Work areas follow `CASACORE_TO_CASA_RS.md` (tracked as GitHub issues).
 ## 7. dask-ms integration
 
 - [X] Cross-implementation round-trip gate (Rust-write → casacore-read and vice versa)
-- [~] Full dask-ms test suite passing against casacure — core read/write + taql ordering/grouping verified end-to-end via a `casacore.tables` shim (`tests/daskms_smoke.py`): `xds_from_table`/`xds_to_table` round-trip (incl. `group_cols` GROUPBY partitioning) on casacure-backed tables, cross-checked with real casacore. Remaining: broader dask-ms fixtures (MS schema tests, `tablefromascii`, apps) + upstream store dispatch.
+- [~] Full dask-ms test suite passing against casacure — the whole MS lifecycle runs on casacure via a `casacore.tables` shim (`tests/daskms_smoke.py`): `xds_from_table`/`xds_to_table` read+write, `group_cols` GROUPBY partitioning, and `xds_to_ms`/`xds_from_ms` create/write/read of a full MS (default_ms + 12 subtables), cross-checked with real casacore. Remaining: broader dask-ms fixtures (`tablefromascii`, apps) + upstream store dispatch.
 - [ ] Register as a store type in `fsspec_store.py`/`dask_ms.py` dispatch (upstream, later)

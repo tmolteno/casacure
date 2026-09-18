@@ -39,6 +39,64 @@ DESC = {
 }
 
 
+def ms_create_read_write():
+    """Create a Measurement Set from scratch via xds_to_table(descriptor='ms')
+    (exercising default_ms), then read it back."""
+
+    import dask
+    import dask.array as da
+    import xarray as xr
+    from daskms import xds_from_ms, xds_to_table
+
+    tmp = tempfile.mkdtemp(prefix="casacure-newms-")
+    path = os.path.join(tmp, "ms.tab")
+    rng = np.random.default_rng(3)
+    n = 4
+    data = (rng.random((n, 8, 4)) + 1j * rng.random((n, 8, 4))).astype(np.complex64)
+    weight = rng.random((n, 4), dtype=np.float32)
+    ds = xr.Dataset(
+        {
+            "TIME": (("row",), da.from_array(np.array([0.0, 1.0, 2.0, 3.0]), chunks=n)),
+            "ANTENNA1": (
+                ("row",),
+                da.from_array(np.array([0, 1, 0, 1], dtype=np.int32), chunks=n),
+            ),
+            "DATA": (("row", "chan", "corr"), da.from_array(data, chunks=(n, 8, 4))),
+            "WEIGHT": (("row", "corr"), da.from_array(weight, chunks=(n, 4))),
+        },
+        coords={"row": np.arange(n)},
+    )
+    dask.compute(xds_to_table(ds, path, descriptor="ms"))
+    print("xds_to_ms create+write: OK")
+
+    back = xds_from_ms(path, columns=["TIME", "ANTENNA1", "DATA", "WEIGHT"])[0].compute()
+    assert back.sizes["row"] == n and back.DATA.shape == (n, 8, 4), back
+    assert np.allclose(back.DATA.values, data), "DATA mismatch"
+    assert back.TIME.values.tolist() == [0.0, 1.0, 2.0, 3.0]
+    print("xds_from_ms read-back: OK")
+
+    # Cross-check with real casacore.
+    try:
+        from casacore.tables import table as casacore_table
+
+        t = casacore_table(path, ack=False)
+        assert t.nrows() == n and t.getcol("DATA").shape == (n, 8, 4), "casacore mismatch"
+        import os as _os
+
+        subs = [
+            d
+            for d in _os.listdir(path)
+            if _os.path.isdir(os.path.join(path, d))
+            and _os.path.exists(os.path.join(path, d, "table.dat"))
+        ]
+        assert len(subs) == 12, f"expected 12 standard subtables, got {subs}"
+        print("casacore cross-check (12 subtables): OK")
+    except ImportError:
+        print("casacore cross-check: skipped (not installed)")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     import dask
     from daskms import xds_from_table, xds_to_table
@@ -107,6 +165,8 @@ def main():
         print("casacore cross-check: skipped (not installed)")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+    ms_create_read_write()
 
 
 if __name__ == "__main__":

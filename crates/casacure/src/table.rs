@@ -1417,10 +1417,36 @@ impl WritableTable {
 
 /// The default value for an unfilled cell of `desc` (scalar columns store
 /// their default; variable strings default to empty).
+/// The cell value casacore uses for an unwritten cell: scalar defaults, a
+/// zero-filled array for fixed-shape array columns, and an empty array for
+/// variable-shape array columns.
 fn default_cell_value(cd: &crate::tabledesc::ColumnDesc) -> Option<RecordValue> {
+    use crate::record::{ArrayData, ArrayValue};
     match &cd.kind {
         crate::tabledesc::ColumnKind::Scalar(default) => Some(default.clone()),
-        crate::tabledesc::ColumnKind::Array => None,
+        crate::tabledesc::ColumnKind::Array => {
+            let shape = cd.shape.clone().unwrap_or_default();
+            let n = shape.iter().map(|&d| d.max(0) as usize).product();
+            let data = match cd.data_type {
+                crate::record::DataType::Bool => ArrayData::Bool(vec![false; n]),
+                crate::record::DataType::UChar => ArrayData::UChar(vec![0; n]),
+                crate::record::DataType::UShort => ArrayData::UShort(vec![0; n]),
+                crate::record::DataType::Short => ArrayData::Short(vec![0; n]),
+                crate::record::DataType::Int => ArrayData::Int(vec![0; n]),
+                crate::record::DataType::UInt => ArrayData::UInt(vec![0; n]),
+                crate::record::DataType::Int64 => ArrayData::Int64(vec![0; n]),
+                crate::record::DataType::Float => ArrayData::Float(vec![0.0; n]),
+                crate::record::DataType::Double => ArrayData::Double(vec![0.0; n]),
+                crate::record::DataType::Complex => ArrayData::Complex(vec![(0.0, 0.0); n]),
+                crate::record::DataType::DComplex => ArrayData::DComplex(vec![(0.0, 0.0); n]),
+                crate::record::DataType::String => ArrayData::String(vec![String::new(); n]),
+                _ => ArrayData::Double(Vec::new()),
+            };
+            Some(RecordValue::Array(ArrayValue {
+                shape: shape.iter().map(|&d| d.max(0) as u32).collect(),
+                data,
+            }))
+        }
         crate::tabledesc::ColumnKind::Record => None,
     }
 }

@@ -694,6 +694,21 @@ impl Table {
         }
     }
 
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __exit__(
+        &self,
+        _ty: Option<Py<PyAny>>,
+        _value: Option<Py<PyAny>>,
+        _tb: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        // python-casacore's `with table(...)` closes (flushing) on exit.
+        self.flush()?;
+        Ok(())
+    }
+
     fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
         self.getcol(py, key, 0, -1, 1)
     }
