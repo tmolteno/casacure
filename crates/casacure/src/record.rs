@@ -632,7 +632,11 @@ pub(crate) fn write_table_record(
                 let Some(RecordValue::Record(sub)) = record.get(&field.name) else {
                     return Err(RecordError::LegacyKeywordSet("missing record value".into()));
                 };
-                if sub.desc.fields.is_empty() {
+                // Framed iff the *field's* sub-descriptor is empty (casacore
+                // frames nested keyword records whose header sub-desc is
+                // empty, regardless of the value's own desc).
+                let field_empty = field.sub_desc.as_ref().is_none_or(|s| s.fields.is_empty());
+                if field_empty {
                     write_table_record(w, sub)?;
                 } else {
                     write_record_data_values(w, sub)?;
@@ -780,7 +784,8 @@ fn write_record_data_values(
             .ok_or_else(|| RecordError::LegacyKeywordSet("missing nested value".into()))?;
         match value {
             RecordValue::Record(sub) => {
-                if sub.desc.fields.is_empty() {
+                let field_empty = field.sub_desc.as_ref().is_none_or(|s| s.fields.is_empty());
+                if field_empty {
                     write_table_record(w, sub)?;
                 } else {
                     write_record_data_values(w, sub)?;

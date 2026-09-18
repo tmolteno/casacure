@@ -3,7 +3,7 @@
 Overall progress towards replacing casacore as the dask-ms I/O backend.
 Work areas are tracked as GitHub issues; subtasks live in `TODO.md`.
 
-**Verdict: NOT YET CURED** — §1–§3 are complete at the Rust-core level (format, lifecycle, column read **and** write); `casacure-python` (numpy/dict bindings) and §4–§7 remain.
+**Verdict: NOT YET CURED** — §1–§7 are complete at the Rust-core level and `casacure-python` now exposes the python-casacore surface (`casacure.tables`); the remaining gap to running dask-ms directly is the `casacore.tables` shim / store dispatch (upstream work).
 
 ## Test status
 
@@ -24,7 +24,7 @@ Work areas are tracked as GitHub issues; subtasks live in `TODO.md`.
 | §5 Metadata & descriptors | ~85% | read + write done incl. subtable linkage: nrows/colnames/getcoldesc/getdesc, getkeywords/getcolkeywords, putkeyword/putcolkeyword/removekeyword/removecolkeyword (nested records), `TpTable` subtable keywords with `"Table: <path>"` resolution both ways |
 | §6 TaQL subset | ~80% | `taql` module: SELECT ($N / `'path'` / DDL), WHERE evaluator, ORDERBY/ROWID, GROUPBY+GROWID/GAGGR/GCOUNT, UNIQUE, subqueries, CREATE TABLE — verified against casacore ordering/grouping probes and casacore reading a casacure-built DDL table. `'path'` FROM + pyo3 surface still pending |
 | §7 MS schema / descriptors | ~90% | vendored required/complete descs (MS + 17 subtables), default_ms with full subtable tree + TpTable linkage, default_ms_subtable, maketabdesc; casacore opens/writes/reads a casacure-created MS end-to-end |
-| dask-ms integration | 0% | not started |
+| §8 dask-ms integration / bindings | ~60% | `casacure-python` pyo3 binding (`casacure.tables`: table/taql/default_ms/default_ms_subtable/required+complete_ms_desc/type helpers) with exact casacore array semantics (fixed logical + variable as-given, descriptor shape reversed) verified both directions; cross-implementation round-trip gate done; remaining: `casacore.tables` shim + dask-ms store dispatch + full suite |
 
 ## Known casacore behaviour discovered by the comparison tests
 

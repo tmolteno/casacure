@@ -58,6 +58,6 @@ Work areas follow `CASACORE_TO_CASA_RS.md` (tracked as GitHub issues).
 
 ## 7. dask-ms integration
 
+- [X] Cross-implementation round-trip gate (Rust-write → casacore-read and vice versa)
 - [ ] Register as a store type in `fsspec_store.py`/`dask_ms.py` dispatch (upstream, later)
-- [ ] Full dask-ms test suite passing against casacure
-- [ ] Cross-implementation round-trip gate (Rust-write → casacore-read and vice versa)
+- [ ] Full dask-ms test suite passing against casacure (needs the bindings `casacore.tables` shim + store dispatch)

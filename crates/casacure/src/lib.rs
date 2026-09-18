@@ -27,9 +27,10 @@ pub use ssm::{
     ARRAY_REF_SIZE,
 };
 pub use table::{
-    build_table_dat, create_table, get_dminfo, parse_table_dat, parse_table_header,
-    slice_array_value, DmInfo, DmSpec, Table, TableCreateError, TableDat, TableDatError,
-    TableError, TableHeader, TableReadError, WritableTable, WriteTableError, ROWS_PER_BUCKET,
+    build_table_dat, casa_value_type, create_table, get_dminfo, parse_table_dat,
+    parse_table_header, slice_array_value, DmInfo, DmSpec, Table, TableCreateError, TableDat,
+    TableDatError, TableError, TableHeader, TableReadError, WritableTable, WriteTableError,
+    ROWS_PER_BUCKET,
 };
 pub use tabledesc::{
     parse_table_desc, write_table_desc, ColumnDesc, ColumnKind, TableDesc, TableDescError,

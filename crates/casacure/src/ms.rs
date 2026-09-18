@@ -110,7 +110,7 @@ pub fn default_ms(path: &Path, extra_desc: Option<&str>) -> Result<(), MsError> 
 
     for sub in STANDARD_SUBTABLES {
         let sub_desc = required_ms_desc(Some(sub))?;
-        let swt = WritableTable::create(path.join(sub), sub_desc);
+        let mut swt = WritableTable::create(path.join(sub), sub_desc);
         swt.flush()?;
     }
     Ok(())
@@ -120,7 +120,7 @@ pub fn default_ms(path: &Path, extra_desc: Option<&str>) -> Result<(), MsError> 
 /// subtable table from its vendored required descriptor.
 pub fn default_ms_subtable(name: &str, path: &Path) -> Result<(), MsError> {
     let sub_desc = required_ms_desc(Some(name))?;
-    let swt = WritableTable::create(path.to_path_buf(), sub_desc);
+    let mut swt = WritableTable::create(path.to_path_buf(), sub_desc);
     swt.flush()?;
     Ok(())
 }

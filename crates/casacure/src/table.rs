@@ -909,7 +909,7 @@ fn json(s: &str) -> String {
 }
 
 /// python-casacore `valueType` names.
-fn casa_value_type(dt: crate::record::DataType) -> &'static str {
+pub fn casa_value_type(dt: crate::record::DataType) -> &'static str {
     use crate::record::DataType;
     match dt {
         DataType::Bool => "boolean",
@@ -1308,6 +1308,16 @@ impl WritableTable {
         Ok(())
     }
 
+    /// The number of rows in the in-memory cell store.
+    pub fn col_len(&self, col_idx: usize) -> usize {
+        self.cells.get(col_idx).map_or(0, Vec::len)
+    }
+
+    /// The in-memory value at (col, row), if set.
+    pub fn cell(&self, col_idx: usize, row: u64) -> Option<&RecordValue> {
+        self.cells.get(col_idx)?.get(row as usize)?.as_ref()
+    }
+
     /// No-op, as casacore's `setmaxcachesize` should be for the replacement
     /// (no caches exist).
     pub fn setmaxcachesize(&mut self, _col_idx: usize, _size: usize) {}
@@ -1382,7 +1392,7 @@ impl WritableTable {
 
     /// Assemble the on-disk table from the buffered cells, filling missing
     /// scalar cells with their defaults; returns the table directory.
-    pub fn flush(self) -> Result<std::path::PathBuf, WriteTableError> {
+    pub fn flush(&mut self) -> Result<std::path::PathBuf, WriteTableError> {
         let mut values: Vec<Vec<RecordValue>> = Vec::with_capacity(self.cells.len());
         for (col_idx, col) in self.cells.iter().enumerate() {
             let cd = &self.desc.columns[col_idx];

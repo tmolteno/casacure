@@ -204,22 +204,37 @@ pub(crate) fn column_from_desc_dict(
         Some(RecordValue::Int64(i)) => *i as i32,
         _ => -1,
     };
-    let shape = match get("shape") {
+    // The dict `shape` is the logical (row-major) shape; the descriptor
+    // stores it in CASA order (reversed), like `getcoldesc` reports back.
+    // JSON represents array values as `{"shape":[..],"array":[..]}` records,
+    // so accept both that dict form and a bare array.
+    let shape_elems: Option<Vec<i64>> = match get("shape") {
         Some(RecordValue::Array(a)) => Some(
             a.elements()
                 .iter()
                 .map(|e| match e {
                     RecordValue::Int(i) => i64::from(*i),
                     RecordValue::Int64(i) => *i,
-                    other => i64::from(match other {
-                        RecordValue::Int(i) => *i,
-                        _ => 0,
-                    }),
+                    _ => 0,
                 })
-                .collect::<Vec<i64>>(),
+                .collect(),
         ),
+        Some(RecordValue::Record(r)) => r.get("array").and_then(|v| match v {
+            RecordValue::Array(a) => Some(
+                a.elements()
+                    .iter()
+                    .map(|e| match e {
+                        RecordValue::Int(i) => i64::from(*i),
+                        RecordValue::Int64(i) => *i,
+                        _ => 0,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        }),
         _ => None,
     };
+    let shape = shape_elems.map(|dims| dims.into_iter().rev().collect());
     let keywords = match get("keywords") {
         Some(RecordValue::Record(r)) => r.clone(),
         _ => crate::record::TableRecord {

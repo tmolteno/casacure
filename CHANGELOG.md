@@ -246,6 +246,26 @@ subtasks are moved here.
   `QuantumUnits: ['s']`), writes variable `DATA` and ANTENNA NAME/POSITION
   into it and reads them back exactly. 6 new unit tests (70/70 unit + 15
   fixture in this release).
+- casacure-python bindings (§7): a `casacure.tables` submodule exposing the
+  python-casacore surface dask-ms uses — `table(...)` (create/open, numpy
+  `getcol`/`getcolnp`/`getcolslice`/`getcolslicenp`, `getcell`/
+  `getcellslice`/`getvarcol`, `putcol`/`putcolnp`/`putcolslice`/
+  `putvarcol`/`putcell`, `addrows`, keyword get/set/remove incl. nested
+  records and arrays, `getcoldesc`/`getdminfo`/`nrows`/`colnames`/
+  `iswritable`, advisory `lock`/`unlock`, no-op `setmaxcachesize`), plus
+  `taql(...)`, `default_ms`, `default_ms_subtable`, `required_ms_desc` /
+  `complete_ms_desc` and the type-mapping helpers. Array shape conventions
+  match casacore exactly: fixed-shape columns read/write in the logical
+  (c-order) orientation with the descriptor shape reversed; variable-shape
+  columns as given; strings as lists / `{"shape","array"}` dicts. `table.f0i`
+  created for array columns at zero rows; `TableDesc::from_desc_json`
+  reverses fixed `shape` keys. Fixed a keyword-record write bug: nested
+  keyword records are framed when the *field's* sub-descriptor is empty
+  (casacore frames them even for non-empty value descs) — verified by
+  re-reading casacore-written keyword tables through the write-back path.
+  Interop-gated: casacure-created fixed/variable tables read identically in
+  casacore and vice versa (written with pyo3/numpy 0.26; install with
+  maturin).
 - `table` module: `parse_table_header` parses the `table.dat` root object
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit

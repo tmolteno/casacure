@@ -1,0 +1,668 @@
+//! Conversions between casacure's Rust values and Python objects / numpy
+//! arrays, matching the python-casacore / dask-ms surface.
+
+use casacure::record::{ArrayData, ArrayValue, DataType, RecordValue, TableRecord};
+use numpy::PyArrayMethods;
+use numpy::{Complex32, Complex64};
+use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::prelude::*;
+use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+
+// ---------------------------------------------------------------------------
+// Shapes / index transposition
+// ---------------------------------------------------------------------------
+
+/// Logical (externally visible) shape from the stored CASA shape: reversed.
+/// Write a column of cells into a flat C-order buffer. Cells are returned
+/// in the shape they are stored (which, for casacore files, is the logical
+/// shape; the descriptor shape is reversed metadata only).
+pub(crate) fn fill_flat<T: Copy + Default>(
+    buf: &mut [T],
+    cells: &[RecordValue],
+    cell: usize,
+    map: impl Fn(&ArrayData, usize) -> T,
+) -> PyResult<()> {
+    for (r, c) in cells.iter().enumerate() {
+        if let RecordValue::Array(a) = c {
+            let base = r * cell;
+            for i in 0..cell {
+                if base + i < buf.len() {
+                    buf[base + i] = map(&a.data, i);
+                }
+            }
+        } else if r < buf.len() {
+            buf[r] = map_scalar_value(c);
+        }
+    }
+    Ok(())
+}
+
+fn map_scalar_value<T: Default>(_v: &RecordValue) -> T {
+    T::default()
+}
+
+// ---------------------------------------------------------------------------
+// Reading cells into a provided numpy buffer (getcolnp / getcolslicenp)
+// ---------------------------------------------------------------------------
+
+fn f64_of(d: &ArrayData, i: usize) -> f64 {
+    match d {
+        ArrayData::Double(v) => v[i],
+        ArrayData::Float(v) => f64::from(v[i]),
+        ArrayData::Int(v) => f64::from(v[i]),
+        _ => 0.0,
+    }
+}
+fn f32_of(d: &ArrayData, i: usize) -> f32 {
+    match d {
+        ArrayData::Float(v) => v[i],
+        ArrayData::Double(v) => v[i] as f32,
+        _ => 0.0,
+    }
+}
+fn i64_of(d: &ArrayData, i: usize) -> i64 {
+    match d {
+        ArrayData::Int64(v) => v[i],
+        ArrayData::Int(v) => i64::from(v[i]),
+        ArrayData::Short(v) => i64::from(v[i]),
+        ArrayData::UChar(v) => i64::from(v[i]),
+        _ => 0,
+    }
+}
+fn i32_of(d: &ArrayData, i: usize) -> i32 {
+    match d {
+        ArrayData::Int(v) => v[i],
+        ArrayData::Int64(v) => v[i] as i32,
+        ArrayData::Short(v) => i32::from(v[i]),
+        ArrayData::UChar(v) => i32::from(v[i]),
+        ArrayData::Bool(v) => i32::from(v[i]),
+        _ => 0,
+    }
+}
+fn i16_of(d: &ArrayData, i: usize) -> i16 {
+    match d {
+        ArrayData::Short(v) => v[i],
+        ArrayData::Int(v) => v[i] as i16,
+        _ => 0,
+    }
+}
+fn u64_of(d: &ArrayData, i: usize) -> u64 {
+    match d {
+        ArrayData::UInt(v) => u64::from(v[i]),
+        ArrayData::Int(v) => v[i] as u64,
+        _ => 0,
+    }
+}
+fn u32_of(d: &ArrayData, i: usize) -> u32 {
+    match d {
+        ArrayData::UInt(v) => v[i],
+        ArrayData::Int(v) => v[i] as u32,
+        _ => 0,
+    }
+}
+fn u16_of(d: &ArrayData, i: usize) -> u16 {
+    match d {
+        ArrayData::UShort(v) => v[i],
+        ArrayData::UChar(v) => u16::from(v[i]),
+        _ => 0,
+    }
+}
+fn u8_of(d: &ArrayData, i: usize) -> u8 {
+    match d {
+        ArrayData::UChar(v) => v[i],
+        _ => 0,
+    }
+}
+fn bool_of(d: &ArrayData, i: usize) -> bool {
+    match d {
+        ArrayData::Bool(v) => v[i],
+        ArrayData::UChar(v) => v[i] != 0,
+        _ => false,
+    }
+}
+fn c64_of(d: &ArrayData, i: usize) -> Complex64 {
+    match d {
+        ArrayData::DComplex(v) => Complex64::new(v[i].0, v[i].1),
+        ArrayData::Complex(v) => Complex64::new(f64::from(v[i].0), f64::from(v[i].1)),
+        _ => Complex64::new(0.0, 0.0),
+    }
+}
+fn c32_of(d: &ArrayData, i: usize) -> Complex32 {
+    match d {
+        ArrayData::Complex(v) => Complex32::new(v[i].0, v[i].1),
+        ArrayData::DComplex(v) => Complex32::new(v[i].0 as f32, v[i].1 as f32),
+        _ => Complex32::new(0.0, 0.0),
+    }
+}
+
+/// Fill an existing numpy buffer with a column's cells.
+pub(crate) fn fill_buffer_by_dtype(
+    buf: &Bound<'_, PyAny>,
+    cells: &[RecordValue],
+    cell: usize,
+) -> PyResult<()> {
+    macro_rules! fill_num {
+        ($ty:ty, $f:expr) => {{
+            if let Ok(arr) = buf.downcast::<numpy::PyArrayDyn<$ty>>() {
+                let mut b = arr.readwrite();
+                let s = b
+                    .as_slice_mut()
+                    .map_err(|_| PyValueError::new_err("getcolnp: non-contiguous buffer"))?;
+                return fill_flat(s, cells, cell, $f);
+            }
+        }};
+    }
+    fill_num!(f64, f64_of);
+    fill_num!(f32, f32_of);
+    fill_num!(i64, i64_of);
+    fill_num!(i32, i32_of);
+    fill_num!(i16, i16_of);
+    fill_num!(u64, u64_of);
+    fill_num!(u32, u32_of);
+    fill_num!(u16, u16_of);
+    fill_num!(u8, u8_of);
+    fill_num!(bool, bool_of);
+    fill_num!(Complex64, c64_of);
+    fill_num!(Complex32, c32_of);
+    Err(PyTypeError::new_err(format!(
+        "getcolnp: unsupported buffer dtype {}",
+        buf.getattr("dtype")?.str()?.to_str()?
+    )))
+}
+
+// ---------------------------------------------------------------------------
+// Building fresh numpy arrays from columns of cells
+// ---------------------------------------------------------------------------
+
+fn reshape_from<T: numpy::Element>(
+    py: Python<'_>,
+    vals: Vec<T>,
+    shape: &[usize],
+) -> PyResult<Py<PyAny>> {
+    let arr = numpy::PyArray1::from_vec(py, vals);
+    let r = arr.call_method1("reshape", (shape.to_vec(),))?;
+    Ok(r.into_any().unbind())
+}
+
+/// Build a fresh 1-D numpy array (or list for strings) from scalar cells.
+pub(crate) fn scalars_cells_to_array(py: Python<'_>, cells: &[RecordValue]) -> PyResult<Py<PyAny>> {
+    if let RecordValue::Bool(_) = cells.first().unwrap_or(&RecordValue::Int(0)) {
+        let vec: Vec<bool> = cells
+            .iter()
+            .map(|v| matches!(v, RecordValue::Bool(true)))
+            .collect();
+        return Ok(numpy::PyArray1::from_vec(py, vec).into_any().unbind());
+    }
+    if let RecordValue::Double(_) = cells.first().unwrap_or(&RecordValue::Int(0)) {
+        let vec: Vec<f64> = cells
+            .iter()
+            .map(|v| match v {
+                RecordValue::Double(d) => *d,
+                RecordValue::Float(f) => f64::from(*f),
+                _ => 0.0,
+            })
+            .collect();
+        return Ok(numpy::PyArray1::from_vec(py, vec).into_any().unbind());
+    }
+    if let RecordValue::Float(_) = cells.first().unwrap_or(&RecordValue::Int(0)) {
+        let vec: Vec<f32> = cells
+            .iter()
+            .map(|v| match v {
+                RecordValue::Float(f) => *f,
+                _ => 0.0,
+            })
+            .collect();
+        return Ok(numpy::PyArray1::from_vec(py, vec).into_any().unbind());
+    }
+    if let RecordValue::Int64(_) = cells.first().unwrap_or(&RecordValue::Int(0)) {
+        let vec: Vec<i64> = cells
+            .iter()
+            .map(|v| match v {
+                RecordValue::Int64(i) => *i,
+                RecordValue::Int(i) => i64::from(*i),
+                RecordValue::UChar(u) => i64::from(*u),
+                _ => 0,
+            })
+            .collect();
+        return Ok(numpy::PyArray1::from_vec(py, vec).into_any().unbind());
+    }
+    if let RecordValue::UChar(_) = cells.first().unwrap_or(&RecordValue::Int(0)) {
+        let vec: Vec<u8> = cells
+            .iter()
+            .map(|v| match v {
+                RecordValue::UChar(u) => *u,
+                _ => 0,
+            })
+            .collect();
+        return Ok(numpy::PyArray1::from_vec(py, vec).into_any().unbind());
+    }
+    if let RecordValue::String(_) | RecordValue::Table(_) =
+        cells.first().unwrap_or(&RecordValue::Int(0))
+    {
+        let list = string_list(py, cells)?;
+        return Ok(list.into_any().unbind());
+    }
+    let vec: Vec<i32> = cells
+        .iter()
+        .map(|v| match v {
+            RecordValue::Int(i) => *i,
+            RecordValue::Int64(i) => *i as i32,
+            _ => 0,
+        })
+        .collect();
+    Ok(numpy::PyArray1::from_vec(py, vec).into_any().unbind())
+}
+
+fn string_list<'py>(py: Python<'py>, cells: &[RecordValue]) -> PyResult<Bound<'py, PyList>> {
+    let list = PyList::empty(py);
+    for v in cells {
+        let s = match v {
+            RecordValue::String(s) | RecordValue::Table(s) => s.clone(),
+            other => other.to_json_string(),
+        };
+        list.append(s)?;
+    }
+    Ok(list)
+}
+
+/// Build a fresh numpy array for a column of array cells: shape
+/// `(nrow, *cell_shape)` where `cell_shape` is the stored (and, for
+/// casacore files, logical) cell shape.
+pub(crate) fn arrays_to_ndarray(
+    py: Python<'_>,
+    cells: &[RecordValue],
+    cell_shape: &[usize],
+) -> PyResult<Py<PyAny>> {
+    let nrow = cells.len();
+    let cell = cell_shape.iter().product::<usize>().max(1);
+    let mut shape = vec![nrow];
+    shape.extend_from_slice(cell_shape);
+    let kind = cells.iter().find_map(|c| match c {
+        RecordValue::Array(a) => Some(&a.data),
+        _ => None,
+    });
+    macro_rules! build {
+        ($ty:ty, $f:expr) => {{
+            let mut buf: Vec<$ty> = vec![Default::default(); nrow * cell];
+            fill_flat(&mut buf, cells, cell, $f)?;
+            reshape_from(py, buf, &shape)
+        }};
+    }
+    match kind {
+        Some(ArrayData::Bool(_)) => build!(bool, bool_of),
+        Some(ArrayData::UChar(_)) => build!(u8, u8_of),
+        Some(ArrayData::UShort(_)) => build!(u16, u16_of),
+        Some(ArrayData::Short(_)) => build!(i16, i16_of),
+        Some(ArrayData::Int(_)) => build!(i32, i32_of),
+        Some(ArrayData::UInt(_)) => build!(u32, u32_of),
+        Some(ArrayData::Int64(_)) => build!(i64, i64_of),
+        Some(ArrayData::Float(_)) => build!(f32, f32_of),
+        Some(ArrayData::Double(_)) => build!(f64, f64_of),
+        Some(ArrayData::Complex(_)) => build!(Complex32, c32_of),
+        Some(ArrayData::DComplex(_)) => build!(Complex64, c64_of),
+        Some(ArrayData::String(_)) => {
+            // Multidim strings come back as {"shape":..., "array":...} dicts;
+            // 1-D as a plain list.
+            let cell = cell_shape.iter().product::<usize>().max(1);
+            let nrow = cells.len();
+            let mut flat: Vec<String> = Vec::with_capacity(nrow * cell);
+            for c in cells {
+                if let RecordValue::Array(a) = c {
+                    for i in 0..cell {
+                        if let ArrayData::String(v) = &a.data {
+                            flat.push(v[i].clone());
+                        }
+                    }
+                }
+            }
+            let list = PyList::empty(py);
+            for s in flat {
+                list.append(s)?;
+            }
+            if cell_shape.len() > 1 {
+                let d = PyDict::new(py);
+                d.set_item("shape", cell_shape)?;
+                d.set_item("array", list)?;
+                Ok(d.into_any().unbind())
+            } else {
+                Ok(list.into_any().unbind())
+            }
+        }
+        _ => Err(PyValueError::new_err("cannot build array column")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cell values -> Python objects
+// ---------------------------------------------------------------------------
+
+fn pybool(py: Python<'_>, b: bool) -> PyResult<Py<PyAny>> {
+    Ok(b.into_pyobject(py)?.to_owned().unbind().into())
+}
+
+/// One cell to a Python object: numpy arrays for array cells, Python
+/// scalars / strings otherwise.
+pub(crate) fn cell_to_py(py: Python<'_>, v: &RecordValue) -> PyResult<Py<PyAny>> {
+    match v {
+        RecordValue::Bool(b) => pybool(py, *b),
+        RecordValue::UChar(u) => Ok(PyInt::new(py, u32::from(*u)).into_any().unbind()),
+        RecordValue::Short(i) => Ok(PyInt::new(py, *i).into_any().unbind()),
+        RecordValue::UShort(u) => Ok(PyInt::new(py, *u).into_any().unbind()),
+        RecordValue::Int(i) => Ok(PyInt::new(py, *i).into_any().unbind()),
+        RecordValue::UInt(u) => Ok(PyInt::new(py, *u).into_any().unbind()),
+        RecordValue::Int64(i) => Ok(PyInt::new(py, *i).into_any().unbind()),
+        RecordValue::Float(f) => Ok(PyFloat::new(py, f64::from(*f)).into_any().unbind()),
+        RecordValue::Double(d) => Ok(PyFloat::new(py, *d).into_any().unbind()),
+        RecordValue::Complex(re, im) => Ok((f64::from(*re), f64::from(*im))
+            .into_pyobject(py)?
+            .into_any()
+            .unbind()),
+        RecordValue::DComplex(re, im) => Ok((*re, *im).into_pyobject(py)?.into_any().unbind()),
+        RecordValue::String(s) | RecordValue::Table(s) => {
+            Ok(PyString::new(py, s).into_any().unbind())
+        }
+        RecordValue::Array(a) => array_to_ndarray(py, a),
+        RecordValue::Record(r) => table_record_to_dict(py, r).map(|d| d.into_any().unbind()),
+    }
+}
+
+/// A keyword-array value as `{"shape": [..], "array": flat list}`.
+pub(crate) fn array_to_dict<'py>(py: Python<'py>, a: &ArrayValue) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    let logical: Vec<u32> = a.shape.iter().rev().copied().collect();
+    d.set_item("shape", logical)?;
+    let mut flat = Vec::new();
+    for e in a.elements() {
+        flat.push(element_to_py(py, &e)?);
+    }
+    d.set_item("array", flat)?;
+    Ok(d)
+}
+
+fn element_to_py(py: Python<'_>, v: &RecordValue) -> PyResult<Py<PyAny>> {
+    match v {
+        RecordValue::Bool(b) => pybool(py, *b),
+        RecordValue::UChar(u) => Ok(PyInt::new(py, u32::from(*u)).into_any().unbind()),
+        RecordValue::Short(i) => Ok(PyInt::new(py, *i).into_any().unbind()),
+        RecordValue::UShort(u) => Ok(PyInt::new(py, *u).into_any().unbind()),
+        RecordValue::Int(i) => Ok(PyInt::new(py, *i).into_any().unbind()),
+        RecordValue::UInt(u) => Ok(PyInt::new(py, *u).into_any().unbind()),
+        RecordValue::Int64(i) => Ok(PyInt::new(py, *i).into_any().unbind()),
+        RecordValue::Float(f) => Ok(PyFloat::new(py, f64::from(*f)).into_any().unbind()),
+        RecordValue::Double(d) => Ok(PyFloat::new(py, *d).into_any().unbind()),
+        RecordValue::String(s) | RecordValue::Table(s) => {
+            Ok(PyString::new(py, s).into_any().unbind())
+        }
+        RecordValue::Complex(re, im) => Ok((f64::from(*re), f64::from(*im))
+            .into_pyobject(py)?
+            .into_any()
+            .unbind()),
+        RecordValue::DComplex(re, im) => Ok((*re, *im).into_pyobject(py)?.into_any().unbind()),
+        RecordValue::Array(a) => array_to_ndarray(py, a),
+        RecordValue::Record(r) => table_record_to_dict(py, r).map(|d| d.into_any().unbind()),
+    }
+}
+
+/// Array cell -> numpy ndarray in logical order.
+pub(crate) fn array_to_ndarray(py: Python<'_>, a: &ArrayValue) -> PyResult<Py<PyAny>> {
+    array_to_ndarray_fixed(py, a, true)
+}
+
+/// Single-cell conversion with an explicit shape.
+pub(crate) fn array_to_ndarray_fixed(
+    py: Python<'_>,
+    a: &ArrayValue,
+    _fixed: bool,
+) -> PyResult<Py<PyAny>> {
+    let cell: Vec<usize> = a.shape.iter().map(|&d| d as usize).collect();
+    arrays_to_ndarray(py, &[RecordValue::Array(a.clone())], &cell)
+}
+
+// ---------------------------------------------------------------------------
+// Record / dict conversions
+// ---------------------------------------------------------------------------
+
+/// A `TableRecord` as a nested Python dict.
+pub(crate) fn table_record_to_dict<'py>(
+    py: Python<'py>,
+    rec: &TableRecord,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    for (field, value) in rec.desc.fields.iter().zip(rec.values.iter()) {
+        let v = match value {
+            RecordValue::Record(sub) => table_record_to_dict(py, sub)?.into_any().unbind(),
+            RecordValue::Array(a) => array_to_dict(py, a)?.into_any().unbind(),
+            other => element_to_py(py, other)?,
+        };
+        d.set_item(&field.name, v)?;
+    }
+    Ok(d)
+}
+
+/// Build a `TableRecord` from a Python dict (`putkeywords` etc).
+pub(crate) fn dict_to_table_record(py: Python<'_>, d: &Bound<'_, PyDict>) -> PyResult<TableRecord> {
+    let mut rec = TableRecord {
+        desc: Default::default(),
+        record_type: 0,
+        values: Vec::new(),
+    };
+    for (k, v) in d.iter() {
+        let name = k
+            .extract::<String>()
+            .map_err(|_| PyTypeError::new_err("keyword names must be strings"))?;
+        let value = pyobject_to_record(py, &v)?;
+        rec.set(&name, value);
+    }
+    Ok(rec)
+}
+
+/// Convert a generic Python object to a `RecordValue`.
+pub(crate) fn pyobject_to_record(py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<RecordValue> {
+    if v.is_none() {
+        return Ok(RecordValue::String(String::new()));
+    }
+    if v.downcast::<PyBool>().is_ok() {
+        return Ok(RecordValue::Bool(v.is_truthy()?));
+    }
+    if let Ok(s) = v.downcast::<PyString>() {
+        return Ok(RecordValue::String(s.to_str()?.to_string()));
+    }
+    if v.downcast::<PyInt>().is_ok() {
+        let big: i128 = v.extract()?;
+        if let Ok(x) = i32::try_from(big) {
+            return Ok(RecordValue::Int(x));
+        }
+        return Ok(RecordValue::Int64(big as i64));
+    }
+    if let Ok(f) = v.downcast::<PyFloat>() {
+        return Ok(RecordValue::Double(f.value()));
+    }
+    if let Ok(d) = v.downcast::<PyDict>() {
+        return Ok(RecordValue::Record(dict_to_table_record(py, d)?));
+    }
+    if let Ok(list) = v.downcast::<PyList>() {
+        return list_to_array(py, list);
+    }
+    if let Ok(tup) = v.downcast::<PyTuple>() {
+        let list = PyList::new(py, tup.iter())?;
+        return list_to_array(py, &list);
+    }
+    // numpy arrays (numeric or object).
+    if let Ok(arr) = v.downcast::<numpy::PyArrayDyn<f64>>() {
+        let readonly = arr.readonly();
+        let shape: Vec<u32> = readonly
+            .as_array()
+            .shape()
+            .to_vec()
+            .iter()
+            .map(|&d| d as u32)
+            .collect();
+        let data = readonly.as_array().iter().copied().collect();
+        return Ok(RecordValue::Array(ArrayValue {
+            shape,
+            data: ArrayData::Double(data),
+        }));
+    }
+    if let Ok(arr) = v.downcast::<numpy::PyArrayDyn<Py<PyAny>>>() {
+        let readonly = arr.readonly();
+        let shape: Vec<u32> = readonly
+            .as_array()
+            .shape()
+            .to_vec()
+            .iter()
+            .map(|&d| d as u32)
+            .collect();
+        let mut s = Vec::with_capacity(readonly.as_array().len());
+        for e in readonly.as_array().iter() {
+            s.push(e.bind(py).extract::<String>().unwrap_or_default());
+        }
+        return Ok(RecordValue::Array(ArrayValue {
+            shape,
+            data: ArrayData::String(s),
+        }));
+    }
+    Ok(RecordValue::String(v.str()?.to_str()?.to_string()))
+}
+
+fn list_to_array(py: Python<'_>, list: &Bound<'_, PyList>) -> PyResult<RecordValue> {
+    let items: Vec<RecordValue> = list
+        .iter()
+        .map(|it| pyobject_to_record(py, &it))
+        .collect::<PyResult<_>>()?;
+    let shape = vec![items.len() as u32];
+    if items
+        .iter()
+        .all(|v| matches!(v, RecordValue::Int(_) | RecordValue::Int64(_)))
+    {
+        let vals: Vec<i32> = items
+            .iter()
+            .map(|v| match v {
+                RecordValue::Int(i) => *i,
+                RecordValue::Int64(i) => *i as i32,
+                _ => 0,
+            })
+            .collect();
+        Ok(RecordValue::Array(ArrayValue {
+            shape,
+            data: ArrayData::Int(vals),
+        }))
+    } else if items
+        .iter()
+        .all(|v| matches!(v, RecordValue::Double(_) | RecordValue::Float(_)))
+    {
+        let vals: Vec<f64> = items
+            .iter()
+            .map(|v| match v {
+                RecordValue::Double(d) => *d,
+                RecordValue::Float(f) => f64::from(*f),
+                _ => 0.0,
+            })
+            .collect();
+        Ok(RecordValue::Array(ArrayValue {
+            shape,
+            data: ArrayData::Double(vals),
+        }))
+    } else if items.iter().all(|v| matches!(v, RecordValue::String(_))) {
+        let vals: Vec<String> = items
+            .iter()
+            .map(|v| match v {
+                RecordValue::String(s) => s.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        Ok(RecordValue::Array(ArrayValue {
+            shape,
+            data: ArrayData::String(vals),
+        }))
+    } else if items.iter().all(|v| matches!(v, RecordValue::Bool(_))) {
+        let vals: Vec<bool> = items
+            .iter()
+            .map(|v| match v {
+                RecordValue::Bool(b) => *b,
+                _ => false,
+            })
+            .collect();
+        Ok(RecordValue::Array(ArrayValue {
+            shape,
+            data: ArrayData::Bool(vals),
+        }))
+    } else {
+        Err(PyTypeError::new_err(
+            "cannot convert mixed list to a keyword array",
+        ))
+    }
+}
+
+/// A `{"shape", "array"}` string dict to a string `ArrayValue`.
+pub(crate) fn py_to_string_array(py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<RecordValue> {
+    if let Ok(d) = v.downcast::<PyDict>() {
+        let shape: Vec<u32> = d
+            .get_item("shape")?
+            .ok_or_else(|| PyValueError::new_err("missing 'shape'"))?
+            .extract()?;
+        let array: Vec<String> = d
+            .get_item("array")?
+            .ok_or_else(|| PyValueError::new_err("missing 'array'"))?
+            .extract()?;
+        return Ok(RecordValue::Array(ArrayValue {
+            shape,
+            data: ArrayData::String(array),
+        }));
+    }
+    if let Ok(arr) = v.downcast::<numpy::PyArrayDyn<Py<PyAny>>>() {
+        let readonly = arr.readonly();
+        let shape: Vec<u32> = readonly
+            .as_array()
+            .shape()
+            .to_vec()
+            .iter()
+            .map(|&d| d as u32)
+            .collect();
+        let s: Vec<String> = readonly
+            .as_array()
+            .iter()
+            .map(|e| e.bind(py).extract::<String>().unwrap_or_default())
+            .collect();
+        return Ok(RecordValue::Array(ArrayValue {
+            shape,
+            data: ArrayData::String(s),
+        }));
+    }
+    Err(PyValueError::new_err(
+        "expected a string {shape,array} dict",
+    ))
+}
+
+/// The `DataType` of a value (used to type taql-result columns).
+pub(crate) fn record_data_type(v: &RecordValue) -> Option<DataType> {
+    use DataType as DT;
+    Some(match v {
+        RecordValue::Bool(_) => DT::Bool,
+        RecordValue::UChar(_) => DT::UChar,
+        RecordValue::Short(_) => DT::Short,
+        RecordValue::UShort(_) => DT::UShort,
+        RecordValue::Int(_) => DT::Int,
+        RecordValue::UInt(_) => DT::UInt,
+        RecordValue::Int64(_) => DT::Int64,
+        RecordValue::Float(_) => DT::Float,
+        RecordValue::Double(_) => DT::Double,
+        RecordValue::Complex(_, _) => DT::Complex,
+        RecordValue::DComplex(_, _) => DT::DComplex,
+        RecordValue::String(_) | RecordValue::Table(_) => DT::String,
+        RecordValue::Array(a) => match &a.data {
+            ArrayData::Bool(_) => DT::ArrayBool,
+            ArrayData::UChar(_) => DT::ArrayUChar,
+            ArrayData::Short(_) => DT::ArrayShort,
+            ArrayData::UShort(_) => DT::ArrayUShort,
+            ArrayData::Int(_) => DT::ArrayInt,
+            ArrayData::UInt(_) => DT::ArrayUInt,
+            ArrayData::Int64(_) => DT::ArrayInt64,
+            ArrayData::Float(_) => DT::ArrayFloat,
+            ArrayData::Double(_) => DT::ArrayDouble,
+            ArrayData::Complex(_) => DT::ArrayComplex,
+            ArrayData::DComplex(_) => DT::ArrayDComplex,
+            ArrayData::String(_) => DT::ArrayString,
+        },
+        RecordValue::Record(_) => DT::Record,
+    })
+}
