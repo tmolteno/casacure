@@ -379,10 +379,30 @@ fn scalar_c32(v: &RecordValue) -> Complex32 {
 /// Build a fresh numpy array for a column of array cells: shape
 /// `(nrow, *cell_shape)` where `cell_shape` is the stored (and, for
 /// casacore files, logical) cell shape.
+#[allow(dead_code)]
 pub(crate) fn arrays_to_ndarray(
     py: Python<'_>,
     cells: &[RecordValue],
     cell_shape: &[usize],
+) -> PyResult<Py<PyAny>> {
+    arrays_to_ndarray_impl(py, cells, cell_shape, false)
+}
+
+/// Like `arrays_to_ndarray`, but multidim-string dicts include the row dim
+/// in `shape` (the `getcol` form: `(nrow, *cell)`).
+pub(crate) fn arrays_to_ndarray_getcol(
+    py: Python<'_>,
+    cells: &[RecordValue],
+    cell_shape: &[usize],
+) -> PyResult<Py<PyAny>> {
+    arrays_to_ndarray_impl(py, cells, cell_shape, true)
+}
+
+fn arrays_to_ndarray_impl(
+    py: Python<'_>,
+    cells: &[RecordValue],
+    cell_shape: &[usize],
+    include_row: bool,
 ) -> PyResult<Py<PyAny>> {
     let nrow = cells.len();
     let cell = cell_shape.iter().product::<usize>().max(1);
@@ -430,9 +450,15 @@ pub(crate) fn arrays_to_ndarray(
             for s in flat {
                 list.append(s)?;
             }
-            if cell_shape.len() > 1 {
+            if include_row || cell_shape.len() > 1 {
                 let d = PyDict::new(py);
-                d.set_item("shape", cell_shape)?;
+                if include_row {
+                    let mut full = vec![nrow];
+                    full.extend_from_slice(cell_shape);
+                    d.set_item("shape", full)?;
+                } else {
+                    d.set_item("shape", cell_shape)?;
+                }
                 d.set_item("array", list)?;
                 Ok(d.into_any().unbind())
             } else {
@@ -627,6 +653,12 @@ pub(crate) fn pyobject_to_record(py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResu
         return Ok(RecordValue::Double(f));
     }
     if let Ok(d) = v.downcast::<PyDict>() {
+        // The `{"shape": [..], "array": [..]}` multidim-string dict form.
+        if d.contains("shape")? && d.contains("array")? {
+            if let Ok(sv) = py_to_string_array(py, v) {
+                return Ok(sv);
+            }
+        }
         return Ok(RecordValue::Record(dict_to_table_record(py, d)?));
     }
     if let Ok(list) = v.downcast::<PyList>() {

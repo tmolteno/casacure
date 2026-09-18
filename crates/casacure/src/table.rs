@@ -436,7 +436,13 @@ fn build_ssm_data(
                 (size, bits)
             }
             crate::tabledesc::ColumnKind::Array => {
-                (crate::ssm::ARRAY_REF_SIZE, 8 * crate::ssm::ARRAY_REF_SIZE)
+                if cd.data_type == crate::record::DataType::String {
+                    // String arrays use a 12-byte string-bucket ref cell
+                    // (like a scalar variable string), not an f0i offset.
+                    (12, 8 * 12)
+                } else {
+                    (crate::ssm::ARRAY_REF_SIZE, 8 * crate::ssm::ARRAY_REF_SIZE)
+                }
             }
             crate::tabledesc::ColumnKind::Record => {
                 return Err(TableCreateError::NotScalar(cd.name.clone()))
@@ -454,9 +460,10 @@ fn build_ssm_data(
     let mut array_index: Vec<u8> = Vec::new();
     // An array column creates the array-index file (`table.f0i`) even when
     // the table has zero rows (casacore does the same).
-    let mut has_arrays = dm_cols
-        .iter()
-        .any(|&c| matches!(desc.columns[c].kind, crate::tabledesc::ColumnKind::Array));
+    let mut has_arrays = dm_cols.iter().any(|&c| {
+        matches!(desc.columns[c].kind, crate::tabledesc::ColumnKind::Array)
+            && desc.columns[c].data_type != crate::record::DataType::String
+    });
     let mut has_strings = false;
 
     let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(dm_cols.len());
@@ -511,6 +518,35 @@ fn build_ssm_data(
                             desc.name, cd.name
                         )));
                     };
+                    if cd.data_type == crate::record::DataType::String {
+                        // Multidim string arrays: the whole cell (shape
+                        // header + filled flag + length-prefixed strings) is
+                        // written into the string buckets as the cell's
+                        // content, referenced by a 12-byte (bucket, offset,
+                        // len) cell like a scalar variable string
+                        // (SSMStringHandler::put(Array<String>&, handleShape)).
+                        let content =
+                            crate::ssm::encode_string_array_content(arr).map_err(|e| {
+                                TableCreateError::Io(std::io::Error::other(format!(
+                                    "encode {}.{}: {e}",
+                                    desc.name, cd.name
+                                )))
+                            })?;
+                        let (bucket, offset) = str_buckets.put(&content);
+                        has_strings = true;
+                        let mut cell = vec![0u8; 12];
+                        if big_endian {
+                            cell[0..4].copy_from_slice(&bucket.to_be_bytes());
+                            cell[4..8].copy_from_slice(&offset.to_be_bytes());
+                            cell[8..12].copy_from_slice(&(content.len() as i32).to_be_bytes());
+                        } else {
+                            cell[0..4].copy_from_slice(&bucket.to_le_bytes());
+                            cell[4..8].copy_from_slice(&offset.to_le_bytes());
+                            cell[8..12].copy_from_slice(&(content.len() as i32).to_le_bytes());
+                        }
+                        bytes.extend_from_slice(&cell);
+                        continue;
+                    }
                     let record = crate::ssm::encode_array_record(big_endian, cd.data_type, arr)
                         .map_err(|e| {
                             TableCreateError::Io(std::io::Error::other(format!(

@@ -441,6 +441,48 @@ pub fn read_array_cell(
             column: desc.name.clone(),
         });
     }
+    // Multidim string arrays are stored in the string buckets: the cell is
+    // a 12-byte (bucket, offset, len) reference to the bucket content
+    // `[ndim][CASA dims][filled flag][len-prefixed strings]`.
+    if desc.data_type == DataType::String {
+        let cell = file.cell_bytes(index_nr, *column_offset, row, 12)?;
+        let (bucket, off, len) = if file.header.big_endian {
+            (
+                i32::from_be_bytes(cell[0..4].try_into().unwrap()),
+                i32::from_be_bytes(cell[4..8].try_into().unwrap()),
+                i32::from_be_bytes(cell[8..12].try_into().unwrap()),
+            )
+        } else {
+            (
+                i32::from_le_bytes(cell[0..4].try_into().unwrap()),
+                i32::from_le_bytes(cell[4..8].try_into().unwrap()),
+                i32::from_le_bytes(cell[8..12].try_into().unwrap()),
+            )
+        };
+        if bucket < 0 || off < 0 || len < 0 {
+            return Err(SsmError::BadStringRef {
+                bucket,
+                offset: off,
+                length: len as u32,
+            });
+        }
+        let bucket_bytes = file.bucket_bytes(bucket as u32)?;
+        let start = 16 + off as usize;
+        let end = start + len as usize;
+        if end > bucket_bytes.len() {
+            return Err(SsmError::BadStringRef {
+                bucket,
+                offset: off,
+                length: len as u32,
+            });
+        }
+        let (logical, strings) = decode_string_array_content(&bucket_bytes[start..end])?;
+        return Ok(RecordValue::Array(ArrayValue {
+            shape: logical,
+            data: ArrayData::String(strings),
+        }));
+    }
+
     let f0i = file
         .f0i
         .as_deref()
@@ -1290,6 +1332,92 @@ pub fn encode_array_record(
     Ok(body)
 }
 
+/// The canonical (big-endian) bytes of a multidim string array cell stored
+/// in the string buckets: `[ndim][CASA-order dims][filled flag 1]
+/// [len][bytes]...` per element in the cell's (as-given) order.
+/// This is `SSMStringHandler::put(Array<String>&, handleShape=true)`.
+pub fn encode_string_array_content(value: &crate::record::ArrayValue) -> Result<Vec<u8>, SsmError> {
+    use crate::record::ArrayData;
+    let strings = match &value.data {
+        ArrayData::String(v) => v,
+        _ => {
+            return Err(SsmError::UnsupportedArrayType(
+                crate::record::DataType::String,
+            ))
+        }
+    };
+    let mut out = Vec::with_capacity(16 + strings.len() * 16);
+    fn push_i32(out: &mut Vec<u8>, v: i32) {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    push_i32(&mut out, value.shape.len() as i32); // ndim
+    for d in value.shape.iter().rev() {
+        push_i32(&mut out, *d as i32); // CASA-order dims (reversed logical)
+    }
+    push_i32(&mut out, 1); // filled flag
+    for s in strings {
+        push_i32(&mut out, s.len() as i32);
+        out.extend_from_slice(s.as_bytes());
+    }
+    Ok(out)
+}
+
+/// Decode the string-bucket content of a multidim string array cell: the
+/// inverse of `encode_string_array_content`, returning the logical
+/// (as-given) shape and string data.
+pub fn decode_string_array_content(content: &[u8]) -> Result<(Vec<u32>, Vec<String>), SsmError> {
+    let mut p = 0usize;
+    let read_i32 = |p: &mut usize| -> Result<i32, SsmError> {
+        if *p + 4 > content.len() {
+            return Err(SsmError::BadStringRef {
+                bucket: 0,
+                offset: *p as i32,
+                length: 0,
+            });
+        }
+        let v = i32::from_be_bytes(content[*p..*p + 4].try_into().unwrap());
+        *p += 4;
+        Ok(v)
+    };
+    let ndim = read_i32(&mut p)?;
+    if ndim < 0 {
+        return Err(SsmError::BadStringRef {
+            bucket: 0,
+            offset: p as i32,
+            length: 0,
+        });
+    }
+    let mut casa_dims = Vec::with_capacity(ndim as usize);
+    for _ in 0..ndim {
+        let d = read_i32(&mut p)?;
+        if d < 0 {
+            return Err(SsmError::BadStringRef {
+                bucket: 0,
+                offset: p as i32,
+                length: 0,
+            });
+        }
+        casa_dims.push(d as u32);
+    }
+    let _flag = read_i32(&mut p)?;
+    let logical: Vec<u32> = casa_dims.iter().rev().copied().collect();
+    let nelem: usize = logical.iter().map(|&d| d as usize).product();
+    let mut strings = Vec::with_capacity(nelem);
+    for _ in 0..nelem {
+        let len = read_i32(&mut p)?;
+        if len < 0 || p + len as usize > content.len() {
+            return Err(SsmError::BadStringRef {
+                bucket: 0,
+                offset: p as i32,
+                length: len as u32,
+            });
+        }
+        let s = String::from_utf8_lossy(&content[p..p + len as usize]).into_owned();
+        p += len as usize;
+        strings.push(s);
+    }
+    Ok((logical, strings))
+}
 #[cfg(test)]
 mod tests {
     use super::*;

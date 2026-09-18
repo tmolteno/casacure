@@ -298,6 +298,16 @@ subtasks are moved here.
   columns are built in the logical (as-given) orientation to match real
   cells; `putcol` accepts the `{"rN": value}` dict form and numpy numeric
   scalars (np.int64 etc.) so dask-ms's SPW/row-grouping setup code runs.
+- SSM multidim string-**array** cells (§1/§3, previously unsupported): these
+  columns store the whole cell in the string buckets — a 12-byte
+  (bucket, offset, len) reference in the data file (not the f0i array
+  index), with bucket content `[ndim][CASA dims][filled flag][len-prefixed
+  strings]` per `SSMStringHandler::put(Array<String>&)` (decoded from the
+  casacore source + real files). Reader + writer implemented; casacore
+  multidim-string tables read byte-identically and our written tables read
+  in casacore; dask-ms's `test_dataset_multidim_string_column` passes
+  (incl. `getcol` dicts with the row dim and per-row splitting of the
+  `{"shape","array"}` write form).
 - `table` module: `parse_table_header` parses the `table.dat` root object
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit

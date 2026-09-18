@@ -529,6 +529,41 @@ impl Table {
     ) -> PyResult<()> {
         let col_idx = self.col_index(column)?;
         let startrow = startrow.max(0) as u64;
+        // Multidim-string dict form: `{"shape": [nrow, *cell], "array": [...]}`
+        // (dask-ms's multidim string writes) — split into per-row cells.
+        if value.downcast::<PyDict>().is_ok()
+            && value.downcast::<PyDict>().unwrap().contains("shape")?
+            && value.downcast::<PyDict>().unwrap().contains("array")?
+        {
+            use casacure::record::ArrayData;
+            let av = match convert::pyobject_to_record(py, value)? {
+                RecordValue::Array(a) => a,
+                other => {
+                    return Err(PyTypeError::new_err(format!(
+                        "expected a string array dict, got {other:?}"
+                    )));
+                }
+            };
+            let ArrayData::String(strings) = &av.data else {
+                return Err(PyTypeError::new_err("expected string array data"));
+            };
+            if av.shape.is_empty() {
+                return Err(PyValueError::new_err("string array dict has no shape"));
+            }
+            let nrow = av.shape[0] as usize;
+            let cell_shape: Vec<u32> = av.shape[1..].to_vec();
+            let cell = cell_shape.iter().product::<u32>() as usize;
+            for r in 0..nrow {
+                let from = r * cell;
+                let to = ((r + 1) * cell).min(strings.len());
+                let rec = RecordValue::Array(casacure::record::ArrayValue {
+                    shape: cell_shape.clone(),
+                    data: ArrayData::String(strings[from..to].to_vec()),
+                });
+                self.put_cell(col_idx, startrow + r as u64, rec)?;
+            }
+            return Ok(());
+        }
         // Dict form: `{"rN": value, ...}` — per-row scalar/array writes
         // (dask-ms writes scalar varcols this way).
         if value.downcast::<PyDict>().is_ok() {
@@ -1070,7 +1105,7 @@ impl Table {
             return convert::scalars_cells_to_array(py, cells);
         }
         let cell_shape = cell_shape_of(cells);
-        convert::arrays_to_ndarray(py, cells, &cell_shape)
+        convert::arrays_to_ndarray_getcol(py, cells, &cell_shape)
     }
 }
 
