@@ -89,8 +89,9 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
-          args: --release --out dist --find-interpreter
-          sdist: ${{ matrix.sdist }}
+          # --sdist on the x86_64 manylinux job produces the source
+          # distribution (maturin-action has no 'sdist' input).
+          args: --release --out dist --find-interpreter ${{ matrix.sdist && '--sdist' || '' }}
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
         with:
