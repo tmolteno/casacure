@@ -5,12 +5,16 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description.workspace = true
+# This is the Python-wheel extension (maturin -> PyPI). It is deliberately
+# not publishable to crates.io: the crates.io package is the core `casacure`
+# crate (crates/casacure).
+publish = false
 
 [lib]
 name = "casacure"
 crate-type = ["cdylib"]
 
 [dependencies]
-casacure = { path = "../casacure" }
+casacure = { workspace = true }
 pyo3 = { version = "0.27", features = ["extension-module"] }
 numpy = "0.27"
