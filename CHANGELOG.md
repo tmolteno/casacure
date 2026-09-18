@@ -266,6 +266,13 @@ subtasks are moved here.
   Interop-gated: casacure-created fixed/variable tables read identically in
   casacore and vice versa (written with pyo3/numpy 0.26; install with
   maturin).
+- dask-ms integration run (§7): `tests/daskms_smoke.py` drives dask-ms's
+  `xds_from_table`/`xds_to_table` against the casacure backend through a
+  `casacore.tables` shim — read (`SELECT ROWID() … ORDERBY` taql + `getcolnp`)
+  and write-back verified against real casacore, including the `group_cols`
+  GROUPBY partitioning path (GROWID/GCOUNT/GAGGR). Fixes surfaced: `getcell`
+  returns just the cell shape (no leading row singleton, matching casacore);
+  `getcolnp` maps scalar cells by the buffer dtype (was zero-filling them).
 - `table` module: `parse_table_header` parses the `table.dat` root object
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit

@@ -21,6 +21,7 @@ pub(crate) fn fill_flat<T: Copy + Default>(
     cells: &[RecordValue],
     cell: usize,
     map: impl Fn(&ArrayData, usize) -> T,
+    scalar: impl Fn(&RecordValue) -> T,
 ) -> PyResult<()> {
     for (r, c) in cells.iter().enumerate() {
         if let RecordValue::Array(a) = c {
@@ -31,14 +32,10 @@ pub(crate) fn fill_flat<T: Copy + Default>(
                 }
             }
         } else if r < buf.len() {
-            buf[r] = map_scalar_value(c);
+            buf[r] = scalar(c);
         }
     }
     Ok(())
-}
-
-fn map_scalar_value<T: Default>(_v: &RecordValue) -> T {
-    T::default()
 }
 
 // ---------------------------------------------------------------------------
@@ -142,28 +139,28 @@ pub(crate) fn fill_buffer_by_dtype(
     cell: usize,
 ) -> PyResult<()> {
     macro_rules! fill_num {
-        ($ty:ty, $f:expr) => {{
+        ($ty:ty, $f:expr, $s:expr) => {{
             if let Ok(arr) = buf.downcast::<numpy::PyArrayDyn<$ty>>() {
                 let mut b = arr.readwrite();
                 let s = b
                     .as_slice_mut()
                     .map_err(|_| PyValueError::new_err("getcolnp: non-contiguous buffer"))?;
-                return fill_flat(s, cells, cell, $f);
+                return fill_flat(s, cells, cell, $f, $s);
             }
         }};
     }
-    fill_num!(f64, f64_of);
-    fill_num!(f32, f32_of);
-    fill_num!(i64, i64_of);
-    fill_num!(i32, i32_of);
-    fill_num!(i16, i16_of);
-    fill_num!(u64, u64_of);
-    fill_num!(u32, u32_of);
-    fill_num!(u16, u16_of);
-    fill_num!(u8, u8_of);
-    fill_num!(bool, bool_of);
-    fill_num!(Complex64, c64_of);
-    fill_num!(Complex32, c32_of);
+    fill_num!(f64, f64_of, scalar_f64);
+    fill_num!(f32, f32_of, scalar_f32);
+    fill_num!(i64, i64_of, scalar_i64);
+    fill_num!(i32, i32_of, scalar_i32);
+    fill_num!(i16, i16_of, scalar_i16);
+    fill_num!(u64, u64_of, scalar_u64);
+    fill_num!(u32, u32_of, scalar_u32);
+    fill_num!(u16, u16_of, scalar_u16);
+    fill_num!(u8, u8_of, scalar_u8);
+    fill_num!(bool, bool_of, scalar_bool);
+    fill_num!(Complex64, c64_of, scalar_c64);
+    fill_num!(Complex32, c32_of, scalar_c32);
     Err(PyTypeError::new_err(format!(
         "getcolnp: unsupported buffer dtype {}",
         buf.getattr("dtype")?.str()?.to_str()?
@@ -265,6 +262,102 @@ fn string_list<'py>(py: Python<'py>, cells: &[RecordValue]) -> PyResult<Bound<'p
     Ok(list)
 }
 
+fn scalar_f64(v: &RecordValue) -> f64 {
+    match v {
+        RecordValue::Double(d) => *d,
+        RecordValue::Float(f) => f64::from(*f),
+        RecordValue::Int(i) => f64::from(*i),
+        RecordValue::Bool(b) => f64::from(*b),
+        _ => 0.0,
+    }
+}
+fn scalar_f32(v: &RecordValue) -> f32 {
+    match v {
+        RecordValue::Float(f) => *f,
+        RecordValue::Double(d) => *d as f32,
+        RecordValue::Int(i) => *i as f32,
+        _ => 0.0,
+    }
+}
+fn scalar_i64(v: &RecordValue) -> i64 {
+    match v {
+        RecordValue::Int64(i) => *i,
+        RecordValue::Int(i) => i64::from(*i),
+        RecordValue::UChar(u) => i64::from(*u),
+        RecordValue::Bool(b) => i64::from(*b),
+        _ => 0,
+    }
+}
+fn scalar_i32(v: &RecordValue) -> i32 {
+    match v {
+        RecordValue::Int(i) => *i,
+        RecordValue::Int64(i) => *i as i32,
+        RecordValue::Short(i) => i32::from(*i),
+        RecordValue::UChar(u) => i32::from(*u),
+        RecordValue::Bool(b) => i32::from(*b),
+        _ => 0,
+    }
+}
+fn scalar_i16(v: &RecordValue) -> i16 {
+    match v {
+        RecordValue::Short(i) => *i,
+        RecordValue::Int(i) => *i as i16,
+        RecordValue::UChar(u) => i16::from(*u),
+        _ => 0,
+    }
+}
+fn scalar_u64(v: &RecordValue) -> u64 {
+    match v {
+        RecordValue::UInt(u) => u64::from(*u),
+        RecordValue::Int(i) => *i as u64,
+        _ => 0,
+    }
+}
+fn scalar_u32(v: &RecordValue) -> u32 {
+    match v {
+        RecordValue::UInt(u) => *u,
+        RecordValue::Int(i) => *i as u32,
+        _ => 0,
+    }
+}
+fn scalar_u16(v: &RecordValue) -> u16 {
+    match v {
+        RecordValue::UShort(u) => *u,
+        RecordValue::UChar(u) => u16::from(*u),
+        RecordValue::Int(i) => *i as u16,
+        _ => 0,
+    }
+}
+fn scalar_u8(v: &RecordValue) -> u8 {
+    match v {
+        RecordValue::UChar(u) => *u,
+        RecordValue::Bool(b) => u8::from(*b),
+        _ => 0,
+    }
+}
+fn scalar_bool(v: &RecordValue) -> bool {
+    match v {
+        RecordValue::Bool(b) => *b,
+        RecordValue::UChar(u) => *u != 0,
+        RecordValue::Int(i) => *i != 0,
+        _ => false,
+    }
+}
+fn scalar_c64(v: &RecordValue) -> Complex64 {
+    match v {
+        RecordValue::DComplex(re, im) => Complex64::new(*re, *im),
+        RecordValue::Complex(re, im) => Complex64::new(f64::from(*re), f64::from(*im)),
+        _ => Complex64::new(0.0, 0.0),
+    }
+}
+fn scalar_c32(v: &RecordValue) -> Complex32 {
+    match v {
+        RecordValue::Complex(re, im) => Complex32::new(*re, *im),
+        RecordValue::DComplex(re, im) => Complex32::new(*re as f32, *im as f32),
+        _ => Complex32::new(0.0, 0.0),
+    }
+}
+
 /// Build a fresh numpy array for a column of array cells: shape
 /// `(nrow, *cell_shape)` where `cell_shape` is the stored (and, for
 /// casacore files, logical) cell shape.
@@ -284,7 +377,7 @@ pub(crate) fn arrays_to_ndarray(
     macro_rules! build {
         ($ty:ty, $f:expr) => {{
             let mut buf: Vec<$ty> = vec![Default::default(); nrow * cell];
-            fill_flat(&mut buf, cells, cell, $f)?;
+            fill_flat(&mut buf, cells, cell, $f, |_| Default::default())?;
             reshape_from(py, buf, &shape)
         }};
     }
@@ -405,17 +498,50 @@ fn element_to_py(py: Python<'_>, v: &RecordValue) -> PyResult<Py<PyAny>> {
 
 /// Array cell -> numpy ndarray in logical order.
 pub(crate) fn array_to_ndarray(py: Python<'_>, a: &ArrayValue) -> PyResult<Py<PyAny>> {
-    array_to_ndarray_fixed(py, a, true)
-}
-
-/// Single-cell conversion with an explicit shape.
-pub(crate) fn array_to_ndarray_fixed(
-    py: Python<'_>,
-    a: &ArrayValue,
-    _fixed: bool,
-) -> PyResult<Py<PyAny>> {
+    // A single cell is returned with just the cell shape (no leading row
+    // singleton), matching casacore's `getcell`.
     let cell: Vec<usize> = a.shape.iter().map(|&d| d as usize).collect();
-    arrays_to_ndarray(py, &[RecordValue::Array(a.clone())], &cell)
+    let n = cell.iter().product::<usize>().max(1);
+    macro_rules! cell_build {
+        ($ty:ty, $f:expr) => {{
+            let mut buf: Vec<$ty> = vec![Default::default(); n];
+            fill_flat(&mut buf, &[RecordValue::Array(a.clone())], n, $f, |_| {
+                Default::default()
+            })?;
+            reshape_from(py, buf, &cell)
+        }};
+    }
+    match &a.data {
+        ArrayData::String(_) => {
+            let mut flat: Vec<String> = Vec::with_capacity(n);
+            if let ArrayData::String(v) = &a.data {
+                flat.extend_from_slice(v);
+            }
+            let list = PyList::empty(py);
+            for s in flat {
+                list.append(s)?;
+            }
+            if cell.len() > 1 {
+                let d = PyDict::new(py);
+                d.set_item("shape", cell)?;
+                d.set_item("array", list)?;
+                Ok(d.into_any().unbind())
+            } else {
+                Ok(list.into_any().unbind())
+            }
+        }
+        ArrayData::Bool(_) => cell_build!(bool, bool_of),
+        ArrayData::UChar(_) => cell_build!(u8, u8_of),
+        ArrayData::UShort(_) => cell_build!(u16, u16_of),
+        ArrayData::Short(_) => cell_build!(i16, i16_of),
+        ArrayData::Int(_) => cell_build!(i32, i32_of),
+        ArrayData::UInt(_) => cell_build!(u32, u32_of),
+        ArrayData::Int64(_) => cell_build!(i64, i64_of),
+        ArrayData::Float(_) => cell_build!(f32, f32_of),
+        ArrayData::Double(_) => cell_build!(f64, f64_of),
+        ArrayData::Complex(_) => cell_build!(Complex32, c32_of),
+        ArrayData::DComplex(_) => cell_build!(Complex64, c64_of),
+    }
 }
 
 // ---------------------------------------------------------------------------
