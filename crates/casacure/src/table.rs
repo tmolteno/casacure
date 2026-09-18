@@ -162,6 +162,96 @@ pub fn build_table_dat(
 /// fixed `ROWS_PER_BUCKET` bucket tile.
 pub const ROWS_PER_BUCKET: u32 = 32;
 
+/// Grows the SSM string buckets (`SSMStringHandler::putData` semantics):
+/// a 16-byte **big-endian canonical** header `[unused][used][nDeleted][next]`
+/// plus raw string data; strings spanning buckets chain via `next`.
+struct StringBuckets {
+    bucket_size: usize,
+    data_len: usize,
+    first_bucket: i32,
+    /// One Vec per bucket: full bucket bytes (header + data + padding).
+    buckets: Vec<Vec<u8>>,
+    current: usize,
+}
+
+impl StringBuckets {
+    fn new(bucket_size: u32, first_bucket: i32) -> StringBuckets {
+        let data_len = bucket_size as usize - 16;
+        StringBuckets {
+            bucket_size: bucket_size as usize,
+            data_len,
+            first_bucket,
+            buckets: Vec::new(),
+            current: 0,
+        }
+    }
+
+    fn new_bucket(&mut self) {
+        let mut b = vec![0u8; self.bucket_size];
+        // Header is big-endian canonical, regardless of data-file endianness.
+        b[4..8].copy_from_slice(&0u32.to_be_bytes()); // used
+        b[8..12].copy_from_slice(&(self.data_len as u32).to_be_bytes()); // nDeleted
+        b[12..16].copy_from_slice(&(-1i32).to_be_bytes()); // next = -1
+        self.buckets.push(b);
+        self.current = self.buckets.len() - 1;
+    }
+
+    fn used(&self) -> usize {
+        if self.buckets.is_empty() {
+            0
+        } else {
+            u32::from_be_bytes(self.buckets[self.current][4..8].try_into().unwrap()) as usize
+        }
+    }
+
+    fn set_used(&mut self, used: usize) {
+        self.buckets[self.current][4..8].copy_from_slice(&(used as u32).to_be_bytes());
+        self.buckets[self.current][8..12]
+            .copy_from_slice(&((self.data_len - used) as u32).to_be_bytes());
+    }
+
+    fn set_next(&mut self, idx: usize, next: i32) {
+        self.buckets[idx][12..16].copy_from_slice(&next.to_be_bytes());
+    }
+
+    /// Append `data`, returning (bucket number, offset into its data area).
+    fn put(&mut self, data: &[u8]) -> (i32, u32) {
+        if self.buckets.is_empty() {
+            self.new_bucket();
+        }
+        let free = self.data_len - self.used();
+        // Start a fresh bucket when the string cannot fit and little space
+        // is left (mirrors `SSMStringHandler::put`).
+        if data.len() > free && free < 50 {
+            self.new_bucket();
+        }
+        let bucket_nr = self.first_bucket + self.current as i32;
+        let offset = self.used() as u32;
+        let mut idx = self.current;
+        let mut src_off: usize = 0;
+        let mut remaining = data.len();
+        loop {
+            let used = self.used();
+            let room = self.data_len - used;
+            let take = remaining.min(room);
+            self.buckets[idx][16 + used..16 + used + take]
+                .copy_from_slice(&data[src_off..src_off + take]);
+            self.set_used(used + take);
+            src_off += take;
+            remaining -= take;
+            if remaining == 0 {
+                break;
+            }
+            // Roll over into a new bucket chained from this one.
+            let prev = idx;
+            self.new_bucket();
+            self.set_next(prev, self.first_bucket + self.current as i32);
+            idx = self.current;
+        }
+        (bucket_nr, offset)
+    }
+}
+
 pub fn create_table(
     table_dir: &std::path::Path,
     desc: &crate::tabledesc::TableDesc,
@@ -189,15 +279,10 @@ pub fn create_table(
     // Little endian, matching casacore on any little-endian host.
     let big_endian = false;
 
-    // Array-column data goes into `table.f0i` as per-row records; the SSM
-    // buckets hold an Int64 reference per row.
-    let mut array_index: Vec<u8> = Vec::new();
-    let mut has_arrays = false;
-
+    // Pass 1: per-column cell size/bits (independent of the tile layout).
     let mut cell_bits = Vec::with_capacity(desc.columns.len());
     let mut cell_bytes = Vec::with_capacity(desc.columns.len());
-    let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(desc.columns.len());
-    for (col, list) in values.iter().enumerate() {
+    for (col, _) in values.iter().enumerate() {
         let cd = &desc.columns[col];
         if cd.data_manager_type != "StandardStMan" {
             return Err(TableCreateError::NotStandardStMan(cd.name.clone()));
@@ -214,30 +299,76 @@ pub fn create_table(
             }
             crate::tabledesc::ColumnKind::Array => {
                 // The bucket cell is an Int64 reference into `table.f0i`.
-                has_arrays = true;
                 (crate::ssm::ARRAY_REF_SIZE, 8 * crate::ssm::ARRAY_REF_SIZE)
             }
             crate::tabledesc::ColumnKind::Record => {
                 return Err(TableCreateError::NotScalar(cd.name.clone()))
             }
         };
+        cell_bits.push(bits);
+        cell_bytes.push(size);
+    }
+
+    let l = layout(ROWS_PER_BUCKET, &cell_bits);
+
+    // String buckets start after the data and index buckets; index bucket
+    // count follows from the serialized SSMIndex stream (same calc as the
+    // writer). Data-bucket count is `ceil(nrow / rows_per_bucket)`.
+    let data_buckets = nrow.div_ceil(u64::from(l.rows_per_bucket)) as u32;
+    let index_stream = crate::ssm::build_index_stream(big_endian, nrow, &l, desc.columns.len());
+    let index_buckets = crate::ssm::index_bucket_count(index_stream.len(), l.bucket_size) as u32;
+    let first_string_bucket = (data_buckets + index_buckets) as i32;
+    let mut str_buckets = StringBuckets::new(l.bucket_size, first_string_bucket);
+
+    // Pass 2: encode the cell bytes.
+    let mut array_index: Vec<u8> = Vec::new();
+    let mut has_arrays = false;
+    let mut has_strings = false;
+    let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(desc.columns.len());
+    for (col, list) in values.iter().enumerate() {
+        let cd = &desc.columns[col];
+        let size = cell_bytes[col];
         let mut bytes = Vec::with_capacity(list.len() * size as usize);
         for value in list {
             match &cd.kind {
                 crate::tabledesc::ColumnKind::Scalar(_) => {
-                    bytes.extend_from_slice(
-                        &crate::ssm::encode_scalar_cell(big_endian, cd, value).map_err(
-                            |e| match e {
-                                crate::ssm::SsmError::StringBucketUnsupported { .. } => {
-                                    TableCreateError::LongString(cd.name.clone())
-                                }
-                                other => TableCreateError::Io(std::io::Error::other(format!(
-                                    "encode {}.{}: {other}",
-                                    desc.name, cd.name
-                                ))),
-                            },
-                        )?,
-                    );
+                    // Variable strings longer than 8 chars go into the SSM
+                    // string buckets; their cell is a 3-Int reference.
+                    if cd.data_type == crate::record::DataType::String
+                        && cd.max_length <= 0
+                        && matches!(value, RecordValue::String(s) if s.len() > 8)
+                    {
+                        let RecordValue::String(s) = value else {
+                            unreachable!()
+                        };
+                        let (bucket, offset) = str_buckets.put(s.as_bytes());
+                        has_strings = true;
+                        let mut cell = vec![0u8; 12];
+                        if big_endian {
+                            cell[0..4].copy_from_slice(&bucket.to_be_bytes());
+                            cell[4..8].copy_from_slice(&offset.to_be_bytes());
+                            cell[8..12].copy_from_slice(&(s.len() as i32).to_be_bytes());
+                        } else {
+                            cell[0..4].copy_from_slice(&bucket.to_le_bytes());
+                            cell[4..8].copy_from_slice(&offset.to_le_bytes());
+                            cell[8..12].copy_from_slice(&(s.len() as i32).to_le_bytes());
+                        }
+                        bytes.extend_from_slice(&cell);
+                    } else {
+                        bytes.extend_from_slice(
+                            &crate::ssm::encode_scalar_cell(big_endian, cd, value).map_err(
+                                |e| match e {
+                                    crate::ssm::SsmError::StringBucketUnsupported { .. } => {
+                                        TableCreateError::LongString(cd.name.clone())
+                                    }
+                                    other => TableCreateError::Io(std::io::Error::other(format!(
+                                        "encode {}.{}: {other}",
+                                        desc.name, cd.name
+                                    ))),
+                                },
+                            )?,
+                        );
+                    }
                 }
                 crate::tabledesc::ColumnKind::Array => {
                     let RecordValue::Array(arr) = value else {
@@ -262,17 +393,15 @@ pub fn create_table(
                     } else {
                         bytes.extend_from_slice(&offset.to_le_bytes());
                     }
+                    has_arrays = true;
                     array_index.extend_from_slice(&record);
                 }
                 crate::tabledesc::ColumnKind::Record => unreachable!(),
             }
         }
-        cell_bits.push(bits);
-        cell_bytes.push(size);
         encoded.push(bytes);
     }
 
-    let l = layout(ROWS_PER_BUCKET, &cell_bits);
     let cols: Vec<WriteColumn<'_>> = encoded
         .iter()
         .zip(cell_bytes.iter())
@@ -282,7 +411,12 @@ pub fn create_table(
             bytes,
         })
         .collect();
-    let data_file = write_standard_stman_file(big_endian, nrow, &cols, &l);
+    let string_bucket_refs: Vec<Vec<u8>> = if has_strings {
+        str_buckets.buckets.clone()
+    } else {
+        Vec::new()
+    };
+    let data_file = write_standard_stman_file(big_endian, nrow, &cols, &l, &string_bucket_refs);
 
     let spec = crate::columnset::StandardStMan {
         data_manager_name: "StandardStMan".into(),
@@ -691,14 +825,78 @@ mod tests {
     }
 
     #[test]
-    fn create_table_rejects_long_strings() {
-        let desc = typed_desc();
-        let mut values = typed_values(1);
-        values[9] = vec![RecordValue::String("way longer than eight chars".into())];
+    fn create_table_with_long_strings_reads_back() {
+        // Variable strings longer than 8 chars are stored in the SSM string
+        // buckets and read back through them.
+        let mut desc = typed_desc();
+        desc.columns = vec![
+            scalar_col("TXT", DataType::String, 0),
+            scalar_col("IDX", DataType::Int, 0),
+        ];
+        let long0 = "hello world this is a longer string than eight chars";
+        let long1 = "another quite long string that certainly exceeds eight characters";
+        let values = vec![
+            vec![
+                RecordValue::String(long0.into()),
+                RecordValue::String(long1.into()),
+            ],
+            vec![RecordValue::Int(0), RecordValue::Int(1)],
+        ];
         let dir = temp_dir("longstring");
-        assert!(matches!(
-            create_table(&dir, &desc, &values),
-            Err(TableCreateError::LongString(_))
-        ));
+        create_table(&dir, &desc, &values).unwrap();
+
+        let dat_bytes = std::fs::read(dir.join("table.dat")).unwrap();
+        let dat = parse_table_dat(&dat_bytes).unwrap();
+        let file = crate::ssm::StandardStManFile::open(&dir, 0, dat.header.big_endian).unwrap();
+        // String bucket allocated after the data + index buckets.
+        assert_eq!(file.header.nr_buckets, 3, "data + index + string bucket");
+        assert_eq!(file.header.last_string_bucket, 2);
+        let dm = &dat.column_set.data_managers[0];
+        let spec = match &dm.blob {
+            crate::columnset::DataManagerBlob::StandardStMan(s) => s,
+            _ => panic!("expected StandardStMan spec"),
+        };
+        let txt = dat.desc.column("TXT").unwrap();
+        assert_eq!(
+            file.read_scalar_cell(spec, 0, txt, 0).unwrap(),
+            RecordValue::String(long0.into())
+        );
+        assert_eq!(
+            file.read_scalar_cell(spec, 0, txt, 1).unwrap(),
+            RecordValue::String(long1.into())
+        );
+        let idx = dat.desc.column("IDX").unwrap();
+        assert_eq!(
+            file.read_scalar_cell(spec, 1, idx, 1).unwrap(),
+            RecordValue::Int(1)
+        );
+    }
+    #[test]
+    fn long_string_spans_multiple_string_buckets() {
+        // A single string column gives a bucket of ~384 bytes; a 600-char
+        // string must chain across several string buckets (putData).
+        let mut desc = typed_desc();
+        desc.columns = vec![scalar_col("TXT", DataType::String, 0)];
+        let big = "x".repeat(600);
+        let values = vec![vec![RecordValue::String(big.clone())]];
+        let dir = temp_dir("chainstr");
+        create_table(&dir, &desc, &values).unwrap();
+
+        let dat_bytes = std::fs::read(dir.join("table.dat")).unwrap();
+        let dat = parse_table_dat(&dat_bytes).unwrap();
+        let file = crate::ssm::StandardStManFile::open(&dir, 0, dat.header.big_endian).unwrap();
+        // Bucket size = rowsPerBucket * 12 = 384; string data area = 368.
+        assert_eq!(file.header.bucket_size, 384);
+        assert!(file.header.nr_buckets >= 3, "string chained buckets");
+        let dm = &dat.column_set.data_managers[0];
+        let spec = match &dm.blob {
+            crate::columnset::DataManagerBlob::StandardStMan(s) => s,
+            _ => panic!("expected StandardStMan spec"),
+        };
+        let txt = dat.desc.column("TXT").unwrap();
+        assert_eq!(
+            file.read_scalar_cell(spec, 0, txt, 0).unwrap(),
+            RecordValue::String(big)
+        );
     }
 }

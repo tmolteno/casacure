@@ -89,7 +89,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|i| RecordValue::Float(i as f32 + 0.5))
             .collect(),
         (0..nrows)
-            .map(|i| RecordValue::String(format!("row{}", i)))
+            // Long enough to exercise the SSM string buckets (> 8 chars).
+            .map(|i| {
+                RecordValue::String(format!(
+                    "row{i}: a label far longer than the eight-character inline limit"
+                ))
+            })
             .collect(),
         arr_values,
     ];

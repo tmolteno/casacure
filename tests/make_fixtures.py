@@ -102,6 +102,38 @@ def make_array_table(fixtures: Path) -> dict:
         }
 
 
+def make_long_string_table(fixtures: Path) -> dict:
+    """A table whose variable string column holds strings longer than 8
+    chars — the SSMStringHandler 'string bucket' case (byte ground truth)."""
+    path = fixtures / "longstr.tab"
+    taql(f"CREATE TABLE {path} [TXT S, IDX I4] LIMIT 2")
+    values = [
+        "hello world this is a longer string than eight chars",
+        "another quite long string that certainly exceeds eight characters",
+    ]
+    with table(str(path), readonly=False, ack=False) as t:
+        for row in range(len(values)):
+            t.putcell("TXT", row, values[row])
+            t.putcell("IDX", row, row)
+        nrows = t.nrows()
+        return {
+            "path": path.name,
+            "nrows": nrows,
+            "big_endian": sys.byteorder == "big",
+            "values": [t.getcell("TXT", row) for row in range(nrows)],
+            "columns": {
+                "TXT": {
+                    "value_type": t.getcoldesc("TXT")["valueType"],
+                    "getcol_dtype": "list",
+                },
+                "IDX": {
+                    "value_type": t.getcoldesc("IDX")["valueType"],
+                    "getcol_dtype": t.getcol("IDX").dtype.str,
+                },
+            },
+        }
+
+
 def main() -> None:
     if FIXTURES.exists():
         shutil.rmtree(FIXTURES)
@@ -113,6 +145,7 @@ def main() -> None:
         "tables": {
             "typed": make_typed_table(FIXTURES),
             "array": make_array_table(FIXTURES),
+            "longstr": make_long_string_table(FIXTURES),
         },
     }
     (FIXTURES / "manifest.json").write_text(json.dumps(manifest, indent=2))

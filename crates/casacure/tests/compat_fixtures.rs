@@ -27,6 +27,9 @@ struct TableFixture {
     nrows: u64,
     big_endian: bool,
     columns: BTreeMap<String, ColumnFixture>,
+    /// Optional cell values recorded per row (long-string table).
+    #[serde(default)]
+    values: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -407,6 +410,51 @@ fn fixture_array_column_read() {
         file.read_scalar_cell(spec, 1, idx, 0).unwrap(),
         RecordValue::Int(0)
     );
+    assert_eq!(
+        file.read_scalar_cell(spec, 1, idx, 1).unwrap(),
+        RecordValue::Int(1)
+    );
+}
+
+/// Reads the real casacore-written `longstr.tab`: variable strings longer
+/// than 8 chars come back through the SSM string buckets (`table.f0`).
+#[test]
+fn fixture_long_strings_read() {
+    use casacure::record::RecordValue;
+    let Some(manifest) = load_manifest() else {
+        return;
+    };
+    let Some(t) = manifest.tables.get("longstr") else {
+        return;
+    };
+    let fixtures_dir = manifest_path().parent().unwrap().to_path_buf();
+    let dir = fixtures_dir.join(&t.path);
+    let dat_bytes = std::fs::read(dir.join("table.dat")).expect("cannot read table.dat");
+    let dat = casacure::parse_table_dat(&dat_bytes)
+        .unwrap_or_else(|e| panic!("longstr: table.dat failed to parse: {e}"));
+    let file = casacure::StandardStManFile::open(&dir, 0, dat.header.big_endian)
+        .unwrap_or_else(|e| panic!("longstr: data file failed to open: {e}"));
+    // Data + index + one string bucket.
+    assert_eq!(file.header.nr_buckets, 3, "longstr: three buckets");
+    assert_eq!(file.header.last_string_bucket, 2, "longstr: string bucket");
+
+    let dm = &dat.column_set.data_managers[0];
+    let spec = match &dm.blob {
+        casacure::DataManagerBlob::StandardStMan(s) => s,
+        _ => panic!("longstr: expected StandardStMan spec"),
+    };
+    let txt = dat.desc.column("TXT").unwrap();
+    for (row, expected) in t.values.iter().enumerate() {
+        let got = file
+            .read_scalar_cell(spec, 0, txt, row as u64)
+            .unwrap_or_else(|e| panic!("longstr TXT row {row}: {e}"));
+        assert_eq!(
+            got,
+            RecordValue::String(expected.clone()),
+            "longstr TXT row {row}"
+        );
+    }
+    let idx = dat.desc.column("IDX").unwrap();
     assert_eq!(
         file.read_scalar_cell(spec, 1, idx, 1).unwrap(),
         RecordValue::Int(1)

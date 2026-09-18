@@ -64,6 +64,12 @@ pub enum SsmError {
     BadArrayRef { offset: i64, len: usize },
     #[error("array elements of type {0:?} are not supported in the array index file yet")]
     UnsupportedArrayType(DataType),
+    #[error("bad string reference: bucket {bucket}, offset {offset}, length {length}")]
+    BadStringRef {
+        bucket: i32,
+        offset: i32,
+        length: u32,
+    },
 }
 
 /// The `StandardStMan` header at the start of the data file
@@ -313,7 +319,75 @@ impl StandardStManFile {
                 count: spec.column_offset.len(),
             })?;
         let cell = self.cell_bytes(index_nr, *column_offset, row, scalar_cell_size(desc))?;
+        if desc.data_type == DataType::String && desc.max_length <= 0 {
+            // Variable-length string: the cell is a 3-Int reference; strings
+            // longer than 8 chars live in the string buckets.
+            let big = self.header.big_endian;
+            let len = read_i32_at(cell, 8, big)?;
+            if len > 8 {
+                let bucket = read_i32_at(cell, 0, big)?;
+                let offset = read_i32_at(cell, 4, big)?;
+                let s = self.read_long_string(bucket, offset, len as u32)?;
+                return Ok(RecordValue::String(s));
+            }
+        }
         decode_scalar(cell, desc, self.header.big_endian)
+    }
+
+    /// Read a string stored in the SSM string buckets
+    /// (`SSMStringHandler::get`/`getData`). String buckets carry a 16-byte
+    /// **big-endian canonical** header `[unused][usedLength][nDeleted][nextBucket]`
+    /// (independent of the data-file endianness) with the string data from
+    /// byte 16; strings spanning buckets chain via `nextBucket`.
+    fn read_long_string(&self, bucket: i32, offset: i32, length: u32) -> Result<String, SsmError> {
+        if bucket < 0 || offset < 0 {
+            return Err(SsmError::BadStringRef {
+                bucket,
+                offset,
+                length,
+            });
+        }
+        let mut out = Vec::with_capacity(length as usize);
+        let mut b = bucket;
+        let mut off = offset as i64;
+        let mut remaining = i64::from(length);
+        while remaining > 0 {
+            let bucket_bytes = self.bucket_bytes(b as u32)?;
+            let used = i64::from(i32::from_be_bytes(bucket_bytes[4..8].try_into().unwrap()));
+            let next = i32::from_be_bytes(bucket_bytes[12..16].try_into().unwrap());
+            let avail = used - off;
+            if avail <= 0 {
+                return Err(SsmError::BadStringRef {
+                    bucket: b,
+                    offset: off as i32,
+                    length: remaining as u32,
+                });
+            }
+            let take = remaining.min(avail) as usize;
+            let start = 16 + off as usize;
+            let end = start + take;
+            if end > bucket_bytes.len() {
+                return Err(SsmError::BadStringRef {
+                    bucket: b,
+                    offset: off as i32,
+                    length,
+                });
+            }
+            out.extend_from_slice(&bucket_bytes[start..end]);
+            remaining -= take as i64;
+            if remaining > 0 {
+                if next < 0 {
+                    return Err(SsmError::BadStringRef {
+                        bucket: b,
+                        offset: off as i32,
+                        length,
+                    });
+                }
+                b = next;
+                off = 0;
+            }
+        }
+        Ok(String::from_utf8_lossy(&out).into_owned())
     }
 }
 
@@ -786,30 +860,54 @@ pub fn layout(rows_per_bucket: u32, cell_bits: &[u32]) -> StandardStManLayout {
     }
 }
 
-/// Serialize a complete StandardStMan data file — header, data buckets, and
-/// the index bucket chain — matching what casacore writes for the tile
-/// layout from `layout`. `big_endian` is the data-file byte order (from the
-/// `table.dat` header); little-endian files get the v3 header with the
-/// explicit endian flag, big-endian files the v2 header.
+/// Serialize the `SSMIndex` stream for the layout (used to size the index
+/// bucket chain before writing; the data-file writer calls it too).
+pub fn build_index_stream(
+    big_endian: bool,
+    n_rows: u64,
+    layout: &StandardStManLayout,
+    nr_columns: usize,
+) -> Vec<u8> {
+    let mut iw = crate::aipsio::Writer::new();
+    if !big_endian {
+        iw = crate::aipsio::Writer::new_le();
+    }
+    write_index_stream(&mut iw, n_rows, layout, nr_columns);
+    iw.into_bytes()
+}
+
+/// Number of index buckets a stream of `index_len` bytes needs, given the
+/// bucket size (mirror of the chain allocation in write/read).
+pub fn index_bucket_count(index_len: usize, bucket_size: u32) -> usize {
+    if index_len == 0 {
+        return 0;
+    }
+    let capacity = bucket_size as usize - 8;
+    index_len.div_ceil(capacity)
+}
+
+/// Serialize a complete StandardStMan data file — header, data buckets, the
+/// index bucket chain, and any SSM string buckets — matching what casacore
+/// writes for the tile layout from `layout`. `big_endian` is the data-file
+/// byte order (from the `table.dat` header); little-endian files get the v3
+/// header with the explicit endian flag, big-endian files the v2 header.
+/// `string_buckets` holds pre-formatted string-bucket contents (16-byte
+/// big-endian header + data); they are appended after the index buckets and
+/// counted in `nr_buckets`, with the last one reported in
+/// `last_string_bucket`.
 pub fn write_standard_stman_file(
     big_endian: bool,
     n_rows: u64,
     cols: &[WriteColumn<'_>],
     layout: &StandardStManLayout,
+    string_buckets: &[Vec<u8>],
 ) -> Vec<u8> {
     let n_bucket_rows = layout.rows_per_bucket as u64;
     let nr_data_buckets = n_rows.div_ceil(n_bucket_rows) as u32;
     let bucket_size = layout.bucket_size as usize;
 
     // SSMIndex stream (endianness = data file).
-    let index_stream = {
-        let mut iw = crate::aipsio::Writer::new();
-        if !big_endian {
-            iw = crate::aipsio::Writer::new_le();
-        }
-        write_index_stream(&mut iw, n_rows, layout, cols.len());
-        iw.into_bytes()
-    };
+    let index_stream = build_index_stream(big_endian, n_rows, layout, cols.len());
 
     // Index bucket(s).
     let a_clen = 8usize;
@@ -845,10 +943,17 @@ pub fn write_standard_stman_file(
     }
     let single_bucket = chunks.len() <= 1;
     let idx_bucket_offset = if single_bucket { 8i32 } else { 0i32 };
+    let first_string_bucket = nr_data_buckets + index_buckets.len() as u32;
+    let last_string_bucket = if string_buckets.is_empty() {
+        -1
+    } else {
+        (first_string_bucket + string_buckets.len() as u32 - 1) as i32
+    };
 
     // Data buckets: copy each column's per-bucket row range into its region.
     let mut file = Vec::with_capacity(
-        DATA_START + (nr_data_buckets as usize + index_buckets.len()) * bucket_size,
+        DATA_START
+            + (nr_data_buckets as usize + index_buckets.len() + string_buckets.len()) * bucket_size,
     );
     // Header.
     let mut hw = crate::aipsio::Writer::new();
@@ -862,7 +967,7 @@ pub fn write_standard_stman_file(
         hw.put_bool(false); // little endian
     }
     hw.put_u32(bucket_size as u32);
-    hw.put_u32(nr_data_buckets + index_buckets.len() as u32);
+    hw.put_u32(nr_data_buckets + index_buckets.len() as u32 + string_buckets.len() as u32);
     hw.put_u32(0); // persistent cache size
     hw.put_u32(0); // free buckets
     hw.put_i32(-1); // first free bucket
@@ -873,7 +978,7 @@ pub fn write_standard_stman_file(
         nr_data_buckets as i32
     }); // first index bucket
     hw.put_i32(idx_bucket_offset);
-    hw.put_i32(-1); // last string bucket
+    hw.put_i32(last_string_bucket);
     hw.put_u32(index_stream.len() as u32);
     hw.put_u32(1); // nr indices
     hw.put_object_end();
@@ -897,9 +1002,11 @@ pub fn write_standard_stman_file(
     for b in index_buckets {
         file.extend_from_slice(&b);
     }
+    for sb in string_buckets {
+        file.extend_from_slice(sb);
+    }
     file
 }
-
 /// Serialize the single `SSMIndex` object for the layout.
 fn write_index_stream(
     iw: &mut crate::aipsio::Writer,
@@ -1419,17 +1526,32 @@ mod tests {
     }
 
     #[test]
-    fn rejects_string_bucket_reference() {
-        let mut data_bucket = [0u8; 64];
-        data_bucket[0..4].copy_from_slice(&2i32.to_be_bytes()); // bucket nr 2
-        data_bucket[8..12].copy_from_slice(&9i32.to_be_bytes()); // len 9 > 8
-        let file = build_file(256, &[&data_bucket], &index_payload(&[0], &[0]));
+    fn reads_long_string_from_string_bucket() {
+        // A cell reference to a string bucket is resolved: build a bucket 2
+        // holding a long string, referenced as [bucket 2][offset 16][…].
+        // String-bucket header is big-endian canonical:
+        // [unused][usedLength][nDeleted][nextBucket].
+        let content = b"a string that is definitely longer than eight characters";
+        let mut sb = vec![0u8; 256];
+        sb[4..8].copy_from_slice(&(content.len() as u32).to_be_bytes()); // used
+        sb[8..12].copy_from_slice(&((256 - 16 - content.len()) as u32).to_be_bytes()); // nDeleted
+        sb[12..16].copy_from_slice(&(-1i32).to_be_bytes()); // next = -1
+        sb[16..16 + content.len()].copy_from_slice(content);
+        // Bucket 0: cell ref [bucket 2][offset 16][len]; bucket 1: index;
+        // bucket 2: the string bucket.
+        let mut data_bucket = [0u8; 256];
+        data_bucket[0..4].copy_from_slice(&2i32.to_be_bytes());
+        data_bucket[4..8].copy_from_slice(&0i32.to_be_bytes()); // data-area offset 0
+        data_bucket[8..12].copy_from_slice(&(content.len() as i32).to_be_bytes());
+        let mut file = build_file(256, &[&data_bucket], &index_payload(&[0], &[0]));
+        file.extend_from_slice(&sb);
         let f = parse(&file);
         let s = spec(&[0]);
-        assert!(matches!(
-            f.read_scalar_cell(&s, 0, &scalar_desc("S", DataType::String, 0), 0),
-            Err(SsmError::StringBucketUnsupported { bucket: 2, len: 9 })
-        ));
+        assert_eq!(
+            f.read_scalar_cell(&s, 0, &scalar_desc("S", DataType::String, 0), 0)
+                .unwrap(),
+            RecordValue::String(String::from_utf8(content.to_vec()).unwrap())
+        );
     }
 
     #[test]

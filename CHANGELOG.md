@@ -96,6 +96,20 @@ subtasks are moved here.
   fixed-shape array columns exactly (`getcoldesc` option 4, logical shape
   `[2,3]`, all values; 3 rows and 100 rows across multiple buckets).
 - `examples/create_sample_table.rs` now writes an array column too.
+- SSM string buckets (`SSMStringHandler`): variable strings longer than 8
+  chars are read **and** written. The string bucket has a 16-byte
+  **big-endian canonical** header `[unused][usedLength][nDeleted][nextBucket]`
+  (independent of the data-file endianness) with raw string data from byte
+  16; strings spanning buckets chain via `nextBucket`. New `longstr.tab`
+  fixture (52/65-char strings, 2 rows) verifies the real casacore layout
+  (bucket 2, refs `[2,0,52]`/`[2,52,65]`, used=117/nDeleted=379), and
+  `read_scalar_cell` now resolves long-string cells through the buckets
+  instead of erroring. `create_table` grows string buckets (a
+  `StringBuckets` writer mirroring `putData`, incl. roll-over chaining) and
+  writes them after the index buckets with `last_string_bucket` set.
+- Long-string interop proven: python-casacore reads casacure-written strings
+  exactly (3-row sample labels, plus 1000-char strings chained across
+  multiple string buckets).
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit
   tests plus a manifest-driven fixture test asserting the header of the real
