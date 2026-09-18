@@ -200,6 +200,18 @@ subtasks are moved here.
   nested records per casacore `putData`. Round-trip test reproduces the
   `kw.tab` keywords (incl. the NEST→HH nested record) and casacore reads a
   casacure-written table's keywords back exactly.
+- Subtable linkage (§4): `Table::getkeywords`/`getcolkeywords`/`getcoldesc`/
+  `getdesc` expose `TpTable` keyword fields as the `"Table: <resolved path>"`
+  strings python-casacore and dask-ms' `CasaFormat.is_subtable` expect —
+  relative stored paths are joined against the directory containing the
+  parent table and lexically normalized, resolving dynamically on read
+  (verified by relocating a fixture tree). `WritableTable::putkeyword`/
+  `putcolkeyword` with `RecordValue::Table` store relative `./subtable`
+  references like casacore (absolute paths kept when outside the parent's
+  directory), recursively into nested records. New `subs` fixture covers
+  same-dir / subdir / outside cases; casacore reads casacure-written subtable
+  links back exactly (incl. nested) and opens the linked tables (74/74 tests).
+- `table` module: `parse_table_header` parses the `table.dat` root object
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit
   tests plus a manifest-driven fixture test asserting the header of the real
