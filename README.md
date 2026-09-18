@@ -140,7 +140,7 @@ pip install .                # maturin builds the cdylib for your interpreter
 ```
 
 The Rust core is published to crates.io as the `casacure` crate; add
-`casacure = "0.1"` to `Cargo.toml` if you want the table engine in Rust
+`casacure = "0.2"` to `Cargo.toml` if you want the table engine in Rust
 directly.
 
 `pip install casacure` on Python 3.9–3.14 installs a self-contained package —

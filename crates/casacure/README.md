@@ -31,7 +31,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-casacure = "0.1"
+casacure = "0.2"
 ```
 
 Create and write a small table in one shot:

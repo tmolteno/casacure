@@ -5,6 +5,34 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-19
+
+### Changed
+
+- Version bump 0.1.0 -> 0.2.0 (workspace package + workspace dependency, in
+  lockstep); the release is tagged `v0.2.0` to drive CI and the crates.io /
+  PyPI trusted-publishing workflows.
+- `crates/casacure` README shipped in the crate (description, features, Rust
+  usage examples, author: Tim Molteno <tim@elec.ac.nz>); `readme`, `authors`
+  and `keywords` metadata added to the crate manifest; pyproject author email
+  corrected to tim@elec.ac.nz.
+- Top-level README retitled "casacure and python-casacure", framing the two
+  user-facing packages (the `casacure` Rust crate and the python-casacure
+  PyPI package, module `casacure.tables`); the internal `casacure-python`
+  crate is noted as build-only, not published to crates.io.
+- Publishing setup: PyPI via GitHub trusted publishing (OIDC,
+  `publish-python.yml`), crates.io via trusted publishing
+  (`rust-lang/crates-io-auth-action`, `publish-rust.yml`, no API token);
+  `casacure-python` marked `publish = false` so the crates.io package is the
+  `casacure` crate.
+- Python 3.14 support: pyo3 0.27 / numpy 0.27; `requires-python >=3.9,<3.15`;
+  macOS/Windows publish wheels for CPython 3.10-3.14 (Linux manylinux covers
+  3.9-3.14).
+- Python package metadata completed for PyPI (PEP 639 SPDX license,
+  authors, keywords, classifiers, project.urls, sdist hygiene via
+  MANIFEST.in).
+
+
 ### Added
 
 - Project scaffolding: Cargo workspace with the `casacure` core crate
