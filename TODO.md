@@ -7,7 +7,6 @@ Work areas follow `CASACORE_TO_CASA_RS.md` (tracked as GitHub issues).
 
 ## 1. CASA table on-disk format (core prerequisite)
 
-- [ ] Parse data-manager info (`ColumnSet` records, StandardStMan spec)
 - [ ] StandardStMan column storage: read
 - [ ] StandardStMan column storage: write
 - [ ] Scalar + fixed-shape array columns

@@ -7,6 +7,7 @@
 //! canonical AipsIO), and a table-kind string (`"PlainTable"`).
 
 use crate::aipsio::{AipsIoError, Reader};
+use crate::columnset::{parse_column_set, ColumnSet, ColumnSetError};
 use crate::tabledesc::{TableDesc, TableDescError};
 use thiserror::Error;
 
@@ -31,6 +32,8 @@ pub enum TableDatError {
     #[error(transparent)]
     Desc(#[from] TableDescError),
     #[error(transparent)]
+    ColumnSet(#[from] ColumnSetError),
+    #[error(transparent)]
     AipsIo(#[from] AipsIoError),
 }
 
@@ -53,14 +56,21 @@ pub struct TableHeader {
 pub struct TableDat {
     pub header: TableHeader,
     pub desc: TableDesc,
+    pub column_set: ColumnSet,
 }
 
-/// Parse a complete `table.dat` buffer: header plus table description.
+/// Parse a complete `table.dat` buffer: header, table description, and the
+/// data-manager info.
 pub fn parse_table_dat(buf: &[u8]) -> Result<TableDat, TableDatError> {
     let mut r = Reader::new(buf);
     let header = read_table_header(&mut r)?;
     let desc = crate::tabledesc::parse_table_desc(&mut r)?;
-    Ok(TableDat { header, desc })
+    let column_set = parse_column_set(&mut r, &desc.columns)?;
+    Ok(TableDat {
+        header,
+        desc,
+        column_set,
+    })
 }
 
 /// Parse the header from the start of a `table.dat` buffer.

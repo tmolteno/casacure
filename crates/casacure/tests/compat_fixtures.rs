@@ -149,6 +149,57 @@ fn fixture_table_dat_headers_parse() {
     }
 }
 
+/// Ground-truth column offsets inside `typed.tab/table.f0` read off the real
+/// casacore-written SSM spec (one per column, including the value sizes).
+const TYPED_COLUMN_OFFSETS: [u32; 10] = [0, 4, 36, 100, 228, 356, 484, 740, 996, 1508];
+
+#[test]
+fn fixture_column_sets_parse() {
+    let Some(manifest) = load_manifest() else {
+        return;
+    };
+    let fixtures_dir = manifest_path().parent().unwrap().to_path_buf();
+    for (name, table) in &manifest.tables {
+        let buf = std::fs::read(fixtures_dir.join(&table.path).join("table.dat"))
+            .expect("cannot read table.dat");
+        let dat = casacure::parse_table_dat(&buf)
+            .unwrap_or_else(|e| panic!("{name}: table.dat failed to parse: {e}"));
+
+        let cs = &dat.column_set;
+        assert_eq!(cs.version, 2, "{name}: unexpected ColumnSet version");
+        assert_eq!(cs.nrow, table.nrows, "{name}: ColumnSet row count");
+        assert_eq!(cs.storage_option, None, "{name}: v2 has no storage option");
+        // One StandardStMan data manager owning every column.
+        assert_eq!(cs.seq_count, 1, "{name}: wrong data-manager count");
+        assert_eq!(cs.data_managers.len(), 1, "{name}: wrong DM list");
+        let dm = &cs.data_managers[0];
+        assert_eq!(dm.type_name, "StandardStMan", "{name}: wrong DM type");
+        assert_eq!(dm.sequence_nr, 0, "{name}: wrong DM sequence");
+
+        // Every column binds to data manager 0.
+        assert_eq!(cs.columns.len(), table.columns.len());
+        for info in &cs.columns {
+            assert_eq!(info.data_manager_seq, 0, "{name}: wrong DM binding");
+            assert_eq!(info.shape_column, None, "{name}: scalar columns only");
+        }
+
+        let ssm = match &dm.blob {
+            casacure::DataManagerBlob::StandardStMan(s) => s,
+            _ => panic!("{name}: expected a StandardStMan spec blob"),
+        };
+        assert_eq!(ssm.data_manager_name, "StandardStMan");
+        assert_eq!(
+            ssm.column_offset, TYPED_COLUMN_OFFSETS,
+            "{name}: wrong column offset table"
+        );
+        assert_eq!(
+            ssm.col_index_map,
+            vec![0u32; TYPED_COLUMN_OFFSETS.len()],
+            "{name}: wrong column index map"
+        );
+    }
+}
+
 #[test]
 fn fixture_table_descs_parse() {
     let Some(manifest) = load_manifest() else {

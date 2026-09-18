@@ -56,3 +56,16 @@ subtasks are moved here.
   flag). `parse_table_dat` parses a whole `table.dat`. Fixture test verifies
   all 10 columns of the casacore-written `typed.tab` (names, value types,
   StandardStMan data manager, scalar kind).
+- `columnset` module: parses the data-manager info following `TableDesc` in
+  `table.dat` — `ColumnSet` version (negative version scheme: -2 reads a
+  `u32` row count, -3 a `u64` row count plus storage option + block size),
+  data-manager list (type + sequence number), per-column `PlainColumn`
+  bindings (scalar/record vs array with optional shape column), and the
+  per-manager opaque spec blobs. StandardStMan's framed `"SSM"` object is
+  decoded into the manager name and the `"Block"`-framed column-offset /
+  column-index-map tables; other data-manager types keep their raw blob.
+  `parse_table_dat` now returns the full `TableDat` (header, desc,
+  column_set). `aipsio` gained a raw-opaque-block reader. 7 unit tests;
+  fixture test asserts the real casacore `typed.tab` ColumnSet (version 2,
+  one StandardStMan DM at seq 0, all 10 scalar bindings, SSM offsets
+  `[0,4,36,100,228,356,484,740,996,1508]`, zero index map).

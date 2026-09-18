@@ -122,6 +122,14 @@ impl<'a> Reader<'a> {
         Ok(self.read_u8()? & 1 != 0)
     }
 
+    /// An opaque data block: `u32` byte length + raw bytes (`AipsIO::getnew`
+    /// / `ByteIO` multi-byte write), e.g. the per-data-manager blobs in
+    /// `table.dat`. The returned slice is a self-contained AipsIO stream.
+    pub fn read_opaque(&mut self) -> Result<&'a [u8], AipsIoError> {
+        let n = self.read_u32()? as usize;
+        self.take(n)
+    }
+
     /// AipsIO string: `u32` length + raw bytes (no NUL terminator).
     pub fn read_string(&mut self) -> Result<String, AipsIoError> {
         let offset = self.pos;
