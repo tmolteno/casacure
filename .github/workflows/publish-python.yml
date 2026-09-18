@@ -1,0 +1,90 @@
+# Publishes the `casacure` Python package to PyPI using GitHub trusted
+# publishing (OpenID Connect) — no API token is stored in this repo.
+#
+# One-time setup in PyPI (pypi.org -> Account settings -> Publishing ->
+# "Add a new publisher"), done once by the project owner:
+#   * Owner:       tmolteno
+#   * Repository:  casacure
+#   * Workflow:    Publish Python package   (this workflow's `name:`)
+#   * Environment: pypi                    (this workflow's environment)
+#
+# After that, every `v*` tag push (or manual dispatch) builds wheels for all
+# supported platforms/ABIs and uploads them to the `casacure` project.
+name: Publish Python package
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Cross-compile a wheel per platform. On Linux the manylinux image bundles
+  # every supported CPython (3.9+), so --find-interpreter covers all ABIs
+  # there; the sdist is produced exactly once (the x86_64 Linux job).
+  build:
+    name: Build wheels (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: auto
+            sdist: true
+          - platform: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            manylinux: auto
+            sdist: false
+          - platform: macos-13
+            target: x86_64-apple-darwin
+            sdist: false
+          - platform: macos-14
+            target: aarch64-apple-darwin
+            sdist: false
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            sdist: false
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist --find-interpreter
+          sdist: ${{ matrix.sdist }}
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist
+          if-no-files-found: error
+
+  # Collect every wheel plus the sdist and publish to PyPI with trusted
+  # publishing. `id-token: write` mints the OIDC token; no password.
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: build
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Publish to PyPI (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

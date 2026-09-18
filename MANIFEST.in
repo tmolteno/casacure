@@ -1,0 +1,7 @@
+# Keep the published PyPI sdist free of local scaffolding and the
+# vendored casacore C++ submodule (not needed to build the Rust extension).
+recursive-exclude casacore *
+recursive-exclude PARENT.tab *
+recursive-exclude SUB.tab *
+recursive-exclude tmp_tqsel.ms *
+recursive-exclude tests/fixtures *
