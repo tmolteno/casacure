@@ -110,6 +110,26 @@ subtasks are moved here.
 - Long-string interop proven: python-casacore reads casacure-written strings
   exactly (3-row sample labels, plus 1000-char strings chained across
   multiple string buckets).
+- IncrementalStMan support (the MS index-columns storage manager): the
+  `table.f0` reader decodes the `"IncrementalStMan"` header (v4/v5, bucket
+  size / counts), the `ISMIndex` at the end of the file (bucket boundaries +
+  bucket numbers), and the per-bucket interval index
+  (`[u32 indexOffset][data][per-col: nr, rownrs, offsets]`) — repeated
+  values across consecutive rows share one stored value (incremental
+  compression, verified: `[0,0,1,1,1,2]` stored as intervals
+  `[0..1],[2..4],[5..5]`). The `option 1`/Direct descriptor flag is a schema
+  hint — the layout doesn't depend on it. New `ism.tab` fixture (TIME double
+  + ANT1 int in ISM, VAL float in a second StandardStMan DM) verifies
+  multi-data-manager tables where `table.f0` is ISM and `table.f1` is SSM.
+- `create_table` now supports **multiple data managers** in one table: data
+  managers are grouped by type in column order, given sequence numbers, and
+  each gets its own `table.f{seq}` file (IncrementalStMan
+  `write_ism_file` with interval compression, StandardStMan as before plus
+  `table.f{seq}i` for arrays). The ColumnSet writer is generalized to a
+  multi-DM form (`write_multi_column_set`, `DmBlob`). Full-MS-pattern
+  interop proven: python-casacore reads a casacure-written table combining
+  SSM scalars, long strings, fixed-shape arrays, **and** ISM TIME/ANT1 —
+  4 files, all values exact.
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit
   tests plus a manifest-driven fixture test asserting the header of the real

@@ -16,6 +16,7 @@ import shutil
 import sys
 from pathlib import Path
 
+import casacore.tables as ct
 from casacore.tables import table, taql
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -120,7 +121,9 @@ def make_long_string_table(fixtures: Path) -> dict:
             "path": path.name,
             "nrows": nrows,
             "big_endian": sys.byteorder == "big",
-            "values": [t.getcell("TXT", row) for row in range(nrows)],
+            "values": {
+                "TXT": [str(t.getcell("TXT", row)) for row in range(nrows)],
+            },
             "columns": {
                 "TXT": {
                     "value_type": t.getcoldesc("TXT")["valueType"],
@@ -129,6 +132,49 @@ def make_long_string_table(fixtures: Path) -> dict:
                 "IDX": {
                     "value_type": t.getcoldesc("IDX")["valueType"],
                     "getcol_dtype": t.getcol("IDX").dtype.str,
+                },
+            },
+        }
+
+
+def make_ism_table(fixtures: Path) -> dict:
+    """A table with IncrementalStMan (Direct, option 1) index-style columns
+    (TIME double, ANT1 int) plus a StandardStMan column, with repeated
+    values so the ISM interval compression is exercised."""
+    path = fixtures / "ism.tab"
+    scd1 = ct.makescacoldesc("TIME", 0.0, "IncrementalStMan", "IncrementalStMan", 1)
+    scd2 = ct.makescacoldesc("ANT1", 0, "IncrementalStMan", "IncrementalStMan", 1)
+    scd3 = ct.makescacoldesc("VAL", 0.0)
+    td = ct.maketabdesc([scd1, scd2, scd3])
+    nrow = 6
+    time_vals = [0.0, 0.0, 1.0, 1.0, 1.0, 2.0]
+    ant1_vals = [0, 0, 1, 1, 1, 2]
+    with ct.table(str(path), td, nrow=nrow, ack=False) as t:
+        for r in range(nrow):
+            t.putcell("TIME", r, time_vals[r])
+            t.putcell("ANT1", r, ant1_vals[r])
+            t.putcell("VAL", r, float(r))
+        return {
+            "path": path.name,
+            "nrows": nrow,
+            "big_endian": sys.byteorder == "big",
+            "values": {
+                "TIME": [float(t.getcell("TIME", r)) for r in range(nrow)],
+                "ANT1": [int(x) for x in t.getcol("ANT1")],
+                "VAL": [float(x) for x in t.getcol("VAL")],
+            },
+            "columns": {
+                "TIME": {
+                    "value_type": t.getcoldesc("TIME")["valueType"],
+                    "getcol_dtype": t.getcol("TIME").dtype.str,
+                },
+                "ANT1": {
+                    "value_type": t.getcoldesc("ANT1")["valueType"],
+                    "getcol_dtype": t.getcol("ANT1").dtype.str,
+                },
+                "VAL": {
+                    "value_type": t.getcoldesc("VAL")["valueType"],
+                    "getcol_dtype": t.getcol("VAL").dtype.str,
                 },
             },
         }
@@ -146,6 +192,7 @@ def main() -> None:
             "typed": make_typed_table(FIXTURES),
             "array": make_array_table(FIXTURES),
             "longstr": make_long_string_table(FIXTURES),
+            "ism": make_ism_table(FIXTURES),
         },
     }
     (FIXTURES / "manifest.json").write_text(json.dumps(manifest, indent=2))

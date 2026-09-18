@@ -774,7 +774,7 @@ fn read_u32_block(r: &mut Reader<'_>) -> Result<Vec<u32>, SsmError> {
 }
 
 /// Decode a scalar cell value for the column.
-fn decode_scalar(
+pub(crate) fn decode_scalar(
     cell: &[u8],
     desc: &ColumnDesc,
     big_endian: bool,

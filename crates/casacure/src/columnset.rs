@@ -266,38 +266,49 @@ pub fn write_standard_stman(spec: &StandardStMan) -> Vec<u8> {
     w.into_bytes()
 }
 
+/// One data manager's entry in the ColumnSet payload, with its serialized
+/// spec blob.
+#[derive(Debug, Clone)]
+pub struct DmBlob {
+    pub type_name: String,
+    pub sequence_nr: u32,
+    pub blob: Vec<u8>,
+}
+
 /// Serialize the ColumnSet payload that follows the `TableDesc` in
-/// `table.dat` (`ColumnSet::putFile` with `writeTable` set), for the
-/// supported layout: a single StandardStMan data manager (sequence 0)
-/// owning every column, written in the v2 (u32 row count) form.
-pub fn write_column_set(
+/// `table.dat` (`ColumnSet::putFile` with `writeTable` set), in the v2
+/// (u32 row count) form, for several data managers (e.g. one
+/// IncrementalStMan and one StandardStMan).
+pub fn write_multi_column_set(
     w: &mut crate::aipsio::Writer,
     nrow: u64,
     seq_count: u32,
-    columns: &[ColumnDesc],
-    spec: &StandardStMan,
+    dms: &[DmBlob],
+    columns: &[(ColumnDesc, u32)],
 ) {
     w.put_i32(-2); // v2: u32 row count follows
     w.put_u32(u32::try_from(nrow).expect("row count exceeds the u32 range of a v2 ColumnSet"));
     w.put_u32(seq_count);
-    w.put_u32(1); // one data manager with columns
-    w.put_string("StandardStMan");
-    w.put_u32(0); // sequence number
-    for desc in columns {
+    w.put_u32(dms.len() as u32);
+    for dm in dms {
+        w.put_string(&dm.type_name);
+        w.put_u32(dm.sequence_nr);
+    }
+    for (desc, dm_seq) in columns {
         // PlainColumn::putFile
         w.put_u32(2); // class version
         w.put_string(&desc.name);
         match desc.kind {
             ColumnKind::Scalar(_) | ColumnKind::Record => {
                 w.put_u32(1); // ScalarColumnData class version
-                w.put_u32(0); // data-manager sequence number
+                w.put_u32(*dm_seq); // data-manager sequence number
             }
             ColumnKind::Array => {
                 // ArrayColumnData::putFileDerived: class version, the
                 // data-manager sequence, and the fixed shape as an
                 // IPosition in CASA (reversed logical) dim order.
                 w.put_u32(1);
-                w.put_u32(0);
+                w.put_u32(*dm_seq);
                 w.put_bool(true);
                 w.put_object_start("IPosition", 1);
                 let shape = desc.shape.as_deref().unwrap_or(&[]);
@@ -309,7 +320,9 @@ pub fn write_column_set(
             }
         }
     }
-    w.put_opaque(&write_standard_stman(spec));
+    for dm in dms {
+        w.put_opaque(&dm.blob);
+    }
 }
 
 #[cfg(test)]

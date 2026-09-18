@@ -27,9 +27,9 @@ struct TableFixture {
     nrows: u64,
     big_endian: bool,
     columns: BTreeMap<String, ColumnFixture>,
-    /// Optional cell values recorded per row (long-string table).
+    /// Optional per-column cell values (long-string / ISM tables).
     #[serde(default)]
-    values: Vec<String>,
+    values: BTreeMap<String, Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -312,9 +312,13 @@ fn fixture_table_descs_parse() {
                 Some(expected),
                 "{name}.{col_name}: wrong value type"
             );
-            assert_eq!(
-                desc.data_manager_type, "StandardStMan",
-                "{name}.{col_name}: wrong data manager"
+            assert!(
+                matches!(
+                    desc.data_manager_type.as_str(),
+                    "StandardStMan" | "IncrementalStMan"
+                ),
+                "{name}.{col_name}: unsupported data manager {}",
+                desc.data_manager_type
             );
             match &desc.kind {
                 casacure::ColumnKind::Scalar(_) => {}
@@ -444,13 +448,14 @@ fn fixture_long_strings_read() {
         _ => panic!("longstr: expected StandardStMan spec"),
     };
     let txt = dat.desc.column("TXT").unwrap();
-    for (row, expected) in t.values.iter().enumerate() {
+    let txt_values = t.values.get("TXT").cloned().unwrap_or_default();
+    for (row, expected) in txt_values.iter().enumerate() {
         let got = file
             .read_scalar_cell(spec, 0, txt, row as u64)
             .unwrap_or_else(|e| panic!("longstr TXT row {row}: {e}"));
         assert_eq!(
             got,
-            RecordValue::String(expected.clone()),
+            RecordValue::String(expected.as_str().unwrap().to_string()),
             "longstr TXT row {row}"
         );
     }
@@ -459,4 +464,80 @@ fn fixture_long_strings_read() {
         file.read_scalar_cell(spec, 1, idx, 1).unwrap(),
         RecordValue::Int(1)
     );
+}
+/// Reads the real casacore-written `ism.tab`: IncrementalStMan (Direct)
+/// TIME/ANT1 columns come back through the ISM interval index; VAL comes
+/// from the StandardStMan file (separate data manager, table.f1).
+#[test]
+fn fixture_ism_read() {
+    use casacure::record::RecordValue;
+    let Some(manifest) = load_manifest() else {
+        return;
+    };
+    let Some(t) = manifest.tables.get("ism") else {
+        return;
+    };
+    let fixtures_dir = manifest_path().parent().unwrap().to_path_buf();
+    let dir = fixtures_dir.join(&t.path);
+    let dat_bytes = std::fs::read(dir.join("table.dat")).expect("cannot read table.dat");
+    let dat = casacure::parse_table_dat(&dat_bytes)
+        .unwrap_or_else(|e| panic!("ism: table.dat failed to parse: {e}"));
+
+    let ism = casacure::IsmFile::open(&dir, 0, dat.header.big_endian)
+        .unwrap_or_else(|e| panic!("ism: ISM file failed to open: {e}"));
+    assert_eq!(
+        ism.index.rows,
+        vec![0, 6],
+        "ism: one bucket covering 6 rows"
+    );
+    assert_eq!(ism.index.bucket_numbers, vec![0]);
+
+    for (row, expected) in t.values["TIME"].iter().enumerate() {
+        let got = ism
+            .read_scalar_cell(0, dat.desc.column("TIME").unwrap(), row as u64)
+            .unwrap_or_else(|e| panic!("ism TIME row {row}: {e}"));
+        assert_eq!(
+            got,
+            RecordValue::Double(expected.as_f64().unwrap()),
+            "ism TIME row {row}"
+        );
+    }
+    let ant1_expected: Vec<i64> = t.values["ANT1"]
+        .iter()
+        .map(|v| v.as_i64().unwrap())
+        .collect();
+    for (row, expected) in ant1_expected.iter().enumerate() {
+        let got = ism
+            .read_scalar_cell(1, dat.desc.column("ANT1").unwrap(), row as u64)
+            .unwrap_or_else(|e| panic!("ism ANT1 row {row}: {e}"));
+        assert_eq!(
+            got,
+            RecordValue::Int(*expected as i32),
+            "ism ANT1 row {row}"
+        );
+    }
+
+    // VAL lives in the StandardStMan data manager (table.f1, seq 1).
+    let ssm = casacure::StandardStManFile::open(&dir, 1, dat.header.big_endian)
+        .unwrap_or_else(|e| panic!("ism: SSM file failed to open: {e}"));
+    let dm = dat
+        .column_set
+        .data_managers
+        .iter()
+        .find(|dm| dm.sequence_nr == 1)
+        .unwrap();
+    let spec = match &dm.blob {
+        casacure::DataManagerBlob::StandardStMan(s) => s,
+        _ => panic!("ism: expected StandardStMan spec"),
+    };
+    for row in 0..t.nrows {
+        let got = ssm
+            .read_scalar_cell(spec, 0, dat.desc.column("VAL").unwrap(), row)
+            .unwrap_or_else(|e| panic!("ism VAL row {row}: {e}"));
+        assert_eq!(
+            got,
+            RecordValue::Double(t.values["VAL"][row as usize].as_f64().unwrap()),
+            "ism VAL row {row}"
+        );
+    }
 }

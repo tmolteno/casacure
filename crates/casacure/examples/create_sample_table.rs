@@ -52,6 +52,14 @@ fn arr(name: &str, dt: DataType, casa_shape: &[i64]) -> ColumnDesc {
     }
 }
 
+fn ism_scalar(name: &str, dt: DataType, default: RecordValue) -> ColumnDesc {
+    let mut d = scalar(name, dt, default);
+    d.data_manager_type = "IncrementalStMan".into();
+    d.data_manager_group = "IncrementalStMan".into();
+    d.options = 1; // Direct
+    d
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args();
     let out = args.nth(1).unwrap_or_else(|| "sample.tab".into());
@@ -70,6 +78,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             scalar("NAME", DataType::String, RecordValue::String(String::new())),
             // Fixed-shape 2x3 complex array (CASA dim order [3,2]).
             arr("ARR", DataType::Complex, &[3, 2]),
+            // MS-style index columns stored incrementally (IncrementalStMan).
+            ism_scalar("TIME", DataType::Double, RecordValue::Double(0.0)),
+            ism_scalar("ANT1", DataType::Int, RecordValue::Int(0)),
         ],
     };
 
@@ -97,6 +108,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect(),
         arr_values,
+        // MS-style index columns stored incrementally (IncrementalStMan).
+        (0..nrows)
+            .map(|i| RecordValue::Double((i as f64) / 2.0))
+            .collect(),
+        (0..nrows)
+            .map(|i| RecordValue::Int((i / 3) as i32))
+            .collect(),
     ];
 
     let written = casacure::create_table(Path::new(&out), &desc, &values)?;

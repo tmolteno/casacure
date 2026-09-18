@@ -131,11 +131,14 @@ pub enum TableCreateError {
 
 /// Serialize the `table.dat` header: the root `"Table"` object plus the
 /// `TableDesc` and `ColumnSet`. `big_endian` is the data-file byte order.
+/// `dms` lists the data managers (with their spec blobs) and `col_dm_seq`
+/// the data-manager sequence number of each column, in table order.
 pub fn build_table_dat(
     big_endian: bool,
     nrow: u64,
     desc: &crate::tabledesc::TableDesc,
-    spec: &crate::columnset::StandardStMan,
+    dms: &[crate::columnset::DmBlob],
+    col_dm_seq: &[u32],
 ) -> Result<Vec<u8>, TableCreateError> {
     let mut w = crate::aipsio::Writer::new();
     if nrow > u64::from(u32::MAX) {
@@ -148,7 +151,13 @@ pub fn build_table_dat(
     w.put_u32(if big_endian { 0 } else { 1 });
     w.put_string("PlainTable");
     crate::tabledesc::write_table_desc(&mut w, desc);
-    crate::columnset::write_column_set(&mut w, nrow, 1, &desc.columns, spec);
+    let cols: Vec<(crate::tabledesc::ColumnDesc, u32)> = desc
+        .columns
+        .iter()
+        .cloned()
+        .zip(col_dm_seq.iter().copied())
+        .collect();
+    crate::columnset::write_multi_column_set(&mut w, nrow, dms.len() as u32, dms, &cols);
     w.put_object_end();
     Ok(w.into_bytes())
 }
@@ -257,8 +266,7 @@ pub fn create_table(
     desc: &crate::tabledesc::TableDesc,
     values: &[Vec<crate::record::RecordValue>],
 ) -> Result<Vec<std::path::PathBuf>, TableCreateError> {
-    use crate::record::RecordValue;
-    use crate::ssm::{layout, write_standard_stman_file, WriteColumn};
+    use crate::columnset::DmBlob;
     if desc.columns.len() != values.len() {
         return Err(TableCreateError::MissingValues(format!(
             "{} columns, {} value lists",
@@ -279,14 +287,97 @@ pub fn create_table(
     // Little endian, matching casacore on any little-endian host.
     let big_endian = false;
 
-    // Pass 1: per-column cell size/bits (independent of the tile layout).
-    let mut cell_bits = Vec::with_capacity(desc.columns.len());
-    let mut cell_bytes = Vec::with_capacity(desc.columns.len());
-    for (col, _) in values.iter().enumerate() {
-        let cd = &desc.columns[col];
-        if cd.data_manager_type != "StandardStMan" {
-            return Err(TableCreateError::NotStandardStMan(cd.name.clone()));
+    // Assign data-manager sequence numbers in column order (casacore
+    // creates one data manager per type/group, in order of first use).
+    let mut dm_types: Vec<String> = Vec::new();
+    let mut col_dm_seq: Vec<u32> = Vec::with_capacity(desc.columns.len());
+    for cd in &desc.columns {
+        if let Some(i) = dm_types.iter().position(|t| *t == cd.data_manager_type) {
+            col_dm_seq.push(i as u32);
+        } else {
+            dm_types.push(cd.data_manager_type.clone());
+            col_dm_seq.push((dm_types.len() - 1) as u32);
         }
+    }
+
+    let mut dms: Vec<DmBlob> = Vec::with_capacity(dm_types.len());
+    let mut data_files: Vec<(u32, Vec<u8>)> = Vec::with_capacity(dm_types.len());
+    let mut index_files: Vec<(u32, Vec<u8>)> = Vec::new();
+
+    for (dm, type_name) in dm_types.iter().enumerate() {
+        let dm_cols: Vec<usize> = (0..desc.columns.len())
+            .filter(|&c| col_dm_seq[c] as usize == dm)
+            .collect();
+        match type_name.as_str() {
+            "StandardStMan" => {
+                let (file, f0i, spec) = build_ssm_data(big_endian, nrow, desc, values, &dm_cols)?;
+                dms.push(DmBlob {
+                    type_name: type_name.clone(),
+                    sequence_nr: dm as u32,
+                    blob: crate::columnset::write_standard_stman(&spec),
+                });
+                data_files.push((dm as u32, file));
+                if let Some(f0i) = f0i {
+                    index_files.push((dm as u32, f0i));
+                }
+            }
+            "IncrementalStMan" => {
+                let file = build_ism_data(big_endian, nrow, desc, values, &dm_cols)?;
+                dms.push(DmBlob {
+                    type_name: type_name.clone(),
+                    sequence_nr: dm as u32,
+                    blob: crate::ism::write_ism_blob(type_name),
+                });
+                data_files.push((dm as u32, file));
+            }
+            other => {
+                return Err(TableCreateError::Io(std::io::Error::other(format!(
+                    "unsupported data-manager type {other}"
+                ))))
+            }
+        }
+    }
+
+    let table_dat = build_table_dat(big_endian, nrow, desc, &dms, &col_dm_seq)?;
+
+    std::fs::create_dir_all(table_dir)?;
+    let mut written = Vec::new();
+    let dat_path = table_dir.join("table.dat");
+    std::fs::write(&dat_path, table_dat)?;
+    written.push(dat_path);
+    for (seq, file) in data_files {
+        let f_path = table_dir.join(format!("table.f{seq}"));
+        std::fs::write(&f_path, file)?;
+        written.push(f_path);
+    }
+    for (seq, file) in index_files {
+        let f_path = table_dir.join(format!("table.f{seq}i"));
+        std::fs::write(&f_path, file)?;
+        written.push(f_path);
+    }
+    Ok(written)
+}
+
+/// Result of building one StandardStMan data manager: the data file, an
+/// optional array index file (`table.f{seq}i`), and the SSM spec for the
+/// `table.dat` blob.
+type SsmDataOutput = (Vec<u8>, Option<Vec<u8>>, crate::columnset::StandardStMan);
+
+/// Build the StandardStMan data-file bytes for one SSM data manager, its
+/// optional `table.f{seq}i` array index file, and the SSM spec.
+fn build_ssm_data(
+    big_endian: bool,
+    nrow: u64,
+    desc: &crate::tabledesc::TableDesc,
+    values: &[Vec<crate::record::RecordValue>],
+    dm_cols: &[usize],
+) -> Result<SsmDataOutput, TableCreateError> {
+    use crate::record::RecordValue;
+    use crate::ssm::{layout, write_standard_stman_file, WriteColumn};
+    let mut cell_bits = Vec::with_capacity(dm_cols.len());
+    let mut cell_bytes = Vec::with_capacity(dm_cols.len());
+    for &col in dm_cols {
+        let cd = &desc.columns[col];
         let (size, bits) = match cd.kind {
             crate::tabledesc::ColumnKind::Scalar(_) => {
                 let size = crate::ssm::scalar_cell_size(cd);
@@ -298,7 +389,6 @@ pub fn create_table(
                 (size, bits)
             }
             crate::tabledesc::ColumnKind::Array => {
-                // The bucket cell is an Int64 reference into `table.f0i`.
                 (crate::ssm::ARRAY_REF_SIZE, 8 * crate::ssm::ARRAY_REF_SIZE)
             }
             crate::tabledesc::ColumnKind::Record => {
@@ -308,32 +398,25 @@ pub fn create_table(
         cell_bits.push(bits);
         cell_bytes.push(size);
     }
-
     let l = layout(ROWS_PER_BUCKET, &cell_bits);
-
-    // String buckets start after the data and index buckets; index bucket
-    // count follows from the serialized SSMIndex stream (same calc as the
-    // writer). Data-bucket count is `ceil(nrow / rows_per_bucket)`.
     let data_buckets = nrow.div_ceil(u64::from(l.rows_per_bucket)) as u32;
-    let index_stream = crate::ssm::build_index_stream(big_endian, nrow, &l, desc.columns.len());
+    let index_stream = crate::ssm::build_index_stream(big_endian, nrow, &l, dm_cols.len());
     let index_buckets = crate::ssm::index_bucket_count(index_stream.len(), l.bucket_size) as u32;
     let first_string_bucket = (data_buckets + index_buckets) as i32;
     let mut str_buckets = StringBuckets::new(l.bucket_size, first_string_bucket);
-
-    // Pass 2: encode the cell bytes.
     let mut array_index: Vec<u8> = Vec::new();
     let mut has_arrays = false;
     let mut has_strings = false;
-    let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(desc.columns.len());
-    for (col, list) in values.iter().enumerate() {
+
+    let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(dm_cols.len());
+    for &col in dm_cols {
         let cd = &desc.columns[col];
-        let size = cell_bytes[col];
+        let size = cell_bytes[encoded.len()];
+        let list = &values[col];
         let mut bytes = Vec::with_capacity(list.len() * size as usize);
         for value in list {
             match &cd.kind {
                 crate::tabledesc::ColumnKind::Scalar(_) => {
-                    // Variable strings longer than 8 chars go into the SSM
-                    // string buckets; their cell is a 3-Int reference.
                     if cd.data_type == crate::record::DataType::String
                         && cd.max_length <= 0
                         && matches!(value, RecordValue::String(s) if s.len() > 8)
@@ -384,9 +467,6 @@ pub fn create_table(
                                 desc.name, cd.name
                             )))
                         })?;
-                    // Records live after the 16-byte `table.f0i` header
-                    // (`[u32 version][1-byte length][padding]`); a 0
-                    // reference means "no array" to casacore.
                     let offset = 16 + array_index.len() as i64;
                     if big_endian {
                         bytes.extend_from_slice(&offset.to_be_bytes());
@@ -407,7 +487,7 @@ pub fn create_table(
         .zip(cell_bytes.iter())
         .map(|(bytes, size)| WriteColumn {
             cell_size: *size,
-            cell_bits: 0, // unused by the file writer
+            cell_bits: 0,
             bytes,
         })
         .collect();
@@ -416,32 +496,71 @@ pub fn create_table(
     } else {
         Vec::new()
     };
-    let data_file = write_standard_stman_file(big_endian, nrow, &cols, &l, &string_bucket_refs);
-
+    let file = write_standard_stman_file(big_endian, nrow, &cols, &l, &string_bucket_refs);
     let spec = crate::columnset::StandardStMan {
         data_manager_name: "StandardStMan".into(),
-        column_offset: l.column_offset.clone(),
-        col_index_map: vec![0; desc.columns.len()],
+        column_offset: l.column_offset,
+        col_index_map: vec![0; dm_cols.len()],
     };
-    let table_dat = build_table_dat(big_endian, nrow, desc, &spec)?;
-
-    std::fs::create_dir_all(table_dir)?;
-    let dat_path = table_dir.join("table.dat");
-    std::fs::write(&dat_path, table_dat)?;
-    let f0_path = table_dir.join("table.f0");
-    std::fs::write(&f0_path, data_file)?;
-    let mut written = vec![dat_path, f0_path];
-    if has_arrays {
-        // `table.f0i`: [u32 version 0][u8 length] then records at offset 16.
+    let f0i = if has_arrays {
         let mut f0i = vec![0u8; 16];
         f0i[4] = (16 + array_index.len()) as u8;
         f0i.extend_from_slice(&array_index);
-        let f0i_path = table_dir.join("table.f0i");
-        std::fs::write(&f0i_path, f0i)?;
-        written.push(f0i_path);
-    }
-    Ok(written)
+        Some(f0i)
+    } else {
+        None
+    };
+    Ok((file, f0i, spec))
 }
+
+/// Build the IncrementalStMan data-file bytes for one ISM data manager
+/// (scalar columns only).
+fn build_ism_data(
+    big_endian: bool,
+    nrow: u64,
+    desc: &crate::tabledesc::TableDesc,
+    values: &[Vec<crate::record::RecordValue>],
+    dm_cols: &[usize],
+) -> Result<Vec<u8>, TableCreateError> {
+    let mut cell_buffers: Vec<Vec<u8>> = Vec::with_capacity(dm_cols.len());
+    let mut cell_sizes: Vec<u32> = Vec::with_capacity(dm_cols.len());
+    for &col in dm_cols {
+        let cd = &desc.columns[col];
+        if !matches!(cd.kind, crate::tabledesc::ColumnKind::Scalar(_)) {
+            return Err(TableCreateError::NotScalar(cd.name.clone()));
+        }
+        if cd.data_type == crate::record::DataType::String {
+            return Err(TableCreateError::Io(std::io::Error::other(format!(
+                "IncrementalStMan string column {} is not writable yet",
+                cd.name
+            ))));
+        }
+        let size = crate::ssm::scalar_cell_size(cd);
+        let mut buf = Vec::with_capacity(values[col].len() * size as usize);
+        for value in &values[col] {
+            buf.extend_from_slice(
+                &crate::ssm::encode_scalar_cell(big_endian, cd, value).map_err(|e| {
+                    TableCreateError::Io(std::io::Error::other(format!(
+                        "encode {}.{}: {e}",
+                        desc.name, cd.name
+                    )))
+                })?,
+            );
+        }
+        cell_buffers.push(buf);
+        cell_sizes.push(size);
+    }
+    let ism_cols: Vec<crate::ism::WriteIsmColumn<'_>> = cell_buffers
+        .iter()
+        .zip(cell_sizes.iter())
+        .map(|(buf, size)| crate::ism::WriteIsmColumn {
+            cell_size: *size,
+            bytes: buf,
+        })
+        .collect();
+    Ok(crate::ism::write_ism_file(big_endian, nrow, &ism_cols))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,7 +764,13 @@ mod tests {
             column_offset: correct.column_offset,
             col_index_map: vec![0; desc.columns.len()],
         };
-        let bytes = build_table_dat(false, 1, &desc, &spec).unwrap();
+        let dms = vec![crate::columnset::DmBlob {
+            type_name: "StandardStMan".into(),
+            sequence_nr: 0,
+            blob: crate::columnset::write_standard_stman(&spec),
+        }];
+        let bytes =
+            build_table_dat(false, 1, &desc, &dms, &vec![0u32; desc.columns.len()]).unwrap();
         let parsed = parse_table_dat(&bytes).unwrap();
         assert_eq!(parsed.header.version, 2);
         assert_eq!(parsed.header.nrow, 1);
@@ -871,6 +996,82 @@ mod tests {
             RecordValue::Int(1)
         );
     }
+    fn ism_col(name: &str, dt: DataType, option: i32) -> ColumnDesc {
+        let mut d = scalar_col(name, dt, 0);
+        d.data_manager_type = "IncrementalStMan".into();
+        d.data_manager_group = "IncrementalStMan".into();
+        d.options = option;
+        d
+    }
+
+    #[test]
+    fn create_table_with_ism_columns_reads_back() {
+        use crate::ism::IsmFile;
+        // MS-style: ISM index columns (TIME double, ANT1 int) + SSM VAL.
+        let mut desc = typed_desc();
+        desc.columns = vec![
+            ism_col("TIME", DataType::Double, 1),
+            ism_col("ANT1", DataType::Int, 1),
+            scalar_col("VAL", DataType::Float, 0),
+        ];
+        let time = [0.0, 0.0, 1.0, 1.0, 1.0, 2.0];
+        let ant1 = [0, 0, 1, 1, 1, 2];
+        let values = vec![
+            time.iter().map(|&v| RecordValue::Double(v)).collect(),
+            ant1.iter().map(|&v| RecordValue::Int(v)).collect(),
+            (0..6).map(|i| RecordValue::Float(i as f32)).collect(),
+        ];
+        let dir = temp_dir("ism");
+        create_table(&dir, &desc, &values).unwrap();
+
+        let dat_bytes = std::fs::read(dir.join("table.dat")).unwrap();
+        let dat = parse_table_dat(&dat_bytes).unwrap();
+        // DMs: IncrementalStMan seq 0, StandardStMan seq 1.
+        assert_eq!(dat.column_set.data_managers.len(), 2);
+        assert_eq!(
+            dat.column_set.data_managers[0].type_name,
+            "IncrementalStMan"
+        );
+        assert_eq!(dat.column_set.data_managers[0].sequence_nr, 0);
+        assert_eq!(dat.column_set.data_managers[1].type_name, "StandardStMan");
+        // Per-column bindings: TIME/ANT1 -> dm 0, VAL -> dm 1.
+        assert_eq!(dat.column_set.columns[0].data_manager_seq, 0);
+        assert_eq!(dat.column_set.columns[1].data_manager_seq, 0);
+        assert_eq!(dat.column_set.columns[2].data_manager_seq, 1);
+
+        let ism = IsmFile::open(&dir, 0, dat.header.big_endian).unwrap();
+        let ant1_col = dat.desc.column("ANT1").unwrap();
+        for (row, &v) in ant1.iter().enumerate() {
+            assert_eq!(
+                ism.read_scalar_cell(1, ant1_col, row as u64).unwrap(),
+                RecordValue::Int(v),
+                "ANT1 row {row}"
+            );
+        }
+        let time_col = dat.desc.column("TIME").unwrap();
+        for (row, &v) in time.iter().enumerate() {
+            assert_eq!(
+                ism.read_scalar_cell(0, time_col, row as u64).unwrap(),
+                RecordValue::Double(v),
+                "TIME row {row}"
+            );
+        }
+        // VAL is in the SSM file (seq 1), first column of that DM.
+        let ssm = crate::ssm::StandardStManFile::open(&dir, 1, dat.header.big_endian).unwrap();
+        let dm1 = &dat.column_set.data_managers[1];
+        let spec = match &dm1.blob {
+            crate::columnset::DataManagerBlob::StandardStMan(s) => s,
+            _ => panic!("expected StandardStMan spec"),
+        };
+        let val_col = dat.desc.column("VAL").unwrap();
+        for row in 0..6u64 {
+            assert_eq!(
+                ssm.read_scalar_cell(spec, 0, val_col, row).unwrap(),
+                RecordValue::Float(row as f32)
+            );
+        }
+    }
+
     #[test]
     fn long_string_spans_multiple_string_buckets() {
         // A single string column gives a bucket of ~384 bytes; a 600-char
