@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Optional row count (default 3); exercises multi-bucket layout.
     let nrows: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(3);
 
-    let desc = TableDesc {
+    let mut desc = TableDesc {
         name: String::new(),
         version: String::new(),
         comment: String::new(),
@@ -93,6 +93,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tsm_arr("DATA", DataType::DComplex, &[3, 2]),
         ],
     };
+    // A few keywords to exercise the keyword write path.
+    desc.keywords.set("MS_VERSION", RecordValue::Int(56));
+    desc.columns[0]
+        .keywords
+        .set("UNITS", RecordValue::String("Jy".into()));
 
     let arr_values = (0..nrows)
         .map(|row| {

@@ -1261,6 +1261,60 @@ impl WritableTable {
     /// (no caches exist).
     pub fn setmaxcachesize(&mut self, _col_idx: usize, _size: usize) {}
 
+    /// Set a table keyword (`putkeyword`); nested records are supported.
+    pub fn putkeyword(&mut self, name: &str, value: RecordValue) {
+        self.desc.keywords.set(name, value);
+    }
+
+    /// Remove a table keyword (`removekeyword`).
+    pub fn removekeyword(&mut self, name: &str) {
+        self.desc.keywords.remove(name);
+    }
+
+    /// The current table keywords as a JSON object.
+    pub fn keywords_json(&self) -> String {
+        self.desc.keywords.to_json_string()
+    }
+
+    /// Set a column keyword (`putcolkeyword`).
+    pub fn putcolkeyword(
+        &mut self,
+        col_idx: usize,
+        name: &str,
+        value: RecordValue,
+    ) -> Result<(), WriteTableError> {
+        let cname = self
+            .desc
+            .columns
+            .get(col_idx)
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        let col = self
+            .desc
+            .columns
+            .get_mut(col_idx)
+            .ok_or(WriteTableError::NoSuchColumn { name: cname })?;
+        col.keywords.set(name, value);
+        Ok(())
+    }
+
+    /// Remove a column keyword (`removecolkeyword`).
+    pub fn removecolkeyword(&mut self, col_idx: usize, name: &str) -> Result<(), WriteTableError> {
+        let cname = self
+            .desc
+            .columns
+            .get(col_idx)
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        let col = self
+            .desc
+            .columns
+            .get_mut(col_idx)
+            .ok_or(WriteTableError::NoSuchColumn { name: cname })?;
+        col.keywords.remove(name);
+        Ok(())
+    }
+
     /// Number of rows written so far.
     pub fn nrows(&self) -> u64 {
         self.cells.first().map_or(0, Vec::len) as u64
@@ -2281,6 +2335,87 @@ mod tests {
                 .map(|i| RecordValue::Double(i as f64 / 2.0))
                 .collect::<Vec<_>>()
         );
+    }
+
+    fn kw_desc() -> TableDesc {
+        let mut desc = typed_desc();
+        desc.columns = vec![scalar_col("A", DataType::Int, 0)];
+        desc
+    }
+
+    #[test]
+    fn keyword_write_round_trip() {
+        // Build the same keywords the kw.tab fixture holds.
+        let mut wt = WritableTable::create(temp_dir("kwrite"), kw_desc());
+        wt.addrows(1);
+        wt.putcell(0, 0, RecordValue::Int(0)).unwrap();
+        wt.putkeyword("VER", RecordValue::String("1.0".into()));
+        wt.putkeyword("MAXROWS", RecordValue::Int(1000));
+        let hh = {
+            let mut r = crate::record::TableRecord {
+                desc: Default::default(),
+                record_type: 0,
+                values: Vec::new(),
+            };
+            r.desc.fields.push(crate::record::RecordDescField {
+                name: "II".into(),
+                data_type: crate::record::DataType::Int,
+                sub_desc: None,
+                shape: None,
+                table_desc_name: None,
+                comment: String::new(),
+            });
+            r.values.push(RecordValue::Int(5));
+            r
+        };
+        let nest = {
+            let mut r = crate::record::TableRecord {
+                desc: Default::default(),
+                record_type: 0,
+                values: Vec::new(),
+            };
+            r.desc.fields.push(crate::record::RecordDescField {
+                name: "HH".into(),
+                data_type: crate::record::DataType::Record,
+                sub_desc: Some(hh.desc.clone()),
+                shape: None,
+                table_desc_name: None,
+                comment: String::new(),
+            });
+            r.desc.fields.push(crate::record::RecordDescField {
+                name: "S".into(),
+                data_type: crate::record::DataType::String,
+                sub_desc: None,
+                shape: None,
+                table_desc_name: None,
+                comment: String::new(),
+            });
+            r.values.push(RecordValue::Record(hh));
+            r.values.push(RecordValue::String("x".into()));
+            r
+        };
+        wt.putkeyword("NEST", RecordValue::Record(nest));
+        wt.putcolkeyword(0, "UNITS", RecordValue::String("Jy".into()))
+            .unwrap();
+        wt.putcolkeyword(0, "MULTI", RecordValue::Int(3)).unwrap();
+        assert_eq!(
+            wt.keywords_json(),
+            r#"{"VER":"1.0","MAXROWS":1000,"NEST":{"HH":{"II":5},"S":"x"}}"#
+        );
+        let dir = wt.flush().unwrap();
+
+        let t = Table::open(&dir, true).unwrap();
+        assert_eq!(
+            t.getkeywords(),
+            r#"{"VER":"1.0","MAXROWS":1000,"NEST":{"HH":{"II":5},"S":"x"}}"#
+        );
+        assert_eq!(t.getcolkeywords(0).unwrap(), r#"{"UNITS":"Jy","MULTI":3}"#);
+
+        // Removal.
+        let mut wt2 = WritableTable::create(temp_dir("kwdel"), kw_desc());
+        wt2.putkeyword("K", RecordValue::Int(1));
+        wt2.removekeyword("K");
+        assert_eq!(wt2.keywords_json(), "{}");
     }
 
     #[test]

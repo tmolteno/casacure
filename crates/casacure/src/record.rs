@@ -641,7 +641,8 @@ fn write_record_desc(w: &mut crate::aipsio::Writer, desc: &RecordDesc) -> Result
     Ok(())
 }
 
-/// Write bare field values of a nested record with a non-empty description.
+/// Write bare field values of a nested record with a non-empty description,
+/// recursing into nested records (casacore `RecordRep::putData`).
 fn write_record_data_values(
     w: &mut crate::aipsio::Writer,
     record: &TableRecord,
@@ -650,9 +651,90 @@ fn write_record_data_values(
         let value = record
             .get(&field.name)
             .ok_or_else(|| RecordError::LegacyKeywordSet("missing nested value".into()))?;
-        write_scalar_value(w, field.data_type, value);
+        match value {
+            RecordValue::Record(sub) => {
+                if sub.desc.fields.is_empty() {
+                    write_table_record(w, sub)?;
+                } else {
+                    write_record_data_values(w, sub)?;
+                }
+            }
+            _ => write_scalar_value(w, field.data_type, value),
+        }
     }
     Ok(())
+}
+
+/// The CASA `DataType` that best represents a constructed `RecordValue`
+/// (used when adding keyword fields).
+pub fn infer_data_type(value: &RecordValue) -> DataType {
+    use DataType::*;
+    match value {
+        RecordValue::Bool(_) => Bool,
+        RecordValue::UChar(_) => UChar,
+        RecordValue::Short(_) => Short,
+        RecordValue::UShort(_) => UShort,
+        RecordValue::Int(_) => Int,
+        RecordValue::UInt(_) => UInt,
+        RecordValue::Int64(_) => Int64,
+        RecordValue::Float(_) => Float,
+        RecordValue::Double(_) => Double,
+        RecordValue::Complex(_, _) => Complex,
+        RecordValue::DComplex(_, _) => DComplex,
+        RecordValue::String(_) | RecordValue::Table(_) => String,
+        RecordValue::Record(_) => Record,
+        RecordValue::Array(a) => match &a.data {
+            ArrayData::Bool(_) => ArrayBool,
+            ArrayData::UChar(_) => ArrayUChar,
+            ArrayData::Short(_) => ArrayShort,
+            ArrayData::UShort(_) => ArrayUShort,
+            ArrayData::Int(_) => ArrayInt,
+            ArrayData::UInt(_) => ArrayUInt,
+            ArrayData::Int64(_) => ArrayInt64,
+            ArrayData::Float(_) => ArrayFloat,
+            ArrayData::Double(_) => ArrayDouble,
+            ArrayData::Complex(_) => ArrayComplex,
+            ArrayData::DComplex(_) => ArrayDComplex,
+            ArrayData::String(_) => ArrayString,
+        },
+    }
+}
+
+impl TableRecord {
+    /// Set (or append) a keyword field, inferring its data type from the
+    /// value (`putkeyword`/`putcolkeyword`).
+    pub fn set(&mut self, name: &str, value: RecordValue) {
+        let dt = infer_data_type(&value);
+        if let Some(i) = self.desc.fields.iter().position(|f| f.name == name) {
+            self.desc.fields[i].data_type = dt;
+            if let RecordValue::Record(sub) = &value {
+                self.desc.fields[i].sub_desc = Some(sub.desc.clone());
+            }
+            self.values[i] = value;
+        } else {
+            let sub_desc = match &value {
+                RecordValue::Record(sub) => Some(sub.desc.clone()),
+                _ => None,
+            };
+            self.desc.fields.push(RecordDescField {
+                name: name.to_string(),
+                data_type: dt,
+                sub_desc,
+                shape: None,
+                table_desc_name: None,
+                comment: String::new(),
+            });
+            self.values.push(value);
+        }
+    }
+
+    /// Remove a field by name, if present (`removekeyword`).
+    pub fn remove(&mut self, name: &str) {
+        if let Some(i) = self.desc.fields.iter().position(|f| f.name == name) {
+            self.desc.fields.remove(i);
+            self.values.remove(i);
+        }
+    }
 }
 
 /// Serialize an `IPosition` (framed `"IPosition"` v1).

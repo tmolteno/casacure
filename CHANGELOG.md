@@ -194,6 +194,12 @@ subtasks are moved here.
   `kw.tab` fixture with table keywords (VER/MAXROWS/NEST nested) and column
   keywords (UNITS/MULTI). Keyword *write* (putkeywords/removekeyword) is the
   next step.
+- Keyword *write* side of §4: `WritableTable::putkeyword`/`putcolkeyword`/
+  `removekeyword`/`removecolkeyword` (plus `TableRecord::set`/`remove` with
+  data-type inference), with `write_record_data_values` now recursing into
+  nested records per casacore `putData`. Round-trip test reproduces the
+  `kw.tab` keywords (incl. the NEST→HH nested record) and casacore reads a
+  casacure-written table's keywords back exactly.
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit
   tests plus a manifest-driven fixture test asserting the header of the real
