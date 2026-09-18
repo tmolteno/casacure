@@ -399,6 +399,13 @@ subtasks are moved here.
     `casacure-0.1.0-cp314-cp314-manylinux_2_34_x86_64.whl` installs and
     round-trips a table.
 
+- **crates/casacure README**: added a crate-level `README.md` (description,
+  features, Rust usage examples, license) and wired the author metadata
+  through the workspace (`authors = ["Tim Molteno <tim@elec.ac.nz>"]` in
+  `[workspace.package]`, `authors.workspace = true` + `readme` + `keywords`
+  on the crate); pyproject author email corrected to tim@elec.ac.nz. Serves
+  the crates.io package listing (next release after 0.1.0, which is live).
+
 - `table` module: `parse_table_header` parses the `table.dat` root object
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit

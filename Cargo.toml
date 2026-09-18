@@ -7,6 +7,7 @@ casacure = { path = "crates/casacure", version = "0.1.0" }
 
 [workspace.package]
 version = "0.1.0"
+authors = ["Tim Molteno <tim@elec.ac.nz>"]
 edition = "2021"
 license = "LGPL-3.0-or-later"
 repository = "https://github.com/tmolteno/casacure"

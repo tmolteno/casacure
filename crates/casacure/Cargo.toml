@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["casacore", "measurement-set", "radio-astronomy", "taql"]
 
 [dependencies]
 thiserror = "2"
