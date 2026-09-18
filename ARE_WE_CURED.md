@@ -3,20 +3,20 @@
 Overall progress towards replacing casacore as the dask-ms I/O backend.
 Work areas are tracked as GitHub issues; subtasks live in `TODO.md`.
 
-**Verdict: NOT YET CURED** — scaffolding only; no table files can be read or written yet.
+**Verdict: NOT YET CURED** — reading works for StandardStMan scalar columns; writing not started.
 
 ## Test status
 
 | Suite | Command | Passing | Coverage |
 |---|---|---|---|
-| Rust unit + fixture tests | `cargo test` | 34/34 | type system, AipsIO reader, `table.dat` header + TableDesc/records/ColumnSet + StandardStMan spec |
+| Rust unit + fixture tests | `cargo test` | 45/45 | type system, AipsIO reader (both endians), `table.dat` (header, TableDesc, records, ColumnSet + StandardStMan spec), StandardStMan data-file read (header, index, scalar cell values) |
 | casacore comparison tests | `.venv/bin/python -m pytest tests/` | 5/5 | type system only |
 
 ## Progress by area (per CASACORE_TO_CASA_RS.md)
 
 | Area | Status | Notes |
 |---|---|---|
-| §1 CASA table on-disk format | ~30% | `table.dat` fully parsed (header, TableDesc, column descriptors, keyword records, ColumnSet data-manager list + per-column bindings, StandardStMan spec); data files not yet |
+| §1 CASA table on-disk format | ~45% | `table.dat` fully parsed (header, TableDesc, column descriptors, keyword records, ColumnSet + StandardStMan spec); StandardStMan data file readable — header, chained index buckets, `SSMIndex`, all scalar cell types (incl. bit-packed Bool, inline short strings) with values verified against the real casacore `typed.tab`. Gaps: string buckets (>8 chars), arrays, all writing. |
 | §2 Table lifecycle & locking | 0% | not started |
 | §3 Column data access | 0% | not started |
 | §4 Type system | ~90% | `ValueType` + numpy mapping done, verified against casacore 3.8.1 |

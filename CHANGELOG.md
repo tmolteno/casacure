@@ -37,9 +37,24 @@ subtasks are moved here.
   casacore fixtures, runs `cargo test --workspace`, `cargo fmt --check`,
   `cargo clippy -D warnings`, builds the bindings with `pip install .`, and
   runs the pytest comparison suite.
-- `aipsio` module: cursor-based reader for casacore's canonical (big-endian)
-  AipsIO byte format — magic check, u32/u64, length-prefixed strings, and
-  typed object headers (root vs nested) — 5 unit tests.
+- `aipsio` module: cursor-based reader for casacore's canonical AipsIO byte
+  format — magic check, u32/u64, length-prefixed strings, and typed object
+  headers (root vs nested), now endian-aware (`new_le` for the StandardStMan
+  data files) — 5 unit tests.
+- `ssm` module: StandardStMan data-file (`table.f0`) reader — the
+  `"StandardStMan"` header (bucket size, bucket/index locations, endian flag
+  with mismatch validation), the index assembled from the chained index
+  buckets, `SSMIndex` decoding (used buckets via `lastRow`/`bucketNumber`
+  blocks, v1 uInt / v2 u64 rows, `SimpleOrderedMap` free-space), and scalar
+  cell reads for every numeric type, bit-packed Bool, fixed-length strings,
+  and inline short (≤8 char) variable strings — the bin-bucket
+  (SSMStringHandler) path for longer strings is a known gap. `parse` takes
+  the table's data-file endianness; `read_scalar_cell` ties the spec offsets
+  from `table.dat` to bucket cells. 10 unit tests incl. rows spanning
+  multiple data buckets and an index spread over a bucket chain; fixture
+  test verifies all 10 values of the casacore-written `typed.tab` read back
+  exactly (bool, uchar, int16/int32/uint32, float, double, complex,
+  dcomplex, inline "hello" string) from its little-endian `table.f0`.
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit
   tests plus a manifest-driven fixture test asserting the header of the real

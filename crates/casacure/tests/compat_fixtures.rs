@@ -153,6 +153,79 @@ fn fixture_table_dat_headers_parse() {
 /// casacore-written SSM spec (one per column, including the value sizes).
 const TYPED_COLUMN_OFFSETS: [u32; 10] = [0, 4, 36, 100, 228, 356, 484, 740, 996, 1508];
 
+/// The sample values written by `tests/make_fixtures.py` (`COLUMN_CASES`).
+fn typed_values() -> [(&'static str, casacure::record::RecordValue); 10] {
+    [
+        ("COL_B", casacure::record::RecordValue::Bool(true)),
+        ("COL_U1", casacure::record::RecordValue::UChar(7)),
+        ("COL_I2", casacure::record::RecordValue::Short(-300)),
+        ("COL_I4", casacure::record::RecordValue::Int(-70000)),
+        ("COL_U4", casacure::record::RecordValue::UInt(4_000_000_000)),
+        ("COL_R4", casacure::record::RecordValue::Float(1.5)),
+        ("COL_R8", casacure::record::RecordValue::Double(1.5e300)),
+        ("COL_C4", casacure::record::RecordValue::Complex(1.5, 2.5)),
+        (
+            "COL_C8",
+            casacure::record::RecordValue::DComplex(1.5e300, 2.5e300),
+        ),
+        (
+            "COL_S",
+            casacure::record::RecordValue::String("hello".into()),
+        ),
+    ]
+}
+
+/// The exact decoded values read back out of the real casacore-written
+/// StandardStMan data file `typed.tab/table.f0` (little-endian host).
+#[test]
+fn fixture_standard_stman_column_values_read() {
+    let Some(manifest) = load_manifest() else {
+        return;
+    };
+    let fixtures_dir = manifest_path().parent().unwrap().to_path_buf();
+    for (name, table) in &manifest.tables {
+        let buf = std::fs::read(fixtures_dir.join(&table.path).join("table.dat"))
+            .expect("cannot read table.dat");
+        let dat = casacure::parse_table_dat(&buf)
+            .unwrap_or_else(|e| panic!("{name}: table.dat failed to parse: {e}"));
+
+        let file = casacure::StandardStManFile::open(
+            fixtures_dir.join(&table.path),
+            0,
+            dat.header.big_endian,
+        )
+        .unwrap_or_else(|e| panic!("{name}: data file failed to open: {e}"));
+        assert_eq!(
+            file.header.big_endian, table.big_endian,
+            "{name}: data-file endianness"
+        );
+        // The fixture table has one scalar row; 10 columns in one index.
+        assert_eq!(file.header.nr_index, 1, "{name}: expect one SSMIndex");
+        assert_eq!(file.indices[0].last_row, vec![0], "{name}: one bucket");
+        assert_eq!(file.indices[0].rows_per_bucket, 32, "{name}: rows/bucket");
+        assert_eq!(file.indices[0].nr_columns, 10, "{name}: columns/index");
+
+        let dm = &dat.column_set.data_managers[0];
+        let spec = match &dm.blob {
+            casacure::DataManagerBlob::StandardStMan(s) => s,
+            _ => panic!("{name}: expected StandardStMan spec"),
+        };
+        for (col_idx, (col_name, expected)) in typed_values().iter().enumerate() {
+            let desc = dat
+                .desc
+                .column(col_name)
+                .unwrap_or_else(|| panic!("{name}.{col_name}: missing descriptor"));
+            let value = file
+                .read_scalar_cell(spec, col_idx, desc, 0)
+                .unwrap_or_else(|e| panic!("{name}.{col_name}: read failed: {e}"));
+            assert_eq!(
+                value, *expected,
+                "{name}.{col_name}: casacore-written value mismatch"
+            );
+        }
+    }
+}
+
 #[test]
 fn fixture_column_sets_parse() {
     let Some(manifest) = load_manifest() else {

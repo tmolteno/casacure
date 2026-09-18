@@ -51,11 +51,33 @@ pub struct ObjectStart {
 pub struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// Multi-byte values with this endianness. `table.dat` is always
+    /// big-endian canonical AipsIO; the StandardStMan data files use the
+    /// table's data-file endianness (big or little).
+    little_endian: bool,
 }
 
 impl<'a> Reader<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
-        Reader { buf, pos: 0 }
+        Reader {
+            buf,
+            pos: 0,
+            little_endian: false,
+        }
+    }
+
+    /// A reader over a little-endian AipsIO stream (`LECanonicalIO`), used
+    /// for the StandardStMan data files on little-endian hosts.
+    pub fn new_le(buf: &'a [u8]) -> Self {
+        Reader {
+            buf,
+            pos: 0,
+            little_endian: true,
+        }
+    }
+
+    pub fn little_endian(&self) -> bool {
+        self.little_endian
     }
 
     pub fn position(&self) -> usize {
@@ -77,7 +99,11 @@ impl<'a> Reader<'a> {
 
     pub fn read_u32(&mut self) -> Result<u32, AipsIoError> {
         let b = self.take(4)?;
-        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+        Ok(if self.little_endian {
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        } else {
+            u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+        })
     }
 
     pub fn read_i32(&mut self) -> Result<i32, AipsIoError> {
@@ -86,9 +112,11 @@ impl<'a> Reader<'a> {
 
     pub fn read_u64(&mut self) -> Result<u64, AipsIoError> {
         let b = self.take(8)?;
-        Ok(u64::from_be_bytes([
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        ]))
+        Ok(if self.little_endian {
+            u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+        } else {
+            u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+        })
     }
 
     pub fn read_i64(&mut self) -> Result<i64, AipsIoError> {
@@ -101,7 +129,11 @@ impl<'a> Reader<'a> {
 
     pub fn read_i16(&mut self) -> Result<i16, AipsIoError> {
         let b = self.take(2)?;
-        Ok(i16::from_be_bytes([b[0], b[1]]))
+        Ok(if self.little_endian {
+            i16::from_le_bytes([b[0], b[1]])
+        } else {
+            i16::from_be_bytes([b[0], b[1]])
+        })
     }
 
     pub fn read_u16(&mut self) -> Result<u16, AipsIoError> {

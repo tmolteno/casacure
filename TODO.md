@@ -7,10 +7,11 @@ Work areas follow `CASACORE_TO_CASA_RS.md` (tracked as GitHub issues).
 
 ## 1. CASA table on-disk format (core prerequisite)
 
-- [ ] StandardStMan column storage: read
+- [X] StandardStMan column storage: read
 - [ ] StandardStMan column storage: write
 - [ ] Scalar + fixed-shape array columns
-- [ ] Byte-level interop proof: read a casacore-written table
+- [X] Byte-level interop proof: read a casacore-written table
+- [ ] SSMStringHandler string buckets (variable strings > 8 chars)
 - [ ] Byte-level interop proof: write a table casacore can read
 - [ ] IncrementalStMan (Direct option) support
 - [ ] TiledColumnStMan (`{column}_GROUP`, reversed dim order DEFAULTTILESHAPE)
