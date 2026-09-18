@@ -236,6 +236,65 @@ fn read_block_u32(r: &mut Reader<'_>) -> Result<Vec<u32>, ColumnSetError> {
     Ok(values)
 }
 
+/// Write a framed `"Block"` v1 of `uInt`s (`putBlock` in
+/// `casacore/casa/Containers/BlockIO.tcc`): `u32` element count then data.
+fn write_block_u32(w: &mut crate::aipsio::Writer, values: &[u32]) {
+    w.put_object_start("Block", 1);
+    w.put_u32(values.len() as u32);
+    for v in values {
+        w.put_u32(*v);
+    }
+    w.put_object_end();
+}
+
+/// Serialize a StandardStMan spec blob (`SSMBase::flush`): a root `"SSM"`
+/// v2 AipsIO stream with the manager name and the column-offset /
+/// column-index-map `Block`s. `table.dat` is always canonical big endian,
+/// so the blob is too — byte-identical to what casacore writes.
+pub fn write_standard_stman(spec: &StandardStMan) -> Vec<u8> {
+    let mut w = crate::aipsio::Writer::new();
+    w.put_root_object_start("SSM", 2);
+    w.put_string(&spec.data_manager_name);
+    write_block_u32(&mut w, &spec.column_offset);
+    write_block_u32(&mut w, &spec.col_index_map);
+    w.put_object_end();
+    w.into_bytes()
+}
+
+/// Serialize the ColumnSet payload that follows the `TableDesc` in
+/// `table.dat` (`ColumnSet::putFile` with `writeTable` set), for the
+/// supported layout: a single StandardStMan data manager (sequence 0)
+/// owning every column, written in the v2 (u32 row count) form.
+pub fn write_column_set(
+    w: &mut crate::aipsio::Writer,
+    nrow: u64,
+    seq_count: u32,
+    columns: &[ColumnDesc],
+    spec: &StandardStMan,
+) {
+    w.put_i32(-2); // v2: u32 row count follows
+    w.put_u32(u32::try_from(nrow).expect("row count exceeds the u32 range of a v2 ColumnSet"));
+    w.put_u32(seq_count);
+    w.put_u32(1); // one data manager with columns
+    w.put_string("StandardStMan");
+    w.put_u32(0); // sequence number
+    for desc in columns {
+        // PlainColumn::putFile
+        w.put_u32(2); // class version
+        w.put_string(&desc.name);
+        match desc.kind {
+            ColumnKind::Scalar(_) | ColumnKind::Record => {
+                w.put_u32(1); // ScalarColumnData class version
+                w.put_u32(0); // data-manager sequence number
+            }
+            ColumnKind::Array => {
+                unimplemented!("array columns are not writable yet")
+            }
+        }
+    }
+    w.put_opaque(&write_standard_stman(spec));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

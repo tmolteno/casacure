@@ -17,6 +17,7 @@ Initially casacore will be a submodule, that we keep updated with the casacore m
 * Make it easy for others to contribute by creating a TODO.md document that keeps track of needed next steps.
 * When performing steps, do them into small subtasks, and add them to TODO.md before starting.
 * Remove each task from TODO.md when completed and add an entry to CHANGELOG.md
+* Then push changes to github before doing the next TODO.md item.
 
 ## Linting
 

@@ -12,10 +12,18 @@ pub mod tabledesc;
 pub mod types;
 
 pub use columnset::{
-    parse_column_set, parse_standard_stman, ColumnInfo, ColumnSet, ColumnSetError, DataManager,
-    DataManagerBlob, StandardStMan,
+    parse_column_set, parse_standard_stman, write_column_set, write_standard_stman, ColumnInfo,
+    ColumnSet, ColumnSetError, DataManager, DataManagerBlob, StandardStMan,
 };
-pub use ssm::{scalar_cell_size, SsmError, SsmIndex, StandardStManFile, StandardStManHeader};
-pub use table::{parse_table_dat, parse_table_header, TableDat, TableError, TableHeader};
-pub use tabledesc::{parse_table_desc, ColumnDesc, ColumnKind, TableDesc, TableDescError};
+pub use ssm::{
+    encode_scalar_cell, layout, scalar_cell_size, write_standard_stman_file, SsmError, SsmIndex,
+    StandardStManFile, StandardStManHeader, StandardStManLayout, WriteColumn,
+};
+pub use table::{
+    build_table_dat, create_table, parse_table_dat, parse_table_header, TableCreateError, TableDat,
+    TableError, TableHeader, ROWS_PER_BUCKET,
+};
+pub use tabledesc::{
+    parse_table_desc, write_table_desc, ColumnDesc, ColumnKind, TableDesc, TableDescError,
+};
 pub use types::{UnknownValueType, ValueType};

@@ -521,6 +521,267 @@ fn decode_scalar(
     })
 }
 
+/// Per-column raw cell bytes handed to `write_standard_stman_file`.
+pub struct WriteColumn<'a> {
+    /// Bytes per row cell in the bucket (external size).
+    pub cell_size: u32,
+    /// Bits per row cell in the bucket (1 for bit-packed Booleans, else
+    /// `8 * cell_size`).
+    pub cell_bits: u32,
+    /// Concatenated cell bytes: `n_rows * cell_size` bytes.
+    pub bytes: &'a [u8],
+}
+
+/// Layout of a StandardStMan bucket tile for `rows_per_bucket` rows:
+/// each column owns `(rows_per_bucket * cell_bits + 7) / 8` bytes laid out
+/// contiguously from offset 0 (the casacore best-fit packing), and the
+/// bucket is exactly the tile size.
+pub struct StandardStManLayout {
+    pub rows_per_bucket: u32,
+    pub bucket_size: u32,
+    /// Byte offset of each column's region in every data bucket.
+    pub column_offset: Vec<u32>,
+}
+
+/// Compute the bucket tile for the given per-column bit sizes.
+pub fn layout(rows_per_bucket: u32, cell_bits: &[u32]) -> StandardStManLayout {
+    let mut offset = 0u32;
+    let mut column_offset = Vec::with_capacity(cell_bits.len());
+    for &bits in cell_bits {
+        column_offset.push(offset);
+        let region = (u64::from(rows_per_bucket) * u64::from(bits)).div_ceil(8);
+        offset += region as u32;
+    }
+    StandardStManLayout {
+        rows_per_bucket,
+        bucket_size: offset.max(1),
+        column_offset,
+    }
+}
+
+/// Serialize a complete StandardStMan data file — header, data buckets, and
+/// the index bucket chain — matching what casacore writes for the tile
+/// layout from `layout`. `big_endian` is the data-file byte order (from the
+/// `table.dat` header); little-endian files get the v3 header with the
+/// explicit endian flag, big-endian files the v2 header.
+pub fn write_standard_stman_file(
+    big_endian: bool,
+    n_rows: u64,
+    cols: &[WriteColumn<'_>],
+    layout: &StandardStManLayout,
+) -> Vec<u8> {
+    let n_bucket_rows = layout.rows_per_bucket as u64;
+    let nr_data_buckets = n_rows.div_ceil(n_bucket_rows) as u32;
+    let bucket_size = layout.bucket_size as usize;
+
+    // SSMIndex stream (endianness = data file).
+    let index_stream = {
+        let mut iw = crate::aipsio::Writer::new();
+        if !big_endian {
+            iw = crate::aipsio::Writer::new_le();
+        }
+        write_index_stream(&mut iw, n_rows, layout, cols.len());
+        iw.into_bytes()
+    };
+
+    // Index bucket(s).
+    let a_clen = 8usize;
+    let idx_capacity = bucket_size - a_clen;
+    let mut index_buckets: Vec<Vec<u8>> = Vec::new();
+    let mut chunks: Vec<&[u8]> = Vec::new();
+    if !index_stream.is_empty() {
+        let mut rest: &[u8] = &index_stream;
+        while !rest.is_empty() {
+            let take = rest.len().min(idx_capacity);
+            chunks.push(&rest[..take]);
+            rest = &rest[take..];
+        }
+    }
+    for (i, chunk) in chunks.iter().enumerate() {
+        let mut b = Vec::with_capacity(bucket_size);
+        let check = -1i32;
+        let next = if i + 1 < chunks.len() {
+            (nr_data_buckets + i as u32 + 1) as i32
+        } else {
+            -1i32
+        };
+        if big_endian {
+            b.extend_from_slice(&check.to_be_bytes());
+            b.extend_from_slice(&next.to_be_bytes());
+        } else {
+            b.extend_from_slice(&check.to_le_bytes());
+            b.extend_from_slice(&next.to_le_bytes());
+        }
+        b.extend_from_slice(chunk);
+        b.resize(bucket_size, 0);
+        index_buckets.push(b);
+    }
+    let single_bucket = chunks.len() <= 1;
+    let idx_bucket_offset = if single_bucket { 8i32 } else { 0i32 };
+
+    // Data buckets: copy each column's per-bucket row range into its region.
+    let mut file = Vec::with_capacity(
+        DATA_START + (nr_data_buckets as usize + index_buckets.len()) * bucket_size,
+    );
+    // Header.
+    let mut hw = crate::aipsio::Writer::new();
+    if !big_endian {
+        hw = crate::aipsio::Writer::new_le();
+    }
+    if big_endian {
+        hw.put_root_object_start("StandardStMan", 2);
+    } else {
+        hw.put_root_object_start("StandardStMan", 3);
+        hw.put_bool(false); // little endian
+    }
+    hw.put_u32(bucket_size as u32);
+    hw.put_u32(nr_data_buckets + index_buckets.len() as u32);
+    hw.put_u32(0); // persistent cache size
+    hw.put_u32(0); // free buckets
+    hw.put_i32(-1); // first free bucket
+    hw.put_u32(index_buckets.len() as u32); // nr index buckets
+    hw.put_i32(if chunks.is_empty() {
+        -1
+    } else {
+        nr_data_buckets as i32
+    }); // first index bucket
+    hw.put_i32(idx_bucket_offset);
+    hw.put_i32(-1); // last string bucket
+    hw.put_u32(index_stream.len() as u32);
+    hw.put_u32(1); // nr indices
+    hw.put_object_end();
+    file.extend_from_slice(&hw.into_bytes());
+    file.resize(DATA_START, 0);
+
+    for b in 0..nr_data_buckets {
+        let mut bucket = vec![0u8; bucket_size];
+        let start_row = u64::from(b) * n_bucket_rows;
+        let end_row = (start_row + n_bucket_rows).min(n_rows);
+        for (c, col) in cols.iter().enumerate() {
+            let cell_size = col.cell_size as usize;
+            let region_start = (start_row * cell_size as u64) as usize;
+            let region_end = (end_row * cell_size as u64) as usize;
+            let src = &col.bytes[region_start..region_end];
+            let off = layout.column_offset[c] as usize;
+            bucket[off..off + src.len()].copy_from_slice(src);
+        }
+        file.extend_from_slice(&bucket);
+    }
+    for b in index_buckets {
+        file.extend_from_slice(&b);
+    }
+    file
+}
+
+/// Serialize the single `SSMIndex` object for the layout.
+fn write_index_stream(
+    iw: &mut crate::aipsio::Writer,
+    n_rows: u64,
+    layout: &StandardStManLayout,
+    nr_columns: usize,
+) {
+    let rpb = layout.rows_per_bucket as u64;
+    let nr_buckets = n_rows.div_ceil(rpb) as usize;
+    iw.put_root_object_start("SSMIndex", 1);
+    iw.put_u32(nr_buckets as u32); // itsNUsed
+    iw.put_u32(layout.rows_per_bucket);
+    iw.put_i32(nr_columns as i32);
+    // Empty SimpleOrderedMap free-space.
+    iw.put_object_start("SimpleOrderedMap", 1);
+    iw.put_i32(0); // old default value
+    iw.put_u32(0); // size
+    iw.put_u32(1); // old increment
+    iw.put_object_end();
+    // lastRow: ascending last row per bucket.
+    iw.put_object_start("Block", 1);
+    iw.put_u32(nr_buckets as u32);
+    for b in 0..nr_buckets as u64 {
+        iw.put_u32((((b + 1) * rpb).min(n_rows) - 1) as u32);
+    }
+    iw.put_object_end();
+    // bucketNumber: data bucket numbers 0..n-1.
+    iw.put_object_start("Block", 1);
+    iw.put_u32(nr_buckets as u32);
+    for b in 0..nr_buckets as u32 {
+        iw.put_u32(b);
+    }
+    iw.put_object_end();
+    iw.put_object_end();
+}
+
+/// Encode one scalar cell for `desc`/`value` into the exact
+/// `scalar_cell_size(desc)` bytes stored in a bucket (mirror of
+/// `decode_scalar`). Variable-length strings up to 8 chars are stored
+/// inline; longer ones need the (unsupported) string buckets.
+pub fn encode_scalar_cell(
+    big_endian: bool,
+    desc: &ColumnDesc,
+    value: &RecordValue,
+) -> Result<Vec<u8>, SsmError> {
+    use crate::aipsio::Writer;
+    fn wr(big_endian: bool) -> Writer {
+        if big_endian {
+            Writer::new()
+        } else {
+            Writer::new_le()
+        }
+    }
+    let mut w = wr(big_endian);
+    match desc.data_type {
+        DataType::Bool => {
+            let b = matches!(value, RecordValue::Bool(true))
+                || matches!(value, RecordValue::UChar(u) if *u != 0);
+            let mut cell = vec![0u8; scalar_cell_size(desc) as usize];
+            cell[0] = b as u8 & 1;
+            Ok(cell)
+        }
+        DataType::String if desc.max_length > 0 => {
+            let maxlen = desc.max_length as usize;
+            let mut cell = vec![0u8; maxlen];
+            let s = match value {
+                RecordValue::String(s) => s.as_bytes(),
+                _ => b"",
+            };
+            let n = s.len().min(maxlen);
+            cell[..n].copy_from_slice(&s[..n]);
+            Ok(cell)
+        }
+        DataType::String => {
+            let s = match value {
+                RecordValue::String(s) => s.as_bytes(),
+                _ => b"",
+            };
+            if s.len() > 8 {
+                return Err(SsmError::StringBucketUnsupported {
+                    bucket: 0,
+                    len: s.len() as i32,
+                });
+            }
+            let mut cell = vec![0u8; 12];
+            cell[..s.len()].copy_from_slice(s);
+            put_scalar_ints(&mut cell[8..12], s.len() as i32, big_endian);
+            Ok(cell)
+        }
+        _ => {
+            crate::record::write_scalar_value(&mut w, desc.data_type, value);
+            let cell = w.into_bytes();
+            let want = scalar_cell_size(desc) as usize;
+            debug_assert_eq!(cell.len(), want, "cell size for {:?}", desc.data_type);
+            let mut out = vec![0u8; want];
+            out[..cell.len().min(want)].copy_from_slice(&cell[..cell.len().min(want)]);
+            Ok(out)
+        }
+    }
+}
+
+fn put_scalar_ints(dst: &mut [u8], v: i32, big_endian: bool) {
+    if big_endian {
+        dst.copy_from_slice(&v.to_be_bytes());
+    } else {
+        dst.copy_from_slice(&v.to_le_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,12 +1,14 @@
-//! Minimal reader for casacore's AipsIO canonical byte format.
+//! Reader and writer for casacore's AipsIO canonical byte format.
 //!
 //! An AipsIO stream holds nested typed objects. The root object starts with
 //! the magic value `0xbebebebe`; every object (root included) is then laid
 //! out as `[u32 length][u32 type-length + type bytes][u32 version][payload]`
 //! where `length` counts every byte of the object after the magic, including
-//! the 4 bytes of the length field itself.
-//! All integers are big-endian; strings are a `u32` length followed by raw
-//! bytes. See `casacore/casa/IO/AipsIO.cc` (`putstart`/`putend`/`getstart`).
+//! the 4 bytes of the length field itself (the length is patched in when the
+//! object is closed). Multi-byte values are big-endian by default and
+//! little-endian for the StandardStMan data files; strings are a `u32`
+//! length followed by raw bytes. See `casacore/casa/IO/AipsIO.cc`
+//! (`putstart`/`putend`/`getstart`).
 
 use thiserror::Error;
 
@@ -225,6 +227,149 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Serializer for casacore's canonical AipsIO byte format.
+///
+/// Objects are opened with `put_object_start` and closed with
+/// `put_object_end`; the length field is patched in on close, mirroring
+/// `AipsIO::putstart`/`putend`. Root objects are additionally preceded by
+/// the magic value.
+#[derive(Debug)]
+pub struct Writer {
+    buf: Vec<u8>,
+    little_endian: bool,
+    /// Positions of open objects' length words, innermost last.
+    stack: Vec<usize>,
+}
+
+impl Writer {
+    pub fn new() -> Writer {
+        Writer {
+            buf: Vec::new(),
+            little_endian: false,
+            stack: Vec::new(),
+        }
+    }
+
+    /// A writer producing a little-endian stream (`LECanonicalIO`), used for
+    /// the StandardStMan data files on little-endian hosts.
+    pub fn new_le() -> Writer {
+        Writer {
+            buf: Vec::new(),
+            little_endian: true,
+            stack: Vec::new(),
+        }
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.buf
+    }
+
+    pub fn put_u8(&mut self, v: u8) {
+        self.buf.push(v);
+    }
+
+    pub fn put_u32(&mut self, v: u32) {
+        if self.little_endian {
+            self.buf.extend_from_slice(&v.to_le_bytes());
+        } else {
+            self.buf.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+
+    pub fn put_i32(&mut self, v: i32) {
+        self.put_u32(v as u32);
+    }
+
+    pub fn put_u64(&mut self, v: u64) {
+        if self.little_endian {
+            self.buf.extend_from_slice(&v.to_le_bytes());
+        } else {
+            self.buf.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+
+    pub fn put_i64(&mut self, v: i64) {
+        self.put_u64(v as u64);
+    }
+
+    pub fn put_i16(&mut self, v: i16) {
+        if self.little_endian {
+            self.buf.extend_from_slice(&v.to_le_bytes());
+        } else {
+            self.buf.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+
+    pub fn put_u16(&mut self, v: u16) {
+        if self.little_endian {
+            self.buf.extend_from_slice(&v.to_le_bytes());
+        } else {
+            self.buf.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+
+    pub fn put_f32(&mut self, v: f32) {
+        self.put_u32(v.to_bits());
+    }
+
+    pub fn put_f64(&mut self, v: f64) {
+        self.put_u64(v.to_bits());
+    }
+
+    /// AipsIO Bool: one byte with the value in bit 0.
+    pub fn put_bool(&mut self, v: bool) {
+        self.put_u8(v as u8);
+    }
+
+    /// AipsIO string: `u32` length + raw bytes (no NUL terminator).
+    pub fn put_string(&mut self, s: &str) {
+        self.put_u32(s.len() as u32);
+        self.buf.extend_from_slice(s.as_bytes());
+    }
+
+    /// An opaque data block: `u32` byte length + raw bytes
+    /// (`AipsIO::put` / `ByteIO` multi-byte write).
+    pub fn put_opaque(&mut self, bytes: &[u8]) {
+        self.put_u32(bytes.len() as u32);
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// Start a nested (unrooted) typed object.
+    pub fn put_object_start(&mut self, type_name: &str, version: u32) {
+        let start = self.buf.len();
+        self.buf.extend_from_slice(&[0; 4]); // length placeholder
+        self.put_string(type_name);
+        self.put_u32(version);
+        self.stack.push(start);
+    }
+
+    /// Start the stream's root object: magic, then the object itself.
+    pub fn put_root_object_start(&mut self, type_name: &str, version: u32) {
+        self.put_u32(MAGIC);
+        self.put_object_start(type_name, version);
+    }
+
+    /// Close the innermost open object, patching its length word.
+    pub fn put_object_end(&mut self) {
+        let start = self
+            .stack
+            .pop()
+            .expect("put_object_end without put_object_start");
+        let len = (self.buf.len() - start) as u32;
+        if self.little_endian {
+            self.buf[start..start + 4].copy_from_slice(&len.to_le_bytes());
+        } else {
+            self.buf[start..start + 4].copy_from_slice(&len.to_be_bytes());
+        }
+    }
+}
+
+impl Default for Writer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +432,62 @@ mod tests {
         let bytes = 0x0102030405060708u64.to_be_bytes();
         let mut r = Reader::new(&bytes);
         assert_eq!(r.read_u64().unwrap(), 0x0102030405060708);
+    }
+
+    #[test]
+    fn hexdump() {
+        let mut w = Writer::new();
+        w.put_root_object_start("Table", 2);
+        w.put_u32(1);
+        w.put_object_end();
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.read_object_start(true).unwrap().type_name, "Table");
+        assert_eq!(r.read_u32().unwrap(), 1);
+    }
+
+    #[test]
+    fn writes_nested_objects_with_checked_lengths() {
+        let mut w = Writer::new();
+        w.put_root_object_start("A", 1);
+        w.put_object_start("B", 2);
+        w.put_string("inner");
+        w.put_object_end();
+        w.put_object_end();
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        let root = r.read_object_start(true).unwrap();
+        assert_eq!((root.type_name.as_str(), root.version), ("A", 1));
+        assert_eq!(root.length as usize, bytes.len() - 4);
+        let nested = r.read_object_start(false).unwrap();
+        assert_eq!((nested.type_name.as_str(), nested.version), ("B", 2));
+        assert_eq!(r.read_string().unwrap(), "inner");
+    }
+
+    #[test]
+    fn writes_little_endian_streams() {
+        let mut w = Writer::new_le();
+        w.put_u32(0x01020304);
+        w.put_i16(-2);
+        w.put_bool(true);
+        let bytes = w.into_bytes();
+        let mut r = Reader::new_le(&bytes);
+        assert_eq!(r.read_u32().unwrap(), 0x01020304);
+        assert_eq!(r.read_i16().unwrap(), -2);
+        assert!(r.read_bool().unwrap());
+        // Same bytes also parse under the big-endian reader as the flipped
+        // values, confirming the endianness is actually applied.
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.read_u32().unwrap(), 0x04030201);
+    }
+
+    #[test]
+    fn writer_round_trips_opaque() {
+        let payload = b"\x00\x01\x02\x03";
+        let mut w = Writer::new();
+        w.put_opaque(payload);
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.read_opaque().unwrap(), payload);
     }
 }

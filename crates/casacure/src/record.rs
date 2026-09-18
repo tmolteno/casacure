@@ -465,6 +465,206 @@ fn read_array(r: &mut Reader<'_>, elem: DataType) -> Result<ArrayValue, RecordEr
     Ok(ArrayValue { shape, data })
 }
 
+/// Write a scalar value of the given (non-array) type, as produced by
+/// `read_scalar_value`. Used for column default values in
+/// `ScalarColumnDesc` and for record fields.
+pub fn write_scalar_value(w: &mut crate::aipsio::Writer, dt: DataType, value: &RecordValue) {
+    match dt {
+        DataType::Bool => match value {
+            RecordValue::Bool(b) => w.put_bool(*b),
+            RecordValue::UChar(u) => w.put_bool(*u != 0),
+            RecordValue::Int(i) => w.put_bool(*i != 0),
+            _ => w.put_bool(false),
+        },
+        DataType::Char | DataType::UChar => match value {
+            RecordValue::UChar(u) => w.put_u8(*u),
+            RecordValue::Bool(b) => w.put_u8(u8::from(*b)),
+            RecordValue::Int(i) => w.put_u8(*i as u8),
+            RecordValue::Short(i) => w.put_u8(*i as u8),
+            _ => w.put_u8(0),
+        },
+        DataType::Short => match value {
+            RecordValue::Short(i) => w.put_i16(*i),
+            RecordValue::Int(i) => w.put_i16(*i as i16),
+            RecordValue::UShort(u) => w.put_i16(*u as i16),
+            _ => w.put_i16(0),
+        },
+        DataType::UShort => match value {
+            RecordValue::UShort(u) => w.put_u16(*u),
+            RecordValue::Short(i) => w.put_u16(*i as u16),
+            RecordValue::UInt(u) => w.put_u16(*u as u16),
+            RecordValue::Int(i) => w.put_u16(*i as u16),
+            _ => w.put_u16(0),
+        },
+        DataType::Int => match value {
+            RecordValue::Int(i) => w.put_i32(*i),
+            RecordValue::Short(i) => w.put_i32(i32::from(*i)),
+            RecordValue::UShort(u) => w.put_i32(i32::from(*u)),
+            RecordValue::UChar(u) => w.put_i32(i32::from(*u)),
+            RecordValue::Bool(b) => w.put_i32(i32::from(*b)),
+            _ => w.put_i32(0),
+        },
+        DataType::UInt => match value {
+            RecordValue::UInt(u) => w.put_u32(*u),
+            RecordValue::Int(i) => w.put_u32(*i as u32),
+            _ => w.put_u32(0),
+        },
+        DataType::Int64 => match value {
+            RecordValue::Int(i) => w.put_i64(i64::from(*i)),
+            RecordValue::Int64(i) => w.put_i64(*i),
+            _ => w.put_i64(0),
+        },
+        DataType::Float => match value {
+            RecordValue::Float(f) => w.put_f32(*f),
+            RecordValue::Double(d) => w.put_f32(*d as f32),
+            _ => w.put_f32(0.0),
+        },
+        DataType::Double => match value {
+            RecordValue::Double(d) => w.put_f64(*d),
+            RecordValue::Float(f) => w.put_f64(*f as f64),
+            _ => w.put_f64(0.0),
+        },
+        DataType::Complex => match value {
+            RecordValue::Complex(re, im) => {
+                w.put_f32(*re);
+                w.put_f32(*im);
+            }
+            RecordValue::DComplex(re, im) => {
+                w.put_f32(*re as f32);
+                w.put_f32(*im as f32);
+            }
+            _ => {
+                w.put_f32(0.0);
+                w.put_f32(0.0);
+            }
+        },
+        DataType::DComplex => match value {
+            RecordValue::DComplex(re, im) => {
+                w.put_f64(*re);
+                w.put_f64(*im);
+            }
+            RecordValue::Complex(re, im) => {
+                w.put_f64(*re as f64);
+                w.put_f64(*im as f64);
+            }
+            _ => {
+                w.put_f64(0.0);
+                w.put_f64(0.0);
+            }
+        },
+        DataType::String => match value {
+            RecordValue::String(s) => w.put_string(s),
+            _ => w.put_string(""),
+        },
+        _ => {}
+    }
+}
+
+/// Serialize a `TableRecord` (`TableRecordRep::putRecord`).
+///
+/// Currently supports the field types this project writes: scalars, strings,
+/// and nested records. Array fields are rejected.
+pub(crate) fn write_table_record(
+    w: &mut crate::aipsio::Writer,
+    record: &TableRecord,
+) -> Result<(), RecordError> {
+    w.put_object_start("TableRecord", 1);
+    w.put_object_start("RecordDesc", 2);
+    w.put_i32(record.desc.fields.len() as i32);
+    for field in &record.desc.fields {
+        w.put_string(&field.name);
+        w.put_i32(data_type_code(field.data_type));
+        match field.data_type {
+            DataType::Record => {
+                let sub = field
+                    .sub_desc
+                    .as_ref()
+                    .ok_or(RecordError::LegacyKeywordSet("missing sub-desc".into()))?;
+                write_record_desc(w, sub)?;
+            }
+            DataType::Table => w.put_string(field.table_desc_name.as_deref().unwrap_or("")),
+            dt if dt.is_array() => write_iposition(w, field.shape.as_deref().unwrap_or(&[])),
+            _ => {}
+        }
+        w.put_string(&field.comment);
+    }
+    w.put_object_end(); // RecordDesc
+    w.put_i32(record.record_type);
+    for field in &record.desc.fields {
+        match field.data_type {
+            dt if dt.is_array() => {
+                return Err(RecordError::LegacyKeywordSet(format!(
+                    "array field {}",
+                    field.name
+                )));
+            }
+            DataType::Record => {
+                let Some(RecordValue::Record(sub)) = record.get(&field.name) else {
+                    return Err(RecordError::LegacyKeywordSet("missing record value".into()));
+                };
+                if sub.desc.fields.is_empty() {
+                    write_table_record(w, sub)?;
+                } else {
+                    write_record_data_values(w, sub)?;
+                }
+            }
+            _ => {
+                let value = record
+                    .get(&field.name)
+                    .ok_or_else(|| RecordError::LegacyKeywordSet("missing field value".into()))?;
+                write_scalar_value(w, field.data_type, value);
+            }
+        }
+    }
+    w.put_object_end(); // TableRecord
+    Ok(())
+}
+
+/// Write just the record-description object (for nested sub-records).
+fn write_record_desc(w: &mut crate::aipsio::Writer, desc: &RecordDesc) -> Result<(), RecordError> {
+    w.put_object_start("RecordDesc", 2);
+    w.put_i32(desc.fields.len() as i32);
+    for field in &desc.fields {
+        w.put_string(&field.name);
+        w.put_i32(data_type_code(field.data_type));
+        match field.data_type {
+            DataType::Record => {
+                write_record_desc(w, field.sub_desc.as_ref().unwrap())?;
+            }
+            DataType::Table => w.put_string(field.table_desc_name.as_deref().unwrap_or("")),
+            dt if dt.is_array() => write_iposition(w, field.shape.as_deref().unwrap_or(&[])),
+            _ => {}
+        }
+        w.put_string(&field.comment);
+    }
+    w.put_object_end();
+    Ok(())
+}
+
+/// Write bare field values of a nested record with a non-empty description.
+fn write_record_data_values(
+    w: &mut crate::aipsio::Writer,
+    record: &TableRecord,
+) -> Result<(), RecordError> {
+    for field in &record.desc.fields {
+        let value = record
+            .get(&field.name)
+            .ok_or_else(|| RecordError::LegacyKeywordSet("missing nested value".into()))?;
+        write_scalar_value(w, field.data_type, value);
+    }
+    Ok(())
+}
+
+/// Serialize an `IPosition` (framed `"IPosition"` v1).
+fn write_iposition(w: &mut crate::aipsio::Writer, dims: &[i64]) {
+    w.put_object_start("IPosition", 1);
+    w.put_u32(dims.len() as u32);
+    for d in dims {
+        w.put_i32(*d as i32);
+    }
+    w.put_object_end();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -55,6 +55,27 @@ subtasks are moved here.
   test verifies all 10 values of the casacore-written `typed.tab` read back
   exactly (bool, uchar, int16/int32/uint32, float, double, complex,
   dcomplex, inline "hello" string) from its little-endian `table.f0`.
+- Writing: `aipsio::Writer` serializes canonical AipsIO (big or little
+  endian) with length-patched framed objects; `record.rs` gained
+  `write_scalar_value` and `write_table_record` (empty + scalar/string
+  nested records), `tabledesc.rs` `write_table_desc`/`write_column_desc`
+  (scalar + array class names verified byte-exact against the casacore
+  fixture), `columnset.rs` `write_column_set` + `write_standard_stman`
+  (SSM spec blob), and `ssm.rs` the full data-file writer
+  (`write_standard_stman_file`: header, data buckets, SSMIndex stream,
+  index-bucket chain) with `encode_scalar_cell`.
+- `create_table(path, desc, values)` writes a complete scalar-column table
+  (`table.dat` + `table.f0`), packing columns into a bucket tile whose
+  offsets match casacore's `getFree`/`addColumn` best-fit layout exactly
+  (unit test reproduces the real fixture's offsets
+  `[0,4,36,100,228,356,484,740,996,1508]` and bucket size 1892).
+- `examples/create_sample_table.rs` writes a sample table for interop
+  checks. Byte-level write-interop proven: python-casacore reads the
+  casacure-written table — 3 rows (int/float/string) and 100 rows spanning
+  multiple buckets — returning exactly the written values.
+- 11 new writer unit tests (layout vs fixture, table.dat round-trip,
+  create→read-back of all 10 typed values, multi-bucket row distribution,
+  long-string rejection).
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit
   tests plus a manifest-driven fixture test asserting the header of the real

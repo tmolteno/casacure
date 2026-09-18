@@ -194,3 +194,120 @@ fn parse_column_desc(r: &mut Reader<'_>) -> Result<ColumnDesc, TableDescError> {
         kind,
     })
 }
+
+/// The 8-char data-type id used inside column-description class names
+/// (`ScaColDesc.h` `dataTypeId`), e.g. `"Int     "` for
+/// `"ScalarColumnDesc<Int     "`.
+pub fn data_type_id(dt: DataType) -> String {
+    use DataType::*;
+    let id = match dt {
+        Bool => "Bool",
+        Char => "uChar",
+        UChar => "uChar",
+        Short => "Short",
+        UShort => "uShort",
+        Int => "Int",
+        UInt => "uInt",
+        Int64 => "int64",
+        Float => "float",
+        Double => "double",
+        Complex => "Complex",
+        DComplex => "DComplex",
+        String => "String",
+        _ => "Other",
+    };
+    format!("{id:8}")
+}
+
+/// The class name written for a column description (`ColumnDesc::putFile`
+/// via `ScaColumnDesc`/`ArrayColumnDesc` `className`).
+fn column_class_name(desc: &ColumnDesc) -> String {
+    if matches!(desc.kind, ColumnKind::Array) {
+        format!("ArrayColumnDesc<{}", data_type_id(desc.data_type))
+    } else if desc.data_type == DataType::Record {
+        "ScalarRecordColumnDesc".to_string()
+    } else {
+        format!("ScalarColumnDesc<{}", data_type_id(desc.data_type))
+    }
+}
+
+/// Serialize a `ColumnDesc` (`ColumnDesc::putFile` +
+/// `BaseColumnDesc::putFile` + the subclass `putDesc`).
+pub(crate) fn write_column_desc(w: &mut crate::aipsio::Writer, desc: &ColumnDesc) {
+    use crate::record::write_scalar_value;
+    w.put_u32(1); // ColumnDesc class version
+    w.put_string(&column_class_name(desc));
+    // BaseColumnDesc::putFile
+    w.put_u32(1); // base class version
+    w.put_string(&desc.name);
+    w.put_string(&desc.comment);
+    w.put_string(&desc.data_manager_type);
+    w.put_string(&desc.data_manager_group);
+    w.put_i32(data_type_code(desc.data_type));
+    w.put_i32(desc.options);
+    w.put_i32(desc.ndim);
+    if !matches!(desc.kind, ColumnKind::Scalar(_) | ColumnKind::Record) {
+        w.put_object_start("IPosition", 1);
+        w.put_u32(desc.shape.as_ref().map_or(0, |s| s.len()) as u32);
+        for d in desc.shape.as_deref().unwrap_or(&[]) {
+            w.put_i32(*d as i32);
+        }
+        w.put_object_end();
+    }
+    w.put_i32(desc.max_length);
+    crate::record::write_table_record(w, &desc.keywords).expect("write column keyword record");
+    // Subclass putDesc.
+    match &desc.kind {
+        ColumnKind::Scalar(default) => {
+            w.put_u32(1); // ScalarColumnDesc class version
+            write_scalar_value(w, desc.data_type, default);
+        }
+        ColumnKind::Array => {
+            w.put_u32(1); // ArrayColumnDesc class version
+            w.put_bool(false); // no default array
+        }
+        ColumnKind::Record => {
+            w.put_u32(1);
+        }
+    }
+}
+
+fn data_type_code(dt: DataType) -> i32 {
+    use DataType::*;
+    match dt {
+        Bool => 0,
+        Char => 1,
+        UChar => 2,
+        Short => 3,
+        UShort => 4,
+        Int => 5,
+        UInt => 6,
+        Float => 7,
+        Double => 8,
+        Complex => 9,
+        DComplex => 10,
+        String => 11,
+        Table => 12,
+        Record => 25,
+        Int64 => 29,
+        ArrayInt64 => 30,
+        _ => 13,
+    }
+}
+
+/// Serialize a `TableDesc` as the nested `"TableDesc"` v2 object that
+/// follows the `"Table"` header in `table.dat`.
+pub fn write_table_desc(w: &mut crate::aipsio::Writer, desc: &TableDesc) {
+    w.put_object_start("TableDesc", 2);
+    w.put_string(&desc.name);
+    w.put_string(&desc.version);
+    w.put_string(&desc.comment);
+    crate::record::write_table_record(w, &desc.keywords).expect("write table keyword record");
+    crate::record::write_table_record(w, &desc.private_keywords)
+        .expect("write private keyword record");
+    w.put_u32(desc.columns.len() as u32);
+    for col in &desc.columns {
+        write_column_desc(w, col);
+    }
+    w.put_object_end();
+}
