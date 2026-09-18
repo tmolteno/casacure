@@ -26,6 +26,14 @@ pub enum AipsIoError {
     BadMagic { offset: usize, found: u32 },
     #[error("invalid string at offset {offset}: not valid UTF-8")]
     BadString { offset: usize },
+    #[error("unexpected object type at offset {offset}: expected {expected:?}, found {found:?}")]
+    UnexpectedType {
+        offset: usize,
+        expected: String,
+        found: String,
+    },
+    #[error("unsupported object version {0}")]
+    UnsupportedVersion(u32),
 }
 
 /// Header of a typed object in an AipsIO stream.
@@ -72,11 +80,46 @@ impl<'a> Reader<'a> {
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
+    pub fn read_i32(&mut self) -> Result<i32, AipsIoError> {
+        Ok(self.read_u32()? as i32)
+    }
+
     pub fn read_u64(&mut self) -> Result<u64, AipsIoError> {
         let b = self.take(8)?;
         Ok(u64::from_be_bytes([
             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
         ]))
+    }
+
+    pub fn read_i64(&mut self) -> Result<i64, AipsIoError> {
+        Ok(self.read_u64()? as i64)
+    }
+
+    pub fn read_u8(&mut self) -> Result<u8, AipsIoError> {
+        Ok(self.take(1)?[0])
+    }
+
+    pub fn read_i16(&mut self) -> Result<i16, AipsIoError> {
+        let b = self.take(2)?;
+        Ok(i16::from_be_bytes([b[0], b[1]]))
+    }
+
+    pub fn read_u16(&mut self) -> Result<u16, AipsIoError> {
+        Ok(self.read_i16()? as u16)
+    }
+
+    pub fn read_f32(&mut self) -> Result<f32, AipsIoError> {
+        Ok(f32::from_bits(self.read_u32()?))
+    }
+
+    pub fn read_f64(&mut self) -> Result<f64, AipsIoError> {
+        Ok(f64::from_bits(self.read_u64()?))
+    }
+
+    /// AipsIO Bool: one bit-packed byte; a scalar occupies a full byte with
+    /// the value in bit 0 (`TypeIO::write` via `Conversion::boolToBit`).
+    pub fn read_bool(&mut self) -> Result<bool, AipsIoError> {
+        Ok(self.read_u8()? & 1 != 0)
     }
 
     /// AipsIO string: `u32` length + raw bytes (no NUL terminator).
@@ -105,6 +148,40 @@ impl<'a> Reader<'a> {
             version,
             payload_offset: self.pos,
         })
+    }
+
+    /// Read a framed object of an expected type, returning its version and
+    /// payload. `root` objects are preceded by the magic value.
+    pub fn read_object(
+        &mut self,
+        root: bool,
+        expected: &str,
+    ) -> Result<(u32, ObjectStart), AipsIoError> {
+        let obj = self.read_object_start(root)?;
+        if obj.type_name != expected {
+            return Err(AipsIoError::UnexpectedType {
+                offset: obj.payload_offset,
+                expected: expected.to_string(),
+                found: obj.type_name,
+            });
+        }
+        Ok((obj.version, obj))
+    }
+
+    /// IPosition: framed `"IPosition"` object; v1 = `u32 nelem` + i32 dims,
+    /// v2 (huge dims) = i64 dims (`casacore/casa/IO/IPositionIO.cc`).
+    pub fn read_iposition(&mut self) -> Result<Vec<i64>, AipsIoError> {
+        let (version, _) = self.read_object(false, "IPosition")?;
+        let n = self.read_u32()? as usize;
+        let mut dims = Vec::with_capacity(n);
+        for _ in 0..n {
+            dims.push(match version {
+                1 => i64::from(self.read_i32()?),
+                2 => self.read_i64()?,
+                v => return Err(AipsIoError::UnsupportedVersion(v)),
+            });
+        }
+        Ok(dims)
     }
 }
 

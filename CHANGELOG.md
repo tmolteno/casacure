@@ -45,3 +45,14 @@ subtasks are moved here.
   tests plus a manifest-driven fixture test asserting the header of the real
   casacore-written `typed.tab` (nrows and host byte order now recorded in
   `tests/fixtures/manifest.json` by `tests/make_fixtures.py`).
+- `record` module: full recursive `TableRecord`/`RecordDesc` parsing —
+  all 31 `DataType` codes, scalar values, framed `"Array<...>"` v3 arrays
+  (incl. bit-packed Bool arrays), nested records (framed and bare),
+  `TpTable` references — 4 unit tests.
+- `tabledesc` module: `parse_table_desc` parses the `TableDesc` v2 object
+  (name/version/comment, public + private keyword records, ColumnDescSet)
+  and each `ColumnDesc` (name, comment, data manager type/group, dtype,
+  options, ndim, IPosition shape, keywords, scalar default value / array
+  flag). `parse_table_dat` parses a whole `table.dat`. Fixture test verifies
+  all 10 columns of the casacore-written `typed.tab` (names, value types,
+  StandardStMan data manager, scalar kind).

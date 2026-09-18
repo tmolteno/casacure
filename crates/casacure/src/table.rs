@@ -7,6 +7,7 @@
 //! canonical AipsIO), and a table-kind string (`"PlainTable"`).
 
 use crate::aipsio::{AipsIoError, Reader};
+use crate::tabledesc::{TableDesc, TableDescError};
 use thiserror::Error;
 
 /// Errors from parsing a `table.dat` header.
@@ -20,6 +21,17 @@ pub enum TableError {
     UnsupportedVersion(u32),
     #[error("invalid endianness flag {0} in table.dat (expected 0 or 1)")]
     BadEndianness(u32),
+}
+
+/// Errors from parsing a whole `table.dat` file.
+#[derive(Debug, Error)]
+pub enum TableDatError {
+    #[error(transparent)]
+    Header(#[from] TableError),
+    #[error(transparent)]
+    Desc(#[from] TableDescError),
+    #[error(transparent)]
+    AipsIo(#[from] AipsIoError),
 }
 
 /// The parsed `table.dat` header.
@@ -36,9 +48,30 @@ pub struct TableHeader {
     pub kind: String,
 }
 
+/// The parsed contents of a `table.dat` file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableDat {
+    pub header: TableHeader,
+    pub desc: TableDesc,
+}
+
+/// Parse a complete `table.dat` buffer: header plus table description.
+pub fn parse_table_dat(buf: &[u8]) -> Result<TableDat, TableDatError> {
+    let mut r = Reader::new(buf);
+    let header = read_table_header(&mut r)?;
+    let desc = crate::tabledesc::parse_table_desc(&mut r)?;
+    Ok(TableDat { header, desc })
+}
+
 /// Parse the header from the start of a `table.dat` buffer.
 pub fn parse_table_header(buf: &[u8]) -> Result<TableHeader, TableError> {
     let mut r = Reader::new(buf);
+    read_table_header(&mut r)
+}
+
+/// Parse the header from an AipsIO stream positioned at the start of the
+/// `Table` root object.
+pub(crate) fn read_table_header(r: &mut Reader<'_>) -> Result<TableHeader, TableError> {
     let obj = r.read_object_start(true)?;
     if obj.type_name != "Table" {
         return Err(TableError::NotATable {

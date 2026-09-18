@@ -148,3 +148,43 @@ fn fixture_table_dat_headers_parse() {
         assert_eq!(hdr.kind, "PlainTable", "{name}: wrong table kind");
     }
 }
+
+#[test]
+fn fixture_table_descs_parse() {
+    let Some(manifest) = load_manifest() else {
+        return;
+    };
+    let fixtures_dir = manifest_path().parent().unwrap().to_path_buf();
+    for (name, table) in &manifest.tables {
+        let buf = std::fs::read(fixtures_dir.join(&table.path).join("table.dat"))
+            .expect("cannot read table.dat");
+        let dat = casacure::parse_table_dat(&buf)
+            .unwrap_or_else(|e| panic!("{name}: table.dat failed to parse: {e}"));
+        assert_eq!(dat.header.nrow, table.nrows, "{name}: wrong row count");
+        assert_eq!(
+            dat.desc.columns.len(),
+            table.columns.len(),
+            "{name}: wrong column count"
+        );
+        for (col_name, col) in &table.columns {
+            let desc = dat
+                .desc
+                .column(col_name)
+                .unwrap_or_else(|| panic!("{name}.{col_name}: column not in descriptor"));
+            let expected = ValueType::from_casa_name(&col.value_type).unwrap();
+            assert_eq!(
+                desc.value_type(),
+                Some(expected),
+                "{name}.{col_name}: wrong value type"
+            );
+            assert_eq!(
+                desc.data_manager_type, "StandardStMan",
+                "{name}.{col_name}: wrong data manager"
+            );
+            assert!(
+                matches!(desc.kind, casacure::ColumnKind::Scalar(_)),
+                "{name}.{col_name}: expected scalar column"
+            );
+        }
+    }
+}
