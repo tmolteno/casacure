@@ -308,6 +308,17 @@ subtasks are moved here.
   in casacore; dask-ms's `test_dataset_multidim_string_column` passes
   (incl. `getcol` dicts with the row dim and per-row splitting of the
   `{"shape","array"}` write form).
+- `addcols` (§3/§7): `WritableTable::addcol` + binding `table.addcols(dict,
+  dminfo=...)` — dask-ms's `test_dataset_add_column` suite passes (8 passed +
+  2 xpassed), including array, string, boolean, int16/uint32 columns added to
+  an existing table and read back by casacore. Supporting fixes:
+  - **TiledColumnStMan Bool tiles** written (1 byte/element, matching the
+    tile reader) — previously rejected;
+  - **Bool scalar storage** confirmed as byte-per-row (a 100-row casacore
+    table reads aligned); the StandardStMan bucket layout was wrongly
+    bit-packing Bool (bits=1) which overflowed wide bool tables — fixed;
+  - **empty array cells** (null/offset-0 references casacore writes) read as
+    empty arrays instead of erroring — unblocked write-back of real MS files.
 - `table` module: `parse_table_header` parses the `table.dat` root object
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit

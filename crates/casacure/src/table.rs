@@ -428,11 +428,12 @@ fn build_ssm_data(
         let (size, bits) = match cd.kind {
             crate::tabledesc::ColumnKind::Scalar(_) => {
                 let size = crate::ssm::scalar_cell_size(cd);
-                let bits = if cd.data_type == crate::record::DataType::Bool {
-                    1
-                } else {
-                    8 * size
-                };
+                // One byte per row including Bool scalars: casacore's SSM
+                // stores scalar Bool cells as a byte (verified against a
+                // 100-row casacore table), unlike the bit-packed array
+                // index. The Bucket layout must reserve the same space the
+                // writer fills.
+                let bits = 8 * size;
                 (size, bits)
             }
             crate::tabledesc::ColumnKind::Array => {
@@ -684,7 +685,7 @@ fn build_tsm_data(
             )));
         };
         cells.push(
-            crate::ssm::encode_array_data(big_endian, &arr.data).map_err(|e| {
+            crate::tsm::tsm_encode_cell(big_endian, cd.data_type, &arr.data).map_err(|e| {
                 TableCreateError::Io(std::io::Error::other(format!(
                     "encode {}.{}: {e}",
                     desc.name, cd.name
@@ -1342,6 +1343,14 @@ impl WritableTable {
             self.putcell(col_idx, startrow + i as u64, v.clone())?;
         }
         Ok(())
+    }
+
+    /// Append a column (`Table::addcols`); existing rows default to the
+    /// column's default value at flush.
+    pub fn addcol(&mut self, cd: crate::tabledesc::ColumnDesc) {
+        let n = self.cells.first().map_or(0, Vec::len);
+        self.desc.columns.push(cd);
+        self.cells.push(vec![None; n]);
     }
 
     /// The number of rows in the in-memory cell store.

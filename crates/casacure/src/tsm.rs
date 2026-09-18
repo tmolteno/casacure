@@ -475,3 +475,26 @@ fn casaure_dtype_code(dt: DataType) -> i32 {
         _ => 12,
     }
 }
+
+/// One row's tile-payload bytes for a TiledColumnStMan cell: the same as the
+/// SSM array-data encoding, but Bool elements are stored one byte per element
+/// (TiledColumnStMan tiles do not bit-pack Bool — see the tile reader).
+pub fn tsm_encode_cell(
+    big_endian: bool,
+    data_type: DataType,
+    data: &crate::record::ArrayData,
+) -> Result<Vec<u8>, TsmError> {
+    use crate::record::ArrayData;
+    if data_type == DataType::Bool {
+        let ArrayData::Bool(v) = data else {
+            return Err(TsmError::UnsupportedType(data_type));
+        };
+        let mut out = Vec::with_capacity(v.len());
+        for b in v {
+            out.push(u8::from(*b));
+        }
+        return Ok(out);
+    }
+    crate::ssm::encode_array_data(big_endian, data)
+        .map_err(|_| TsmError::UnsupportedType(data_type))
+}

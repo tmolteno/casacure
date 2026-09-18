@@ -436,10 +436,11 @@ pub fn read_array_cell(
         i64::from_le_bytes(cell[0..8].try_into().unwrap())
     };
     if offset == 0 {
-        return Err(SsmError::EmptyArray {
-            row,
-            column: desc.name.clone(),
-        });
+        // casacore stores empty array cells as a null (offset 0) reference.
+        return Ok(RecordValue::Array(ArrayValue {
+            shape: Vec::new(),
+            data: crate::record::ArrayData::Double(Vec::new()),
+        }));
     }
     // Multidim string arrays are stored in the string buckets: the cell is
     // a 12-byte (bucket, offset, len) reference to the bucket content
@@ -1034,8 +1035,21 @@ pub fn write_standard_stman_file(
             let cell_size = col.cell_size as usize;
             let region_start = (start_row * cell_size as u64) as usize;
             let region_end = (end_row * cell_size as u64) as usize;
+            if region_end > col.bytes.len() {
+                panic!(
+                    "bucket column region {region_start}..{region_end} > col.bytes {} (cell_size {cell_size}, rows {n_rows}, this col {:?})",
+                    col.bytes.len(),
+                    cell_size
+                );
+            }
             let src = &col.bytes[region_start..region_end];
             let off = layout.column_offset[c] as usize;
+            if off + src.len() > bucket.len() {
+                panic!(
+                    "bucket copy off {off}+len {} (col {c}, cell_size {cell_size}, rows {n_rows}, bucket_size {}) > bucket {}",
+                    src.len(), bucket.len(), bucket.len()
+                );
+            }
             bucket[off..off + src.len()].copy_from_slice(src);
         }
         file.extend_from_slice(&bucket);

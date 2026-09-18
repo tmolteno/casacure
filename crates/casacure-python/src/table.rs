@@ -306,6 +306,37 @@ impl Table {
         Ok(out.into_any().unbind())
     }
 
+    /// `addcols(coldesc_dict, dminfo=None)` — append columns (each a
+    /// python-casacore column-desc dict) to the writable table.
+    #[pyo3(signature = (coldesc, dminfo = None))]
+    fn addcols(
+        &self,
+        py: Python<'_>,
+        coldesc: &Bound<'_, PyDict>,
+        dminfo: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let _ = dminfo;
+        let mut inner = self.inner.lock().unwrap();
+        match &mut *inner {
+            Inner::Write { wt, dirty, .. } => {
+                // Pull the desc's columns out (they live in a dict of
+                // {colname: coldesc}).
+                let json = {
+                    let rec = convert::dict_to_table_record(py, coldesc)?;
+                    rec.to_json_string()
+                };
+
+                let parsed = core::tabledesc::TableDesc::from_desc_json(&json).map_err(err)?;
+                for cd in parsed.columns {
+                    wt.addcol(cd);
+                }
+                *dirty = true;
+                Ok(())
+            }
+            _ => Err(PyValueError::new_err("table is not writable")),
+        }
+    }
+
     /// `addrows(n)`; grows the table by `n` empty rows.
     fn addrows(&self, n: u64) -> PyResult<()> {
         let mut inner = self.inner.lock().unwrap();
@@ -1004,6 +1035,14 @@ impl Table {
                 let readonly = arr.readonly();
                 return ndarray_cells(&readonly, nrow, RecordValue::UChar);
             }
+            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<i16>>() {
+                let readonly = arr.readonly();
+                return ndarray_cells(&readonly, nrow, RecordValue::Short);
+            }
+            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<u32>>() {
+                let readonly = arr.readonly();
+                return ndarray_cells(&readonly, nrow, RecordValue::UInt);
+            }
             if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<u16>>() {
                 let readonly = arr.readonly();
                 return ndarray_cells(&readonly, nrow, RecordValue::UShort);
@@ -1213,6 +1252,15 @@ fn array_data_of(elems: &[RecordValue]) -> core::record::ArrayData {
                 .iter()
                 .map(|v| match v {
                     RecordValue::UShort(d) => *d,
+                    _ => 0,
+                })
+                .collect(),
+        ),
+        Some(RecordValue::Short(_)) => AD::Short(
+            elems
+                .iter()
+                .map(|v| match v {
+                    RecordValue::Short(d) => *d,
                     _ => 0,
                 })
                 .collect(),
