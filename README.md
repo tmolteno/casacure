@@ -1,5 +1,10 @@
 # casacure and python-casacure
 
+[![Crates.io](https://img.shields.io/crates/v/casacure?style=flat-square&logo=rust&logoColor=white)](https://crates.io/crates/casacure)
+[![Crates.io downloads](https://img.shields.io/crates/d/casacure?style=flat-square&logo=rust&logoColor=white)](https://crates.io/crates/casacure)
+[![PyPI](https://img.shields.io/pypi/v/casacure?style=flat-square&logo=pypi&logoColor=white&label=PyPI)](https://pypi.org/project/casacure/)
+[![PyPI downloads](https://img.shields.io/pypi/dm/casacure?style=flat-square&logo=pypi&logoColor=white&label=PyPI%20downloads)](https://pypi.org/project/casacure/)
+
 This repository contains two user-facing packages that share one engine — a
 pure-Rust implementation of the CASA table system that reads and writes real
 casacore Measurement Sets and tables without needing the C++ casacore library:
