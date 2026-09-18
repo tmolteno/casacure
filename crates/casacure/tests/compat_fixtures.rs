@@ -26,10 +26,18 @@ struct TableFixture {
     path: String,
     nrows: u64,
     big_endian: bool,
+    #[serde(default)]
     columns: BTreeMap<String, ColumnFixture>,
     /// Optional per-column cell values (long-string / ISM tables).
     #[serde(default)]
     values: BTreeMap<String, Vec<serde_json::Value>>,
+    /// Subtable keywords (subs fixture): the resolved paths casacore exposes.
+    #[serde(default)]
+    sub_same: String,
+    #[serde(default)]
+    sub_nested: String,
+    #[serde(default)]
+    outside: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -791,4 +799,61 @@ fn fixture_metadata_and_keywords_match_casacore() {
         "getdesc keywords part: {desc}"
     );
     assert!(desc.contains(r#""_private_keywords_":{}"#));
+}
+
+/// Subtable keywords: `TpTable` keyword fields are exposed as
+/// `"Table: <resolved-path>"` strings (resolved against the parent table's
+/// location, matching dask-ms `CasaFormat.is_subtable` discovery).
+#[test]
+fn fixture_subtable_keywords_match_casacore() {
+    let Some(manifest) = load_manifest() else {
+        return;
+    };
+    let fixtures_dir = manifest_path().parent().unwrap().to_path_buf();
+    let subs = &manifest.tables["subs"];
+    let dir = fixtures_dir.join(&subs.path);
+    let t = casacure::Table::open(&dir, true).unwrap();
+
+    let expected = format!(
+        "{{\"SAME\":\"Table: {}\",\"NEST\":\"Table: {}\",\"OUTS\":\"Table: {}\",\"PLAIN\":99}}",
+        subs.sub_same, subs.sub_nested, subs.outside
+    );
+    assert_eq!(t.getkeywords(), expected);
+
+    // The stored values are relative (`./SUB.tab`, `./sub2/s2.tab`); an
+    // absolute "outside" path is kept. Verify against a moved copy: the
+    // read side must re-resolve dynamically.
+    let copied = tempdir();
+    let cp_dir = copied.join("P.tab");
+    std::fs::create_dir_all(copied.join("SUB.tab")).unwrap();
+    std::fs::create_dir_all(copied.join("sub2").join("S2.tab")).unwrap();
+    std::fs::create_dir_all(copied.join("OUTSIDE.tab")).unwrap();
+    copy_tree(&dir, &cp_dir);
+    let t = casacure::Table::open(&cp_dir, true).unwrap();
+    let moved_expected = format!(
+        "{{\"SAME\":\"Table: {}\",\"NEST\":\"Table: {}\",\"OUTS\":\"Table: {}\",\"PLAIN\":99}}",
+        copied.join("SUB.tab").display(),
+        copied.join("sub2").join("S2.tab").display(),
+        subs.outside, // absolute path unchanged
+    );
+    assert_eq!(t.getkeywords(), moved_expected);
+}
+
+fn tempdir() -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("casacure-fixture-subcopy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&p);
+    p
+}
+
+fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let target = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
 }

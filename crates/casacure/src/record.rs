@@ -552,8 +552,8 @@ pub fn write_scalar_value(w: &mut crate::aipsio::Writer, dt: DataType, value: &R
                 w.put_f64(0.0);
             }
         },
-        DataType::String => match value {
-            RecordValue::String(s) => w.put_string(s),
+        DataType::String | DataType::Table => match value {
+            RecordValue::String(s) | RecordValue::Table(s) => w.put_string(s),
             _ => w.put_string(""),
         },
         _ => {}
@@ -681,7 +681,8 @@ pub fn infer_data_type(value: &RecordValue) -> DataType {
         RecordValue::Double(_) => Double,
         RecordValue::Complex(_, _) => Complex,
         RecordValue::DComplex(_, _) => DComplex,
-        RecordValue::String(_) | RecordValue::Table(_) => String,
+        RecordValue::String(_) => String,
+        RecordValue::Table(_) => Table,
         RecordValue::Record(_) => Record,
         RecordValue::Array(a) => match &a.data {
             ArrayData::Bool(_) => ArrayBool,
@@ -753,6 +754,14 @@ impl RecordValue {
     /// The value as a JSON fragment (matching the dict values python-casacore
     /// returns: bools, integers, floats, strings, nested records, arrays).
     pub fn to_json_string(&self) -> String {
+        self.to_json_string_ctx(None)
+    }
+
+    /// Like `to_json_string`, but resolves subtable (`TpTable`) fields to the
+    /// `"Table: <path>"` string python-casacore returns, joining a relative
+    /// stored path against `base` (the directory containing the parent
+    /// table).
+    pub fn to_json_string_ctx(&self, base: Option<&std::path::Path>) -> String {
         match self {
             RecordValue::Bool(b) => b.to_string(),
             RecordValue::UChar(u) => u.to_string(),
@@ -770,8 +779,11 @@ impl RecordValue {
                 format!("[{}, {}]", format_float(*re), format_float(*im))
             }
             RecordValue::String(s) => json_string(s),
-            RecordValue::Table(name) => json_string(name),
-            RecordValue::Record(r) => r.to_json_string(),
+            RecordValue::Table(name) => match base {
+                Some(b) => json_string(&format!("Table: {}", resolve_subtable(name, b))),
+                None => json_string(name),
+            },
+            RecordValue::Record(r) => r.to_json_string_ctx(base),
             RecordValue::Array(a) => {
                 let mut s = String::from("{\"shape\":[");
                 for (i, d) in a.shape.iter().enumerate() {
@@ -794,6 +806,35 @@ impl RecordValue {
             }
         }
     }
+}
+
+/// Resolve a stored subtable name against the directory containing the
+/// parent table, lexically (no filesystem access, matching casacore's
+/// dynamic resolution).
+fn resolve_subtable(name: &str, base: &std::path::Path) -> String {
+    let path = std::path::Path::new(name);
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    lexical_normalize(&joined).display().to_string()
+}
+
+/// Strip `.` components and resolve `..` without touching the filesystem.
+pub fn lexical_normalize(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// The flat element JSON fragments of an `ArrayData`.
@@ -841,6 +882,13 @@ fn json_string(s: &str) -> String {
 impl TableRecord {
     /// The record as a JSON object `{"key": value, ...}` in field order.
     pub fn to_json_string(&self) -> String {
+        self.to_json_string_ctx(None)
+    }
+
+    /// Like `to_json_string`. With a `base` (the directory containing the
+    /// parent table), subtable `TpTable` fields are rendered as the
+    /// `"Table: <resolved-path>"` string python-casacore returns.
+    pub fn to_json_string_ctx(&self, base: Option<&std::path::Path>) -> String {
         let mut s = String::from("{");
         for (i, (field, value)) in self.desc.fields.iter().zip(self.values.iter()).enumerate() {
             if i > 0 {
@@ -848,7 +896,7 @@ impl TableRecord {
             }
             s.push_str(&json_string(&field.name));
             s.push(':');
-            s.push_str(&value.to_json_string());
+            s.push_str(&value.to_json_string_ctx(base));
         }
         s.push('}');
         s

@@ -39,7 +39,7 @@ Work areas follow `CASACORE_TO_CASA_RS.md` (tracked as GitHub issues).
 - [X] Table keywords: `putkeywords`/`removekeyword`
 - [X] Column keywords: `putcolkeyword`/`removecolkeyword`
 - [X] Public table-description dict API (`Table::getdesc`; replaces private `_getdesc`)
-- [ ] Subtable linkage via `"Table: <path>"` keywords
+- [X] Subtable linkage via `TpTable` keywords (read: `"Table: <resolved path>"` strings; write: `./relative` storage + byte-level `TpTable` fields; dask-ms `is_subtable` discovery verified)
 
 ## 5. TaQL subset
 

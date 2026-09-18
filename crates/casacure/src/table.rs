@@ -825,7 +825,10 @@ impl Table {
             }
         }
         s.push(',');
-        s.push_str(&kv("keywords", &cd.keywords.to_json_string()));
+        s.push_str(&kv(
+            "keywords",
+            &cd.keywords.to_json_string_ctx(self.path.parent()),
+        ));
         s.push('}');
         Some(s)
     }
@@ -844,9 +847,21 @@ impl Table {
             s.push_str(&self.getcoldesc(i).unwrap_or_default());
         }
         s.push_str(",\"_define_hypercolumn_\":{},\"_keywords_\":");
-        s.push_str(&self.dat.desc.keywords.to_json_string());
+        s.push_str(
+            &self
+                .dat
+                .desc
+                .keywords
+                .to_json_string_ctx(self.path.parent()),
+        );
         s.push_str(",\"_private_keywords_\":");
-        s.push_str(&self.dat.desc.private_keywords.to_json_string());
+        s.push_str(
+            &self
+                .dat
+                .desc
+                .private_keywords
+                .to_json_string_ctx(self.path.parent()),
+        );
         s.push('}');
         s
     }
@@ -854,7 +869,10 @@ impl Table {
     /// The table keyword record as a JSON object (python-casacore
     /// `table.getkeywords()`).
     pub fn getkeywords(&self) -> String {
-        self.dat.desc.keywords.to_json_string()
+        self.dat
+            .desc
+            .keywords
+            .to_json_string_ctx(self.path.parent())
     }
 
     /// A column's keyword record as a JSON object (python-casacore
@@ -864,7 +882,7 @@ impl Table {
             .desc
             .columns
             .get(col_idx)
-            .map(|c| c.keywords.to_json_string())
+            .map(|c| c.keywords.to_json_string_ctx(self.path.parent()))
     }
 }
 
@@ -1182,6 +1200,35 @@ pub struct WritableTable {
     cells: Vec<Vec<Option<RecordValue>>>,
 }
 
+/// Convert absolute `Table`-valued subtable references to the `./relative`
+/// form casacore stores (relative to the parent table's directory); absolute
+/// paths outside the parent's directory are kept. Recurses into nested
+/// records.
+fn relativize_subtables(value: RecordValue, base: Option<&std::path::Path>) -> RecordValue {
+    match value {
+        RecordValue::Table(name) => {
+            let path = std::path::Path::new(&name);
+            let relativized = match (path.is_absolute(), base) {
+                (true, Some(b)) => match path.strip_prefix(b) {
+                    Ok(rest) => format!("./{}", rest.display()),
+                    Err(_) => name,
+                },
+                _ => name,
+            };
+            RecordValue::Table(relativized)
+        }
+        RecordValue::Record(mut inner) => {
+            inner.values = inner
+                .values
+                .drain(..)
+                .map(|v| relativize_subtables(v, base))
+                .collect();
+            RecordValue::Record(inner)
+        }
+        other => other,
+    }
+}
+
 /// Errors from building a table incrementally.
 #[derive(Debug, Error)]
 pub enum WriteTableError {
@@ -1262,7 +1309,10 @@ impl WritableTable {
     pub fn setmaxcachesize(&mut self, _col_idx: usize, _size: usize) {}
 
     /// Set a table keyword (`putkeyword`); nested records are supported.
+    /// `Table` values (subtable references) are stored relative to the
+    /// parent table's directory with a `./` prefix, like casacore.
     pub fn putkeyword(&mut self, name: &str, value: RecordValue) {
+        let value = relativize_subtables(value, self.dir.parent());
         self.desc.keywords.set(name, value);
     }
 
@@ -1294,7 +1344,8 @@ impl WritableTable {
             .columns
             .get_mut(col_idx)
             .ok_or(WriteTableError::NoSuchColumn { name: cname })?;
-        col.keywords.set(name, value);
+        col.keywords
+            .set(name, relativize_subtables(value, self.dir.parent()));
         Ok(())
     }
 
@@ -2416,6 +2467,98 @@ mod tests {
         wt2.putkeyword("K", RecordValue::Int(1));
         wt2.removekeyword("K");
         assert_eq!(wt2.keywords_json(), "{}");
+    }
+
+    #[test]
+    fn subtable_keyword_write_round_trip() {
+        let base = temp_dir("subkw");
+
+        // A subtable in the same directory as the parent's directory.
+        let sub_dir = std::path::PathBuf::from(&base).join("SUB.tab");
+        let mut sub = WritableTable::create(&sub_dir, kw_desc());
+        sub.addrows(1);
+        sub.putcell(0, 0, RecordValue::Int(1)).unwrap();
+        sub.flush().unwrap();
+
+        // A subtable one level down.
+        let sub2_dir = std::path::PathBuf::from(&base)
+            .join("nested")
+            .join("S2.tab");
+        std::fs::create_dir_all(sub2_dir.parent().unwrap()).unwrap();
+        let mut sub2 = WritableTable::create(&sub2_dir, kw_desc());
+        sub2.addrows(1);
+        sub2.putcell(0, 0, RecordValue::Int(2)).unwrap();
+        sub2.flush().unwrap();
+
+        let parent_dir = std::path::PathBuf::from(&base).join("P.tab");
+        let mut wt = WritableTable::create(&parent_dir, kw_desc());
+        wt.addrows(1);
+        wt.putcell(0, 0, RecordValue::Int(0)).unwrap();
+        // Casacore-style subtable keyword: TpTable value relative to P's dir.
+        wt.putkeyword(
+            "SAME",
+            RecordValue::Table(sub_dir.to_string_lossy().into_owned()),
+        );
+        wt.putkeyword(
+            "SUB2",
+            RecordValue::Table(sub2_dir.to_string_lossy().into_owned()),
+        );
+        // A column keyword and a nested-record keyword containing a subtable.
+        wt.putcolkeyword(
+            0,
+            "SUBREF",
+            RecordValue::Table(sub_dir.to_string_lossy().into_owned()),
+        )
+        .unwrap();
+        let nested = {
+            let mut inner = crate::record::TableRecord {
+                desc: Default::default(),
+                record_type: 0,
+                values: Vec::new(),
+            };
+            inner.desc.fields.push(crate::record::RecordDescField {
+                name: "LINK".into(),
+                data_type: crate::record::DataType::Table,
+                sub_desc: None,
+                shape: None,
+                table_desc_name: None,
+                comment: String::new(),
+            });
+            // A nested TpTable reference; putkeyword's relativization recurses
+            // into nested records.
+            inner
+                .values
+                .push(RecordValue::Table(sub_dir.to_string_lossy().into_owned()));
+            inner
+        };
+        let mut nest = crate::record::TableRecord {
+            desc: Default::default(),
+            record_type: 0,
+            values: Vec::new(),
+        };
+        nest.desc.fields.push(crate::record::RecordDescField {
+            name: "HH".into(),
+            data_type: crate::record::DataType::Record,
+            sub_desc: Some(nested.desc.clone()),
+            shape: None,
+            table_desc_name: None,
+            comment: String::new(),
+        });
+        nest.values.push(RecordValue::Record(nested));
+        wt.putkeyword("NEST", RecordValue::Record(nest));
+        let dir = wt.flush().unwrap();
+
+        let t = Table::open(&dir, true).unwrap();
+        let sub_abs = sub_dir.canonicalize().unwrap().display().to_string();
+        let sub2_abs = sub2_dir.canonicalize().unwrap().display().to_string();
+        let expected = format!(
+            "{{\"SAME\":\"Table: {sub_abs}\",\"SUB2\":\"Table: {sub2_abs}\",\"NEST\":{{\"HH\":{{\"LINK\":\"Table: {sub_abs}\"}}}}}}"
+        );
+        assert_eq!(t.getkeywords(), expected);
+        assert_eq!(
+            t.getcolkeywords(0).unwrap(),
+            format!("{{\"SUBREF\":\"Table: {sub_abs}\"}}")
+        );
     }
 
     #[test]

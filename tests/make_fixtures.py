@@ -13,6 +13,7 @@ read interop once §1 (on-disk format) is implemented.
 
 import json
 import shutil
+import shutil
 import sys
 from pathlib import Path
 
@@ -251,6 +252,55 @@ def make_keyword_table(fixtures: Path) -> dict:
         }
 
 
+def make_subtable_tree(fixtures: Path) -> dict:
+    """A parent table with subtable keywords in the same dir, a subdir, and
+    outside the parent dir; the resolved keyword view is the read side's
+    ground truth (python-casacore exposes `"Table: <abs path>"` strings)."""
+    root = fixtures / "subs"
+    if root.exists():
+        shutil.rmtree(root)
+    parent = root / "P.tab"
+    sub_same = root / "SUB.tab"
+    sub_nested = root / "sub2" / "S2.tab"
+    outside = fixtures / "outside.tab"
+
+    def mk(path: Path, ival: int) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        td = ct.maketabdesc([ct.makescacoldesc("ID", 0)])
+        with ct.table(str(path), td, nrow=1, ack=False) as t:
+            t.putcol("ID", [ival])
+
+    mk(sub_same, 1)
+    mk(sub_nested, 2)
+    mk(outside, 3)
+
+    with ct.table(str(parent), ct.maketabdesc([ct.makescacoldesc("X", 0)]),
+                  nrow=1, ack=False) as t:
+        t.putcol("X", [7])
+        t.putkeyword("SAME", ct.table(str(sub_same), ack=False))
+        t.putkeyword("NEST", ct.table(str(sub_nested), ack=False))
+        t.putkeyword("OUTS", ct.table(str(outside), ack=False))
+        t.putkeyword("PLAIN", 99)
+
+    kw = ct.table(str(parent), ack=False).getkeywords()
+    return {
+        "path": parent.relative_to(fixtures).as_posix(),
+        "nrows": 1,
+        "big_endian": sys.byteorder == "big",
+        "keywords": {k: v for k, v in kw.items()},
+        "columns": {
+            "X": {
+                "value_type": "int",
+                "getcol_dtype": "<i4",
+                "shape": None,
+            }
+        },
+        "sub_same": str(sub_same),
+        "sub_nested": str(sub_nested),
+        "outside": str(outside),
+    }
+
+
 def main() -> None:
     if FIXTURES.exists():
         shutil.rmtree(FIXTURES)
@@ -266,6 +316,7 @@ def main() -> None:
             "ism": make_ism_table(FIXTURES),
             "tsm": make_tsm_table(FIXTURES),
             "kw": make_keyword_table(FIXTURES),
+            "subs": make_subtable_tree(FIXTURES),
         },
     }
     (FIXTURES / "manifest.json").write_text(json.dumps(manifest, indent=2))
