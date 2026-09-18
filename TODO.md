@@ -5,20 +5,6 @@ starting them; remove each when completed and log it in `CHANGELOG.md`.
 
 Work areas follow `CASACORE_TO_CASA_RS.md` (tracked as GitHub issues).
 
-## Project scaffolding (in progress)
-
-- [ ] Add casacore as a git submodule (track master, never modify)
-- [ ] Create Rust workspace: `casacure` core crate + `casacure-python` bindings crate
-- [ ] Set up maturin/`pyproject.toml` so the bindings are pip installable
-- [ ] Implement the CASA type system module (`ValueType` enum + numpy mapping) with unit tests
-- [ ] Set up the casacore comparison test framework (python-casacore vs casacure round-trips)
-- [ ] Create `ARE_WE_CURED.md` progress tracker
-- [ ] Create GitHub issues for each major functionality area
-- [ ] Move the casacore comparison framework into the Rust core: fixture
-      generator script + manifest-driven `cargo test -p casacure` integration
-      tests (no pyo3 rebuild needed)
-- [ ] CI: GitHub Actions workflow running `cargo test` (and comparison tests where possible)
-
 ## 1. CASA table on-disk format (core prerequisite)
 
 - [ ] Parse `table.dat` header (magic, version, endianness)

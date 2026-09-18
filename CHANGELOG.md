@@ -24,3 +24,16 @@ subtasks are moved here.
   `getcolnp` unsupported for uchar/short/uint, 1-D strings as Python lists,
   TaQL boolean code `B`.
 - `TODO.md` subtask tracker and `ARE_WE_CURED.md` progress document.
+- Rust-side comparison tests (`crates/casacure/tests/compat_fixtures.rs`):
+  `tests/make_fixtures.py` writes real casacore tables plus `manifest.json`
+  into `tests/fixtures/` (gitignored), and manifest-driven
+  `cargo test -p casacure` integration tests verify `ValueType` parsing and
+  the observed `getcol` dtypes (including the uchar→uint16 promotion quirk)
+  without needing the pyo3 bindings — 3 tests.
+- GitHub issues #1–#7 for each major functionality area (§1 on-disk format,
+  §2 lifecycle/locking, §3 column access, §5 metadata, §6 TaQL, §7 MS schema,
+  dask-ms integration).
+- CI: GitHub Actions workflow (`.github/workflows/ci.yml`) — generates the
+  casacore fixtures, runs `cargo test --workspace`, `cargo fmt --check`,
+  `cargo clippy -D warnings`, builds the bindings with `pip install .`, and
+  runs the pytest comparison suite.

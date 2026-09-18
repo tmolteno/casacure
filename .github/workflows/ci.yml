@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install python-casacore pytest maturin
+
+      - name: Generate casacore fixture tables
+        run: python tests/make_fixtures.py
+
+      - name: Rust tests
+        run: cargo test --workspace
+
+      - name: Rust lints
+        run: |
+          cargo fmt --check
+          cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build and install Python bindings
+        run: pip install .
+
+      - name: casacore comparison tests
+        run: pytest tests/

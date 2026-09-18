@@ -9,7 +9,7 @@ Work areas are tracked as GitHub issues; subtasks live in `TODO.md`.
 
 | Suite | Command | Passing | Coverage |
 |---|---|---|---|
-| Rust unit tests | `cargo test` | 7/7 | type system only |
+| Rust unit + fixture tests | `cargo test` | 10/10 | type system, fixture manifest |
 | casacore comparison tests | `.venv/bin/python -m pytest tests/` | 5/5 | type system only |
 
 ## Progress by area (per CASACORE_TO_CASA_RS.md)
