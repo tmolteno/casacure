@@ -9,7 +9,8 @@
 #   * Environment: pypi                    (this workflow's environment)
 #
 # After that, every `v*` tag push (or manual dispatch) builds wheels for all
-# supported platforms/ABIs and uploads them to the `casacure` project.
+# supported platforms and CPython versions (3.9 through 3.14) and uploads
+# them to the `casacure` project.
 name: Publish Python package
 
 on:
@@ -21,11 +22,16 @@ permissions:
   contents: read
 
 jobs:
-  # Cross-compile a wheel per platform. On Linux the manylinux image bundles
-  # every supported CPython (3.9+), so --find-interpreter covers all ABIs
-  # there; the sdist is produced exactly once (the x86_64 Linux job).
+  # Cross-compile a wheel per platform/ABI.
+  #
+  # Linux: the manylinux image bundles every supported CPython (3.9-3.14), so
+  # `--find-interpreter` covers all ABIs in one job per target; the sdist is
+  # produced exactly once (the x86_64 Linux job).
+  #
+  # macOS / Windows: one job per CPython version (3.10-3.14; 3.9 is provided
+  # on Linux via manylinux).
   build:
-    name: Build wheels (${{ matrix.target }})
+    name: Build wheels (${{ matrix.target }} ${{ matrix.python || 'manylinux' }})
     strategy:
       fail-fast: false
       matrix:
@@ -40,19 +46,57 @@ jobs:
             sdist: false
           - platform: macos-13
             target: x86_64-apple-darwin
-            sdist: false
+            python: "3.10"
+          - platform: macos-13
+            target: x86_64-apple-darwin
+            python: "3.11"
+          - platform: macos-13
+            target: x86_64-apple-darwin
+            python: "3.12"
+          - platform: macos-13
+            target: x86_64-apple-darwin
+            python: "3.13"
+          - platform: macos-13
+            target: x86_64-apple-darwin
+            python: "3.14"
           - platform: macos-14
             target: aarch64-apple-darwin
-            sdist: false
+            python: "3.10"
+          - platform: macos-14
+            target: aarch64-apple-darwin
+            python: "3.11"
+          - platform: macos-14
+            target: aarch64-apple-darwin
+            python: "3.12"
+          - platform: macos-14
+            target: aarch64-apple-darwin
+            python: "3.13"
+          - platform: macos-14
+            target: aarch64-apple-darwin
+            python: "3.14"
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
-            sdist: false
+            python: "3.10"
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            python: "3.11"
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            python: "3.12"
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            python: "3.13"
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            python: "3.14"
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          # Linux uses the full interpreter set inside the manylinux image;
+          # macOS/Windows select one per matrix entry.
+          python-version: ${{ matrix.python || '3.12' }}
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
@@ -63,7 +107,7 @@ jobs:
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: dist-${{ matrix.target }}
+          name: dist-${{ matrix.target }}-${{ matrix.python || 'ml' }}
           path: dist
           if-no-files-found: error
 

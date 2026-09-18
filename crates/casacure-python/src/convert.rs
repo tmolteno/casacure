@@ -141,7 +141,7 @@ pub(crate) fn fill_buffer_by_dtype(
 ) -> PyResult<()> {
     macro_rules! fill_num {
         ($ty:ty, $f:expr, $s:expr) => {{
-            if let Ok(arr) = buf.downcast::<numpy::PyArrayDyn<$ty>>() {
+            if let Ok(arr) = buf.cast::<numpy::PyArrayDyn<$ty>>() {
                 let mut b = arr.readwrite();
                 let s = b
                     .as_slice_mut()
@@ -666,10 +666,10 @@ pub(crate) fn pyobject_to_record(py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResu
     if v.is_none() {
         return Ok(RecordValue::String(String::new()));
     }
-    if v.downcast::<PyBool>().is_ok() {
+    if v.cast::<PyBool>().is_ok() {
         return Ok(RecordValue::Bool(v.is_truthy()?));
     }
-    if let Ok(s) = v.downcast::<PyString>() {
+    if let Ok(s) = v.cast::<PyString>() {
         return Ok(RecordValue::String(s.to_str()?.to_string()));
     }
     // Integers (python ints and numpy integer scalars, which expose
@@ -680,19 +680,19 @@ pub(crate) fn pyobject_to_record(py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResu
         }
         return Ok(RecordValue::Int64(n as i64));
     }
-    if let Ok(f) = v.downcast::<PyFloat>() {
+    if let Ok(f) = v.cast::<PyFloat>() {
         return Ok(RecordValue::Double(f.value()));
     }
     // numpy floating scalars (expose `__float__`).
     if let Ok(f) = v.extract::<f64>() {
         return Ok(RecordValue::Double(f));
     }
-    if let Ok(d) = v.downcast::<PyDict>() {
+    if let Ok(d) = v.cast::<PyDict>() {
         // The `{"shape": [..], "array": [..]}` multidim-string dict form:
         // only when the array is actually strings.
         if d.contains("shape")? && d.contains("array")? {
             let is_strings = match d.get_item("array")? {
-                Some(a) => match a.downcast::<PyList>() {
+                Some(a) => match a.cast::<PyList>() {
                     Ok(list) => match list.iter().next() {
                         None => true,
                         Some(e) => {
@@ -712,15 +712,15 @@ pub(crate) fn pyobject_to_record(py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResu
         }
         return Ok(RecordValue::Record(dict_to_table_record(py, d)?));
     }
-    if let Ok(list) = v.downcast::<PyList>() {
+    if let Ok(list) = v.cast::<PyList>() {
         return list_to_array(py, list);
     }
-    if let Ok(tup) = v.downcast::<PyTuple>() {
+    if let Ok(tup) = v.cast::<PyTuple>() {
         let list = PyList::new(py, tup.iter())?;
         return list_to_array(py, &list);
     }
     // numpy arrays (numeric or object).
-    if let Ok(arr) = v.downcast::<numpy::PyArrayDyn<f64>>() {
+    if let Ok(arr) = v.cast::<numpy::PyArrayDyn<f64>>() {
         let readonly = arr.readonly();
         let shape: Vec<u32> = readonly
             .as_array()
@@ -735,7 +735,7 @@ pub(crate) fn pyobject_to_record(py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResu
             data: ArrayData::Double(data),
         }));
     }
-    if let Ok(arr) = v.downcast::<numpy::PyArrayDyn<Py<PyAny>>>() {
+    if let Ok(arr) = v.cast::<numpy::PyArrayDyn<Py<PyAny>>>() {
         let readonly = arr.readonly();
         let shape: Vec<u32> = readonly
             .as_array()
@@ -827,7 +827,7 @@ fn list_to_array(py: Python<'_>, list: &Bound<'_, PyList>) -> PyResult<RecordVal
 
 /// A `{"shape", "array"}` string dict to a string `ArrayValue`.
 pub(crate) fn py_to_string_array(py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<RecordValue> {
-    if let Ok(d) = v.downcast::<PyDict>() {
+    if let Ok(d) = v.cast::<PyDict>() {
         let shape: Vec<u32> = d
             .get_item("shape")?
             .ok_or_else(|| PyValueError::new_err("missing 'shape'"))?
@@ -841,7 +841,7 @@ pub(crate) fn py_to_string_array(py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResu
             data: ArrayData::String(array),
         }));
     }
-    if let Ok(arr) = v.downcast::<numpy::PyArrayDyn<Py<PyAny>>>() {
+    if let Ok(arr) = v.cast::<numpy::PyArrayDyn<Py<PyAny>>>() {
         let readonly = arr.readonly();
         let shape: Vec<u32> = readonly
             .as_array()
@@ -925,7 +925,7 @@ pub(crate) fn unflatten(idx: usize, shape: &[usize]) -> Vec<usize> {
 pub(crate) fn numpy_to_record_flat(value: &Bound<'_, PyAny>) -> Option<PyResult<Vec<RecordValue>>> {
     macro_rules! try_num {
         ($ty:ty, $f:expr) => {{
-            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<$ty>>() {
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<$ty>>() {
                 let readonly = arr.readonly();
                 let mut out = Vec::with_capacity(readonly.as_array().len());
                 for e in readonly.as_array().iter() {

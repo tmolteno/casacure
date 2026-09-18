@@ -695,9 +695,9 @@ impl Table {
         let startrow = startrow.max(0) as u64;
         // Multidim-string dict form: `{"shape": [nrow, *cell], "array": [...]}`
         // (dask-ms's multidim string writes) — split into per-row cells.
-        if value.downcast::<PyDict>().is_ok()
-            && value.downcast::<PyDict>().unwrap().contains("shape")?
-            && value.downcast::<PyDict>().unwrap().contains("array")?
+        if value.cast::<PyDict>().is_ok()
+            && value.cast::<PyDict>().unwrap().contains("shape")?
+            && value.cast::<PyDict>().unwrap().contains("array")?
         {
             use casacure::record::ArrayData;
             let av = match convert::pyobject_to_record(py, value)? {
@@ -731,9 +731,9 @@ impl Table {
         }
         // Dict form: `{"rN": value, ...}` — per-row scalar/array writes
         // (dask-ms writes scalar varcols this way).
-        if value.downcast::<PyDict>().is_ok() {
+        if value.cast::<PyDict>().is_ok() {
             let mut rows: Vec<(u64, Bound<'_, PyAny>)> = Vec::new();
-            for (k, v) in value.downcast::<PyDict>().unwrap().iter() {
+            for (k, v) in value.cast::<PyDict>().unwrap().iter() {
                 let s = k.extract::<String>()?;
                 if let Some(n) = s.strip_prefix('r') {
                     let idx: u64 = n
@@ -1178,8 +1178,8 @@ impl Table {
                 // Any ndarray (typed ndarrays don't all downcast to the
                 // `PyArrayDyn<PyAny>` form, e.g. complex64).
                 if value.getattr("dtype").is_ok()
-                    && value.downcast::<PyList>().is_err()
-                    && value.downcast::<PyDict>().is_err()
+                    && value.cast::<PyList>().is_err()
+                    && value.cast::<PyDict>().is_err()
                 {
                     let dtype = value.getattr("dtype")?;
                     let kind: String = dtype.getattr("kind")?.extract()?;
@@ -1197,26 +1197,26 @@ impl Table {
         };
         if is_array_col {
             // Accept a 2-D+ ndarray or a list of row-arrays.
-            if value.downcast::<PyDict>().is_ok() {
+            if value.cast::<PyDict>().is_ok() {
                 let rec = convert::py_to_string_array(py, value)?;
                 return Ok(vec![rec]);
             }
             // Complex arrays (the coercion above has already matched the
             // array to the column precision); numpy 0.26 names: Complex32 =
             // c64 (float32 complex), Complex64 = c128 (float64 complex).
-            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<numpy::Complex32>>() {
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<numpy::Complex32>>() {
                 let readonly = arr.readonly();
                 return ndarray_cells(&readonly, nrow, varcol, |e| {
                     RecordValue::Complex(e.re, e.im)
                 });
             }
-            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<numpy::Complex64>>() {
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<numpy::Complex64>>() {
                 let readonly = arr.readonly();
                 return ndarray_cells(&readonly, nrow, varcol, |e| {
                     RecordValue::DComplex(e.re, e.im)
                 });
             }
-            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<Py<PyAny>>>() {
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<Py<PyAny>>>() {
                 let readonly = arr.readonly();
                 let shape: Vec<usize> = readonly.as_array().shape().to_vec();
                 let cell = reshape_cell(&shape);
@@ -1240,49 +1240,49 @@ impl Table {
                 let _ = key;
             }
             // Numeric ndarray.
-            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<f64>>() {
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<f64>>() {
                 let readonly = arr.readonly();
                 return ndarray_cells(&readonly, nrow, varcol, RecordValue::Double);
             }
-            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<f32>>() {
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<f32>>() {
                 let readonly = arr.readonly();
                 return ndarray_cells(&readonly, nrow, varcol, RecordValue::Float);
             }
-            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<u8>>() {
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<u8>>() {
                 let readonly = arr.readonly();
                 return ndarray_cells(&readonly, nrow, varcol, RecordValue::UChar);
             }
-            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<i16>>() {
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<i16>>() {
                 let readonly = arr.readonly();
                 return ndarray_cells(&readonly, nrow, varcol, RecordValue::Short);
             }
-            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<u32>>() {
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<u32>>() {
                 let readonly = arr.readonly();
                 return ndarray_cells(&readonly, nrow, varcol, RecordValue::UInt);
             }
-            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<u16>>() {
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<u16>>() {
                 let readonly = arr.readonly();
                 return ndarray_cells(&readonly, nrow, varcol, RecordValue::UShort);
             }
-            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<i64>>() {
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<i64>>() {
                 let readonly = arr.readonly();
                 return ndarray_cells(&readonly, nrow, varcol, RecordValue::Int64);
             }
-            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<i32>>() {
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<i32>>() {
                 let readonly = arr.readonly();
                 return ndarray_cells(&readonly, nrow, varcol, RecordValue::Int);
             }
-            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<bool>>() {
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<bool>>() {
                 let readonly = arr.readonly();
                 return ndarray_cells(&readonly, nrow, varcol, RecordValue::Bool);
             }
-            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<Complex32>>() {
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<Complex32>>() {
                 let readonly = arr.readonly();
                 return ndarray_cells(&readonly, nrow, varcol, |e| {
                     RecordValue::Complex(e.re, e.im)
                 });
             }
-            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<Complex64>>() {
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<Complex64>>() {
                 let readonly = arr.readonly();
                 return ndarray_cells(&readonly, nrow, varcol, |e| {
                     RecordValue::DComplex(e.re, e.im)
@@ -1294,14 +1294,14 @@ impl Table {
             )));
         }
         // Scalar column: 1-D array (or list) of scalars.
-        if let Ok(list) = value.downcast::<PyList>() {
+        if let Ok(list) = value.cast::<PyList>() {
             let mut out = Vec::with_capacity(list.len());
             for item in list.iter() {
                 out.push(convert::pyobject_to_record(py, &item)?);
             }
             return Ok(out);
         }
-        if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<Py<PyAny>>>() {
+        if let Ok(arr) = value.cast::<numpy::PyArrayDyn<Py<PyAny>>>() {
             let readonly = arr.readonly();
             let mut out = Vec::with_capacity(readonly.as_array().len());
             for e in readonly.as_array().iter() {
@@ -1311,7 +1311,7 @@ impl Table {
         }
         macro_rules! scalar_num {
             ($ty:ty, $f:expr) => {{
-                if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<$ty>>() {
+                if let Ok(arr) = value.cast::<numpy::PyArrayDyn<$ty>>() {
                     let readonly = arr.readonly();
                     let mut out = Vec::with_capacity(readonly.as_array().len());
                     for e in readonly.as_array().iter() {
@@ -1611,7 +1611,7 @@ pub fn table(
 ) -> PyResult<Table> {
     let desc_json = match tabledesc {
         Some(d) if !d.is_none() => {
-            if let Ok(dict) = d.downcast::<PyDict>() {
+            if let Ok(dict) = d.cast::<PyDict>() {
                 let rec = convert::dict_to_table_record(py, dict)?;
                 Some(rec.to_json_string())
             } else {

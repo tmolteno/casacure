@@ -388,6 +388,17 @@ subtasks are moved here.
   bumps TIME, writes back; real python-casacore re-opens the result and reads
   back the exact modified values with all 22 main-table columns intact.
 
+- **Python 3.14 support** (pyo3 0.27.2 + numpy 0.27):
+  - the extension builds and imports on Python 3.14.7; the full dask-ms 0.2.32
+    suite passes 219/219 on 3.14 (direct backend, no shim) as well as 3.13;
+  - `downcast` -> `Bound::cast` across the bindings (downcast is deprecated in
+    pyo3 0.27), zero build warnings;
+  - `requires-python` widened to `>=3.9,<3.15` with the 3.14 classifier;
+  - publish workflow: macOS/Windows now build one wheel per CPython version
+    (3.10-3.14) and Linux manylinux covers 3.9-3.14; verified a
+    `casacure-0.1.0-cp314-cp314-manylinux_2_34_x86_64.whl` installs and
+    round-trips a table.
+
 - `table` module: `parse_table_header` parses the `table.dat` root object
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit

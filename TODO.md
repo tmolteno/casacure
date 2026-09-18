@@ -66,3 +66,5 @@ to `casacure.tables`, and the full dask-ms 0.2.32 suite passes 219/219 with
 selection patch to dask-ms upstream (real python-casacore, when installed,
 still wins by default).
 - [ ] Register as a store type in `fsspec_store.py`/`dask_ms.py` dispatch (upstream, later)
+
+Python 3.14: supported (pyo3 0.27 / numpy 0.27; full dask-ms suite green on 3.14; requires-python >=3.9,<3.15).

@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "casacure"
 description = "A Rust replacement for the casacore table system, pip installable on any machine"
 readme = "README.md"
-requires-python = ">=3.9,<3.14"
+requires-python = ">=3.9,<3.15"
 license = "LGPL-3.0-or-later"
 license-files = ["LICENSE*", "COPYING*", "NOTICE*"]
 authors = [{ name = "Tim Molteno", email = "tim@molteno.net" }]
@@ -35,6 +35,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Astronomy",

@@ -12,5 +12,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 casacure = { path = "../casacure" }
-pyo3 = { version = "0.26", features = ["extension-module"] }
-numpy = "0.26"
+pyo3 = { version = "0.27", features = ["extension-module"] }
+numpy = "0.27"

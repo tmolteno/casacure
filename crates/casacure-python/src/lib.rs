@@ -47,7 +47,7 @@ fn default_ms(
     let _ = dminfo;
     let extra = match tabdesc {
         Some(d) if !d.is_none() => {
-            if let Ok(dict) = d.downcast::<PyDict>() {
+            if let Ok(dict) = d.cast::<PyDict>() {
                 let rec = convert::dict_to_table_record(py, dict)?;
                 Some(rec.to_json_string())
             } else {
