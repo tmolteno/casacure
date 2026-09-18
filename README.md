@@ -18,4 +18,17 @@ Initially casacore will be a submodule, that we keep updated with the casacore m
 * When performing steps, do them into small subtasks, and add them to TODO.md before starting.
 * Remove each task from TODO.md when completed and add an entry to CHANGELOG.md
 
+## Linting
+
+Rust work is linted with clippy and rustfmt as we go — CI runs these as gates
+(`.github/workflows/ci.yml`), so run them locally before committing:
+
+```sh
+cargo fmt
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+`clippy` is run with `-D warnings` (warnings are errors); `cargo fmt` keeps
+the formatting canonical. Everything merged must pass both.
+
 
