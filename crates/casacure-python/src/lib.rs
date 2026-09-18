@@ -64,7 +64,7 @@ fn default_ms(
         None,
         0,
         None,
-        true,
+        false, // readonly: the returned main table must be writable
         true,
         &PyTuple::empty(py),
         None,

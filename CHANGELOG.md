@@ -284,6 +284,13 @@ subtasks are moved here.
   defaults (zeros for fixed shape, empty for variable) instead of failing —
   required for dask-ms's addrows-before-putcol write pattern (was
   `NoDefault`); 85/85 tests still pass.
+- dask-ms's own `example_ms()` fixture factory now runs entirely on casacure
+  (§7): the shimmed `casacore.tables` builds the main MS plus the
+  ANTENNA/POLARIZATION/SPECTRAL_WINDOW/FIELD/DATA_DESCRIPTION subtables,
+  and `xds_from_ms` reads the result back (10 rows, DATA (10,16,4)
+  complex64). Bindings gained `ms::SUBTABLE` path syntax, int64/UInt array
+  `putcol` support, and `default_ms` now returns a writable context-manager
+  main table.
 - `table` module: `parse_table_header` parses the `table.dat` root object
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit

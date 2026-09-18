@@ -74,7 +74,13 @@ impl Table {
         nrow: u64,
         writable: bool,
     ) -> PyResult<Self> {
-        let dir = PathBuf::from(path);
+        // casacore `ms::SUBTABLE` path syntax: the subtable lives in a
+        // directory of the same name under the main table directory.
+        let dir = if let Some((base, sub)) = path.split_once("::") {
+            PathBuf::from(base).join(sub)
+        } else {
+            PathBuf::from(path)
+        };
         if let Some(desc_string) = desc_json {
             let desc = core::tabledesc::TableDesc::from_desc_json(desc_string).map_err(err)?;
             let mut wt = core::WritableTable::create(&dir, desc);
@@ -844,6 +850,10 @@ impl Table {
                 let readonly = arr.readonly();
                 return ndarray_cells(&readonly, nrow, RecordValue::UShort);
             }
+            if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<i64>>() {
+                let readonly = arr.readonly();
+                return ndarray_cells(&readonly, nrow, RecordValue::Int64);
+            }
             if let Ok(arr) = value.downcast::<numpy::PyArrayDyn<i32>>() {
                 let readonly = arr.readonly();
                 return ndarray_cells(&readonly, nrow, RecordValue::Int);
@@ -1000,6 +1010,26 @@ fn array_data_of(elems: &[RecordValue]) -> core::record::ArrayData {
                 .iter()
                 .map(|v| match v {
                     RecordValue::Int(d) => *d,
+                    RecordValue::Int64(d) => *d as i32,
+                    _ => 0,
+                })
+                .collect(),
+        ),
+        Some(RecordValue::Int64(_)) => AD::Int64(
+            elems
+                .iter()
+                .map(|v| match v {
+                    RecordValue::Int64(d) => *d,
+                    RecordValue::Int(d) => i64::from(*d),
+                    _ => 0,
+                })
+                .collect(),
+        ),
+        Some(RecordValue::UInt(_)) => AD::UInt(
+            elems
+                .iter()
+                .map(|v| match v {
+                    RecordValue::UInt(d) => *d,
                     _ => 0,
                 })
                 .collect(),
