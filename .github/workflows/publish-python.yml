@@ -94,10 +94,11 @@ jobs:
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
         with:
-          # Same artifact name over all matrix jobs: GitHub merges same-name
-          # uploads into ONE artifact (concurrent-upload merge, not the
-          # download-side 'merge-multiple' that corrupts files).
-          name: dist
+          # One artifact per job (unique names). Same-name concurrent uploads
+          # are unreliable (only one job's files survive), and the download
+          # 'merge-multiple' merge corrupts wheels on twine upload — so keep
+          # artifact files byte-identical and flatten them in the publish job.
+          name: dist-${{ matrix.target }}-${{ matrix.python || 'ml' }}
           path: dist
           if-no-files-found: error
 
@@ -112,13 +113,16 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - name: Download all wheels
+      - name: Download wheel artifacts
         uses: actions/download-artifact@v4
         with:
-          # Single merged artifact: a plain download (no pattern /
-          # merge-multiple) so wheel bytes are untouched.
-          name: dist
-          path: dist
+          pattern: dist-*
+          path: dist_artifacts
+      - name: Flatten distribution files
+        run: |
+          mkdir -p dist
+          find dist_artifacts -type f \( -name '*.whl' -o -name '*.tar.gz' \) -exec cp -n {} dist/ \;
+          echo "distribution files:"; ls -1 dist
       - name: Publish to PyPI (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
