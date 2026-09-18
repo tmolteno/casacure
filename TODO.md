@@ -15,7 +15,7 @@ Work areas follow `CASACORE_TO_CASA_RS.md` (tracked as GitHub issues).
 - [X] Byte-level interop proof: write a table casacore can read
 - [X] IncrementalStMan (Direct option) support
 - [X] TiledColumnStMan (`{column}_GROUP`, reversed dim order DEFAULTTILESHAPE)
-- [ ] dminfo dict round-trip fidelity (incl. `_1` auto-suffix behaviour)
+- [X] dminfo dict round-trip fidelity (incl. `_1` auto-suffix behaviour)
 
 ## 2. Table lifecycle and locking API
 

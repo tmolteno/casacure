@@ -611,3 +611,46 @@ fn fixture_tsm_read() {
         );
     }
 }
+
+/// `get_dminfo()` must match python-casacore's `table.getdminfo()` exactly
+/// (factory-record keys `*N`, TYPE/NAME/SEQNR/SPEC/COLUMNS order, sorted
+/// columns, per-manager SPEC read from the data-file headers).
+#[test]
+fn fixture_dminfo_matches_casacore() {
+    let Some(manifest) = load_manifest() else {
+        return;
+    };
+    let cases: [(&str, &str); 3] = [
+        (
+            "typed",
+            r#"{"*1":{"TYPE":"StandardStMan","NAME":"StandardStMan","SEQNR":0,"SPEC":{"MaxCacheSize":2,"BUCKETSIZE":1892,"PERSCACHESIZE":2,"IndexLength":126},"COLUMNS":["COL_B","COL_C4","COL_C8","COL_I2","COL_I4","COL_R4","COL_R8","COL_S","COL_U1","COL_U4"]}}"#,
+        ),
+        (
+            "ism",
+            r#"{"*1":{"TYPE":"IncrementalStMan","NAME":"IncrementalStMan","SEQNR":0,"SPEC":{"MaxCacheSize":1,"BUCKETSIZE":32768,"PERSCACHESIZE":1},"COLUMNS":["ANT1","TIME"]},"*2":{"TYPE":"StandardStMan","NAME":"StandardStMan","SEQNR":1,"SPEC":{"MaxCacheSize":2,"BUCKETSIZE":256,"PERSCACHESIZE":2,"IndexLength":126},"COLUMNS":["VAL"]}}"#,
+        ),
+        (
+            "tsm",
+            r#"{"*1":{"TYPE":"TiledColumnStMan","NAME":"TiledData_GROUP","SEQNR":0,"SPEC":{"MaxCacheSize":0,"DEFAULTTILESHAPE":[],"MAXIMUMCACHESIZE":0,"HYPERCUBES":{"*1":{"CubeShape":[3,2,3],"TileShape":[3,2,5461],"CellShape":[3,2],"BucketSize":524256,"ID":{}}},"SEQNR":0},"COLUMNS":["DATA"]},"*2":{"TYPE":"StandardStMan","NAME":"StandardStMan","SEQNR":1,"SPEC":{"MaxCacheSize":2,"BUCKETSIZE":128,"PERSCACHESIZE":2,"IndexLength":126},"COLUMNS":["IDX"]}}"#,
+        ),
+    ];
+    let fixtures_dir = manifest_path().parent().unwrap().to_path_buf();
+    for (table_name, expected) in cases {
+        let Some(t) = manifest.tables.get(table_name) else {
+            continue;
+        };
+        let dir = fixtures_dir.join(&t.path);
+        let dat_bytes = std::fs::read(dir.join("table.dat")).expect("cannot read table.dat");
+        let dat = casacure::parse_table_dat(&dat_bytes).unwrap();
+        let info = casacure::get_dminfo(&dir, &dat).unwrap();
+        let mut json = String::from("{");
+        for (i, (key, value)) in info.iter().enumerate() {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!("\"{key}\":{}", value.to_json()));
+        }
+        json.push('}');
+        assert_eq!(json, expected, "{table_name}: getdminfo mismatch");
+    }
+}

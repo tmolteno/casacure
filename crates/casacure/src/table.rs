@@ -34,6 +34,10 @@ pub enum TableDatError {
     #[error(transparent)]
     ColumnSet(#[from] ColumnSetError),
     #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("storage error: {0}")]
+    Storage(String),
+    #[error(transparent)]
     AipsIo(#[from] AipsIoError),
 }
 
@@ -289,13 +293,34 @@ pub fn create_table(
 
     // Assign data-manager sequence numbers in column order (casacore
     // creates one data manager per type/group, in order of first use).
+    // The manager name is the group (or the type when no group is given);
+    // colliding names get the `_N` auto-suffix (`StandardStMan_1`, ...).
     let mut dm_types: Vec<String> = Vec::new();
+    let mut dm_names: Vec<String> = Vec::new();
     let mut col_dm_seq: Vec<u32> = Vec::with_capacity(desc.columns.len());
+    let mut name_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for cd in &desc.columns {
-        if let Some(i) = dm_types.iter().position(|t| *t == cd.data_manager_type) {
+        let group = if cd.data_manager_group.is_empty() {
+            cd.data_manager_type.clone()
+        } else {
+            cd.data_manager_group.clone()
+        };
+        let existing = dm_types
+            .iter()
+            .zip(dm_names.iter())
+            .position(|(t, n)| *t == cd.data_manager_type && *n == group);
+        if let Some(i) = existing {
             col_dm_seq.push(i as u32);
         } else {
+            let count = name_counts.entry(group.clone()).or_insert(0);
+            let name = if *count == 0 {
+                group.clone()
+            } else {
+                format!("{group}_{}", *count)
+            };
+            *count += 1;
             dm_types.push(cd.data_manager_type.clone());
+            dm_names.push(name);
             col_dm_seq.push((dm_types.len() - 1) as u32);
         }
     }
@@ -306,12 +331,14 @@ pub fn create_table(
     let mut tile_files: Vec<(u32, u32, Vec<u8>)> = Vec::new();
 
     for (dm, type_name) in dm_types.iter().enumerate() {
+        let dm_name = &dm_names[dm];
         let dm_cols: Vec<usize> = (0..desc.columns.len())
             .filter(|&c| col_dm_seq[c] as usize == dm)
             .collect();
         match type_name.as_str() {
             "StandardStMan" => {
-                let (file, f0i, spec) = build_ssm_data(big_endian, nrow, desc, values, &dm_cols)?;
+                let (file, f0i, spec) =
+                    build_ssm_data(big_endian, nrow, dm_name, desc, values, &dm_cols)?;
                 dms.push(DmBlob {
                     type_name: type_name.clone(),
                     sequence_nr: dm as u32,
@@ -323,16 +350,17 @@ pub fn create_table(
                 }
             }
             "IncrementalStMan" => {
-                let file = build_ism_data(big_endian, nrow, desc, values, &dm_cols)?;
+                let file = build_ism_data(big_endian, nrow, dm_name, desc, values, &dm_cols)?;
                 dms.push(DmBlob {
                     type_name: type_name.clone(),
                     sequence_nr: dm as u32,
-                    blob: crate::ism::write_ism_blob(type_name),
+                    blob: crate::ism::write_ism_blob(dm_name),
                 });
                 data_files.push((dm as u32, file));
             }
             "TiledColumnStMan" => {
-                let (header, tile) = build_tsm_data(big_endian, dm as u32, desc, values, &dm_cols)?;
+                let (header, tile) =
+                    build_tsm_data(big_endian, dm as u32, dm_name, desc, values, &dm_cols)?;
                 dms.push(DmBlob {
                     type_name: type_name.clone(),
                     sequence_nr: dm as u32,
@@ -385,6 +413,7 @@ type SsmDataOutput = (Vec<u8>, Option<Vec<u8>>, crate::columnset::StandardStMan)
 fn build_ssm_data(
     big_endian: bool,
     nrow: u64,
+    dm_name: &str,
     desc: &crate::tabledesc::TableDesc,
     values: &[Vec<crate::record::RecordValue>],
     dm_cols: &[usize],
@@ -515,7 +544,7 @@ fn build_ssm_data(
     };
     let file = write_standard_stman_file(big_endian, nrow, &cols, &l, &string_bucket_refs);
     let spec = crate::columnset::StandardStMan {
-        data_manager_name: "StandardStMan".into(),
+        data_manager_name: dm_name.into(),
         column_offset: l.column_offset,
         col_index_map: vec![0; dm_cols.len()],
     };
@@ -535,10 +564,12 @@ fn build_ssm_data(
 fn build_ism_data(
     big_endian: bool,
     nrow: u64,
+    dm_name: &str,
     desc: &crate::tabledesc::TableDesc,
     values: &[Vec<crate::record::RecordValue>],
     dm_cols: &[usize],
 ) -> Result<Vec<u8>, TableCreateError> {
+    let _ = dm_name;
     let mut cell_buffers: Vec<Vec<u8>> = Vec::with_capacity(dm_cols.len());
     let mut cell_sizes: Vec<u32> = Vec::with_capacity(dm_cols.len());
     for &col in dm_cols {
@@ -583,6 +614,7 @@ fn build_ism_data(
 fn build_tsm_data(
     big_endian: bool,
     seq_nr: u32,
+    dm_name: &str,
     desc: &crate::tabledesc::TableDesc,
     values: &[Vec<crate::record::RecordValue>],
     dm_cols: &[usize],
@@ -619,12 +651,7 @@ fn build_tsm_data(
             })?,
         );
     }
-    let group = if cd.data_manager_group.is_empty() {
-        cd.name.clone()
-    } else {
-        cd.data_manager_group.clone()
-    };
-    crate::tsm::write_tsm_file(big_endian, seq_nr, &group, cd.data_type, &cradle, &cells).map_err(
+    crate::tsm::write_tsm_file(big_endian, seq_nr, dm_name, cd.data_type, &cradle, &cells).map_err(
         |e| {
             TableCreateError::Io(std::io::Error::other(format!(
                 "encode {}.{}: {e}",
@@ -632,6 +659,317 @@ fn build_tsm_data(
             )))
         },
     )
+}
+
+/// A data-manager-info record as returned by casacore `table.getdminfo()`:
+/// `{"TYPE", "NAME", "SEQNR", "SPEC", "COLUMNS"}` (keys in that order).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DmInfo {
+    pub type_name: String,
+    pub name: String,
+    pub seqnr: u32,
+    pub spec: DmSpec,
+    /// Column names belonging to this manager (sorted, as casacore does).
+    pub columns: Vec<String>,
+}
+
+/// The `SPEC` field of a data-manager-info record.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DmSpec {
+    StandardStMan {
+        max_cache_size: u32,
+        bucket_size: u32,
+        pers_cache_size: u32,
+        index_length: u32,
+    },
+    IncrementalStMan {
+        max_cache_size: u32,
+        bucket_size: u32,
+        pers_cache_size: u32,
+    },
+    TiledColumnStMan {
+        max_cache_size: u32,
+        max_cache_size_64: i64,
+        cube_shapes: Vec<Vec<i64>>,
+        tile_shapes: Vec<Vec<i64>>,
+        cell_shapes: Vec<Vec<i64>>,
+        bucket_sizes: Vec<u64>,
+        seqnr: u32,
+    },
+    Unsupported(String),
+}
+
+/// Build the `getdminfo()` dictionary (`{"*1": ..., "*2": ...}`) for a
+/// table, matching casacore's `ColumnSet::dataManagerInfo`: one entry per
+/// data manager with columns, numbered from 1, `COLUMNS` sorted, and each
+/// `SPEC` read from the manager's data-file header.
+pub fn get_dminfo(
+    table_dir: &std::path::Path,
+    dat: &TableDat,
+) -> Result<std::collections::BTreeMap<String, DmInfo>, TableDatError> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut tsm_hypercolumn: Option<String> = None;
+    let mut n = 0u32;
+    for dm in &dat.column_set.data_managers {
+        // Columns bound to this data manager, in table order then sorted.
+        let mut columns: Vec<&String> = dat
+            .column_set
+            .columns
+            .iter()
+            .filter(|c| c.data_manager_seq == dm.sequence_nr)
+            .map(|c| &c.original_name)
+            .collect();
+        if columns.is_empty() {
+            continue;
+        }
+        columns.sort();
+        let columns: Vec<String> = columns.into_iter().cloned().collect();
+        let spec = match dm.type_name.as_str() {
+            "StandardStMan" => {
+                let file = crate::ssm::StandardStManFile::open(
+                    table_dir,
+                    dm.sequence_nr,
+                    dat.header.big_endian,
+                )
+                .map_err(|e| TableDatError::Storage(e.to_string()))?;
+                DmSpec::StandardStMan {
+                    max_cache_size: file.header.pers_cache_size,
+                    bucket_size: file.header.bucket_size,
+                    pers_cache_size: file.header.pers_cache_size,
+                    index_length: file.header.index_length,
+                }
+            }
+            "IncrementalStMan" => {
+                let file =
+                    crate::ism::IsmFile::open(table_dir, dm.sequence_nr, dat.header.big_endian)
+                        .map_err(|e| TableDatError::Storage(e.to_string()))?;
+                DmSpec::IncrementalStMan {
+                    max_cache_size: file.header.pers_cache_size,
+                    bucket_size: file.header.bucket_size,
+                    pers_cache_size: file.header.pers_cache_size,
+                }
+            }
+            "TiledColumnStMan" => {
+                let file =
+                    crate::tsm::TsmFile::open(table_dir, dm.sequence_nr, dat.header.big_endian)
+                        .map_err(|e| TableDatError::Storage(e.to_string()))?;
+                let header = &file.header;
+                tsm_hypercolumn = Some(header.hypercolumn_name.clone());
+                DmSpec::TiledColumnStMan {
+                    max_cache_size: 0,
+                    max_cache_size_64: 0,
+                    cube_shapes: header.cubes.iter().map(|c| c.cube_shape.clone()).collect(),
+                    tile_shapes: header.cubes.iter().map(|c| c.tile_shape.clone()).collect(),
+                    cell_shapes: header
+                        .cubes
+                        .iter()
+                        .map(|c| {
+                            let mut s = c.cube_shape.clone();
+                            if !s.is_empty() {
+                                s.pop(); // drop the row axis
+                            }
+                            s
+                        })
+                        .collect(),
+                    bucket_sizes: header
+                        .cubes
+                        .iter()
+                        .map(|c| c.tile_shape.iter().product::<i64>() as u64 * 16)
+                        .collect(),
+                    seqnr: header.seq_nr,
+                }
+            }
+            other => DmSpec::Unsupported(other.to_string()),
+        };
+        // The manager name is the group/hypercolumn name: from the SSM spec
+        // blob for StandardStMan, from the TSM header's hypercolumn name
+        // otherwise (the TSM blob is empty).
+        let name = match &dm.blob {
+            crate::columnset::DataManagerBlob::StandardStMan(s) => s.data_manager_name.clone(),
+            crate::columnset::DataManagerBlob::Unsupported(_) => {
+                if dm.type_name == "TiledColumnStMan" {
+                    tsm_hypercolumn
+                        .clone()
+                        .unwrap_or_else(|| dm.type_name.clone())
+                } else {
+                    dm.type_name.clone()
+                }
+            }
+        };
+        n += 1;
+        out.insert(
+            format!("*{n}"),
+            DmInfo {
+                type_name: dm.type_name.clone(),
+                name,
+                seqnr: dm.sequence_nr,
+                spec,
+                columns,
+            },
+        );
+    }
+    Ok(out)
+}
+
+impl DmInfo {
+    /// Serialize exactly as python-casacore's `getdminfo()` repr order
+    /// (TYPE, NAME, SEQNR, SPEC, COLUMNS).
+    pub fn to_json(&self) -> String {
+        let mut s = String::new();
+        s.push('{');
+        s.push_str("\"TYPE\":");
+        s.push_str(&json_string(&self.type_name));
+        s.push(',');
+        s.push_str("\"NAME\":");
+        s.push_str(&json_string(&self.name));
+        s.push(',');
+        s.push_str("\"SEQNR\":");
+        s.push_str(&self.seqnr.to_string());
+        s.push(',');
+        s.push_str("\"SPEC\":");
+        s.push_str(&self.spec.to_json());
+        s.push(',');
+        s.push_str("\"COLUMNS\":");
+        s.push_str(&json_list(&self.columns));
+        s.push('}');
+        s
+    }
+}
+
+impl DmSpec {
+    fn to_json(&self) -> String {
+        match self {
+            DmSpec::StandardStMan {
+                max_cache_size,
+                bucket_size,
+                pers_cache_size,
+                index_length,
+            } => {
+                let mut s = String::new();
+                s.push('{');
+                s.push_str(&format!("\"MaxCacheSize\":{}", max_cache_size));
+                s.push(',');
+                s.push_str(&format!("\"BUCKETSIZE\":{}", bucket_size));
+                s.push(',');
+                s.push_str(&format!("\"PERSCACHESIZE\":{}", pers_cache_size));
+                s.push(',');
+                s.push_str(&format!("\"IndexLength\":{}", index_length));
+                s.push('}');
+                s
+            }
+            DmSpec::IncrementalStMan {
+                max_cache_size,
+                bucket_size,
+                pers_cache_size,
+            } => {
+                let mut s = String::new();
+                s.push('{');
+                s.push_str(&format!("\"MaxCacheSize\":{}", max_cache_size));
+                s.push(',');
+                s.push_str(&format!("\"BUCKETSIZE\":{}", bucket_size));
+                s.push(',');
+                s.push_str(&format!("\"PERSCACHESIZE\":{}", pers_cache_size));
+                s.push('}');
+                s
+            }
+            DmSpec::TiledColumnStMan {
+                max_cache_size,
+                max_cache_size_64,
+                cube_shapes,
+                tile_shapes,
+                cell_shapes,
+                bucket_sizes,
+                seqnr,
+            } => {
+                let mut cubes = String::new();
+                for i in 0..cube_shapes.len() {
+                    if i > 0 {
+                        cubes.push(',');
+                    }
+                    cubes.push('"');
+                    cubes.push('*');
+                    cubes.push_str(&(i + 1).to_string());
+                    cubes.push('"');
+                    cubes.push(':');
+                    cubes.push('{');
+                    cubes.push_str("\"CubeShape\":");
+                    cubes.push_str(&json_ilist(&cube_shapes[i]));
+                    cubes.push(',');
+                    cubes.push_str("\"TileShape\":");
+                    cubes.push_str(&json_ilist(&tile_shapes[i]));
+                    cubes.push(',');
+                    cubes.push_str("\"CellShape\":");
+                    cubes.push_str(&json_ilist(&cell_shapes[i]));
+                    cubes.push(',');
+                    cubes.push_str(&format!("\"BucketSize\":{}", bucket_sizes[i]));
+                    cubes.push(',');
+                    cubes.push_str("\"ID\":{}");
+                    cubes.push('}');
+                }
+                let mut s = String::new();
+                s.push('{');
+                s.push_str(&format!("\"MaxCacheSize\":{}", max_cache_size));
+                s.push(',');
+                s.push_str("\"DEFAULTTILESHAPE\":[]");
+                s.push(',');
+                s.push_str(&format!("\"MAXIMUMCACHESIZE\":{}", max_cache_size_64));
+                s.push(',');
+                s.push_str("\"HYPERCUBES\":{");
+                s.push_str(&cubes);
+                s.push('}');
+                s.push(',');
+                s.push_str(&format!("\"SEQNR\":{}", seqnr));
+                s.push('}');
+                s
+            }
+            DmSpec::Unsupported(t) => {
+                let mut s = String::new();
+                s.push('{');
+                s.push_str("\"TYPE\":");
+                s.push_str(&json_string(t));
+                s.push('}');
+                s
+            }
+        }
+    }
+}
+
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_list(items: &[String]) -> String {
+    let mut s = String::from("[");
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&json_string(item));
+    }
+    s.push(']');
+    s
+}
+
+fn json_ilist(items: &[i64]) -> String {
+    let mut s = String::from("[");
+    for (i, v) in items.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&v.to_string());
+    }
+    s.push(']');
+    s
 }
 
 #[cfg(test)]
@@ -1092,6 +1430,37 @@ mod tests {
             keywords: empty_record(),
             kind: ColumnKind::Array,
         }
+    }
+
+    #[test]
+    fn dminfo_round_trips_group_names() {
+        // create_table names data managers by their group; get_dminfo must
+        // report those names back (the `_1` auto-suffix applies to addcols,
+        // which is not implemented yet).
+        let mut desc = typed_desc();
+        desc.columns = vec![
+            scalar_col("A", DataType::Int, 0),
+            scalar_col("B", DataType::Int, 0),
+        ];
+        desc.columns[0].data_manager_group = "Main".into();
+        desc.columns[0].options = 0;
+        // second column keeps the default group "StandardStMan".
+        let values = vec![
+            (0..3).map(RecordValue::Int).collect(),
+            (0..3).map(RecordValue::Int).collect(),
+        ];
+        let dir = temp_dir("dminfo");
+        create_table(&dir, &desc, &values).unwrap();
+        let dat_bytes = std::fs::read(dir.join("table.dat")).unwrap();
+        let dat = parse_table_dat(&dat_bytes).unwrap();
+        let info = crate::table::get_dminfo(&dir, &dat).unwrap();
+        // Col A (group "Main") creates DM 0, col B the default SSM DM.
+        assert_eq!(info["*1"].name, "Main");
+        assert_eq!(info["*1"].columns, vec!["A"]);
+        assert_eq!(info["*2"].name, "StandardStMan");
+        assert_eq!(info["*2"].columns, vec!["B"]);
+        let all_types: Vec<&str> = info.values().map(|d| d.type_name.as_str()).collect();
+        assert_eq!(all_types, vec!["StandardStMan", "StandardStMan"]);
     }
 
     #[test]

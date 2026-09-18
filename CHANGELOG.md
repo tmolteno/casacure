@@ -153,6 +153,19 @@ subtasks are moved here.
   table combining StandardStMan scalars + long strings + `table.f0i` arrays,
   IncrementalStMan TIME/ANT1, and TiledColumnStMan DATA — 6 files, every
   value exact.
+- Data-manager info (`getdminfo`) round-trip: `get_dminfo` builds the
+  exact python-casacore `table.getdminfo()` dictionary — `*N` records with
+  TYPE/NAME/SEQNR/SPEC/COLUMNS (sorted columns) — with per-manager SPECs
+  read from the data-file headers: StandardStMan
+  (MaxCacheSize/BUCKETSIZE/PERSCACHESIZE/IndexLength), IncrementalStMan
+  (MaxCacheSize/BUCKETSIZE/PERSCACHESIZE), and TiledColumnStMan
+  (incl. the HYPERCUBES CubeShape/TileShape/CellShape/BucketSize records).
+  Verified byte-for-byte against casacore on the typed/ism/tsm fixtures.
+- `create_table` now groups columns by (data-manager type, group) and names
+  managers by their group (the `_N` auto-suffix applies to `addcols`,
+  tracked for the future column-management step); SSM/ISM/TSM spec names
+  follow the group. Full multi-DM interop re-verified (SSM + ISM + TSM in
+  one table, all values exact; dminfo NAME now e.g. `TiledData_GROUP`).
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit
   tests plus a manifest-driven fixture test asserting the header of the real
