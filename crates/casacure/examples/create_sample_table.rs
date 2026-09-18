@@ -52,6 +52,13 @@ fn arr(name: &str, dt: DataType, casa_shape: &[i64]) -> ColumnDesc {
     }
 }
 
+fn tsm_arr(name: &str, dt: DataType, casa_shape: &[i64]) -> ColumnDesc {
+    let mut d = arr(name, dt, casa_shape);
+    d.data_manager_type = "TiledColumnStMan".into();
+    d.data_manager_group = "TiledData_GROUP".into();
+    d
+}
+
 fn ism_scalar(name: &str, dt: DataType, default: RecordValue) -> ColumnDesc {
     let mut d = scalar(name, dt, default);
     d.data_manager_type = "IncrementalStMan".into();
@@ -81,6 +88,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // MS-style index columns stored incrementally (IncrementalStMan).
             ism_scalar("TIME", DataType::Double, RecordValue::Double(0.0)),
             ism_scalar("ANT1", DataType::Int, RecordValue::Int(0)),
+            // MS-style visibility data stored in tiles (TiledColumnStMan),
+            // fixed-shape 2x3 dcomplex per row.
+            tsm_arr("DATA", DataType::DComplex, &[3, 2]),
         ],
     };
 
@@ -114,6 +124,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect(),
         (0..nrows)
             .map(|i| RecordValue::Int((i / 3) as i32))
+            .collect(),
+        // Tiled visibility data.
+        (0..nrows)
+            .map(|row| {
+                use casacure::record::{ArrayData, ArrayValue};
+                RecordValue::Array(ArrayValue {
+                    shape: vec![2, 3],
+                    data: ArrayData::DComplex((1..=6).map(|k| (row as f64, k as f64)).collect()),
+                })
+            })
             .collect(),
     ];
 

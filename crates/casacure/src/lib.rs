@@ -10,6 +10,7 @@ pub mod record;
 pub mod ssm;
 pub mod table;
 pub mod tabledesc;
+pub mod tsm;
 pub mod types;
 
 pub use columnset::{
@@ -29,4 +30,5 @@ pub use table::{
 pub use tabledesc::{
     parse_table_desc, write_table_desc, ColumnDesc, ColumnKind, TableDesc, TableDescError,
 };
+pub use tsm::{write_tsm_file, TsmCube, TsmError, TsmFile, TsmHeader, TsmTileFile};
 pub use types::{UnknownValueType, ValueType};

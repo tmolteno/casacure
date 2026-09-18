@@ -669,7 +669,10 @@ fn read_index(
             .get(bp..bp + bucket_size)
             .ok_or(SsmError::InvalidBucket(bucket_nr))?;
         // [checkNr][nextBucket] at the start of each index bucket.
-        let next = read_i32_at(bucket, 4, big_endian)?;
+        // [checkNr][nextBucket] at the start of each index bucket; like the
+        // string-bucket headers, they use big-endian canonical regardless
+        // of the data-file endianness (CanonicalConversion).
+        let next = read_i32_at(bucket, 4, true)?;
         let take = if let Some(off) = offset {
             let n = a_nr.min(bucket_size.saturating_sub(off));
             stream.extend_from_slice(&bucket[off..off + n]);
@@ -930,13 +933,9 @@ pub fn write_standard_stman_file(
         } else {
             -1i32
         };
-        if big_endian {
-            b.extend_from_slice(&check.to_be_bytes());
-            b.extend_from_slice(&next.to_be_bytes());
-        } else {
-            b.extend_from_slice(&check.to_le_bytes());
-            b.extend_from_slice(&next.to_le_bytes());
-        }
+        // Big-endian canonical, independent of the data-file endianness.
+        b.extend_from_slice(&check.to_be_bytes());
+        b.extend_from_slice(&next.to_be_bytes());
         b.extend_from_slice(chunk);
         b.resize(bucket_size, 0);
         index_buckets.push(b);
@@ -1119,28 +1118,17 @@ fn put_scalar_ints(dst: &mut [u8], v: i32, big_endian: bool) {
 /// Encode one array value into its `table.f0i` record: `[ndim][CASA-order
 /// dims][element data]` (byte-identical to `StManArrayFile::putShape` +
 /// the element writes, for the table's data-file endianness).
-pub fn encode_array_record(
+/// Encode the element payload of an array value in the table's data-file
+/// byte order (the part of `encode_array_record` after the shape header),
+/// plus the trailing element data.
+pub fn encode_array_data(
     big_endian: bool,
-    elem: DataType,
-    value: &crate::record::ArrayValue,
+    data: &crate::record::ArrayData,
 ) -> Result<Vec<u8>, SsmError> {
-    use crate::aipsio::Writer;
     use crate::record::ArrayData;
-    if elem == DataType::String {
-        return Err(SsmError::UnsupportedArrayType(DataType::String));
-    }
-    let mut w = if big_endian {
-        Writer::new()
-    } else {
-        Writer::new_le()
-    };
-    w.put_u32(value.shape.len() as u32);
-    for d in value.shape.iter().rev() {
-        w.put_i32(*d as i32); // CASA dim order = reversed logical
-    }
-    let mut body = w.into_bytes();
+    let mut body: Vec<u8> = Vec::new();
     let mut push = |bytes: &[u8]| body.extend_from_slice(bytes);
-    match &value.data {
+    match data {
         ArrayData::Bool(bits) => {
             let nbytes = bits.len().div_ceil(8);
             let mut packed = vec![0u8; nbytes];
@@ -1272,8 +1260,33 @@ pub fn encode_array_record(
             }
             push(&b);
         }
-        ArrayData::String(_) => unreachable!("string arrays rejected above"),
+        ArrayData::String(_) => return Err(SsmError::UnsupportedArrayType(DataType::String)),
     }
+    let _ = push;
+    Ok(body)
+}
+
+pub fn encode_array_record(
+    big_endian: bool,
+    elem: DataType,
+    value: &crate::record::ArrayValue,
+) -> Result<Vec<u8>, SsmError> {
+    use crate::aipsio::Writer;
+    if elem == DataType::String {
+        return Err(SsmError::UnsupportedArrayType(DataType::String));
+    }
+    let mut w = if big_endian {
+        Writer::new()
+    } else {
+        Writer::new_le()
+    };
+    w.put_u32(value.shape.len() as u32);
+    for d in value.shape.iter().rev() {
+        w.put_i32(*d as i32); // CASA dim order = reversed logical
+    }
+    let mut body = w.into_bytes();
+    let data = encode_array_data(big_endian, &value.data)?;
+    body.extend_from_slice(&data);
     Ok(body)
 }
 

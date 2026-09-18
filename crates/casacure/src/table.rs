@@ -303,6 +303,7 @@ pub fn create_table(
     let mut dms: Vec<DmBlob> = Vec::with_capacity(dm_types.len());
     let mut data_files: Vec<(u32, Vec<u8>)> = Vec::with_capacity(dm_types.len());
     let mut index_files: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut tile_files: Vec<(u32, u32, Vec<u8>)> = Vec::new();
 
     for (dm, type_name) in dm_types.iter().enumerate() {
         let dm_cols: Vec<usize> = (0..desc.columns.len())
@@ -330,6 +331,17 @@ pub fn create_table(
                 });
                 data_files.push((dm as u32, file));
             }
+            "TiledColumnStMan" => {
+                let (header, tile) = build_tsm_data(big_endian, dm as u32, desc, values, &dm_cols)?;
+                dms.push(DmBlob {
+                    type_name: type_name.clone(),
+                    sequence_nr: dm as u32,
+                    blob: Vec::new(), // TSM writes its spec to the header file
+                });
+                data_files.push((dm as u32, header));
+                // Tile data lives in `table.f{dm}_TSM0`.
+                tile_files.push((dm as u32, 0, tile));
+            }
             other => {
                 return Err(TableCreateError::Io(std::io::Error::other(format!(
                     "unsupported data-manager type {other}"
@@ -352,6 +364,11 @@ pub fn create_table(
     }
     for (seq, file) in index_files {
         let f_path = table_dir.join(format!("table.f{seq}i"));
+        std::fs::write(&f_path, file)?;
+        written.push(f_path);
+    }
+    for (seq, file_seq, file) in tile_files {
+        let f_path = table_dir.join(format!("table.f{seq}_TSM{file_seq}"));
         std::fs::write(&f_path, file)?;
         written.push(f_path);
     }
@@ -559,6 +576,62 @@ fn build_ism_data(
         })
         .collect();
     Ok(crate::ism::write_ism_file(big_endian, nrow, &ism_cols))
+}
+
+/// Build the TiledColumnStMan header + tile data for one TSM data manager
+/// (a single fixed-shape array column).
+fn build_tsm_data(
+    big_endian: bool,
+    seq_nr: u32,
+    desc: &crate::tabledesc::TableDesc,
+    values: &[Vec<crate::record::RecordValue>],
+    dm_cols: &[usize],
+) -> Result<(Vec<u8>, Vec<u8>), TableCreateError> {
+    use crate::record::RecordValue;
+    if dm_cols.len() != 1 {
+        return Err(TableCreateError::Io(std::io::Error::other(format!(
+            "TiledColumnStMan with {} columns is not supported (one array column per group)",
+            dm_cols.len()
+        ))));
+    }
+    let col = dm_cols[0];
+    let cd = &desc.columns[col];
+    let cradle = cd.shape.clone().ok_or_else(|| {
+        TableCreateError::NotScalar(format!(
+            "{}.{}: TiledColumnStMan needs a fixed-shape array column",
+            desc.name, cd.name
+        ))
+    })?;
+    let mut cells: Vec<Vec<u8>> = Vec::with_capacity(values[col].len());
+    for value in &values[col] {
+        let RecordValue::Array(arr) = value else {
+            return Err(TableCreateError::NotScalar(format!(
+                "{}.{}: expected an array value",
+                desc.name, cd.name
+            )));
+        };
+        cells.push(
+            crate::ssm::encode_array_data(big_endian, &arr.data).map_err(|e| {
+                TableCreateError::Io(std::io::Error::other(format!(
+                    "encode {}.{}: {e}",
+                    desc.name, cd.name
+                )))
+            })?,
+        );
+    }
+    let group = if cd.data_manager_group.is_empty() {
+        cd.name.clone()
+    } else {
+        cd.data_manager_group.clone()
+    };
+    crate::tsm::write_tsm_file(big_endian, seq_nr, &group, cd.data_type, &cradle, &cells).map_err(
+        |e| {
+            TableCreateError::Io(std::io::Error::other(format!(
+                "encode {}.{}: {e}",
+                desc.name, cd.name
+            )))
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1002,6 +1075,89 @@ mod tests {
         d.data_manager_group = "IncrementalStMan".into();
         d.options = option;
         d
+    }
+
+    fn tsm_arr_col(name: &str, dt: DataType, logical_shape: Vec<i64>) -> ColumnDesc {
+        let casa: Vec<i64> = logical_shape.iter().rev().copied().collect();
+        ColumnDesc {
+            name: name.into(),
+            comment: String::new(),
+            data_type: dt,
+            data_manager_type: "TiledColumnStMan".into(),
+            data_manager_group: "TiledData_GROUP".into(),
+            options: 4,
+            ndim: logical_shape.len() as i32,
+            shape: Some(casa),
+            max_length: 0,
+            keywords: empty_record(),
+            kind: ColumnKind::Array,
+        }
+    }
+
+    #[test]
+    fn create_table_with_tsm_column_reads_back() {
+        use crate::record::{ArrayData, ArrayValue};
+        // A fixed-shape 2x3 dcomplex column stored with TiledColumnStMan.
+        let mut desc = typed_desc();
+        desc.columns = vec![
+            tsm_arr_col("DATA", DataType::DComplex, vec![2, 3]),
+            scalar_col("IDX", DataType::Int, 0),
+        ];
+        let arr = |row: i32| {
+            RecordValue::Array(ArrayValue {
+                shape: vec![2, 3],
+                data: ArrayData::DComplex((1..=6).map(|k| (row as f64, k as f64)).collect()),
+            })
+        };
+        let values = vec![
+            vec![arr(0), arr(1), arr(2)],
+            vec![
+                RecordValue::Int(0),
+                RecordValue::Int(1),
+                RecordValue::Int(2),
+            ],
+        ];
+        let dir = temp_dir("tsm");
+        create_table(&dir, &desc, &values).unwrap();
+        // Files: table.dat, table.f0 (TSM header), table.f0_TSM0 (tiles),
+        // table.f1 (SSM).
+        assert!(dir.join("table.f0_TSM0").is_file(), "tile file present");
+
+        let dat_bytes = std::fs::read(dir.join("table.dat")).unwrap();
+        let dat = parse_table_dat(&dat_bytes).unwrap();
+        assert_eq!(
+            dat.column_set.data_managers[0].type_name,
+            "TiledColumnStMan"
+        );
+        assert!(
+            matches!(
+                &dat.column_set.data_managers[0].blob,
+                crate::columnset::DataManagerBlob::Unsupported(b) if b.is_empty()
+            ),
+            "TSM ColumnSet blob is empty"
+        );
+        let tsm = crate::tsm::TsmFile::open(&dir, 0, dat.header.big_endian).unwrap();
+        assert_eq!(tsm.header.hypercolumn_name, "TiledData_GROUP");
+        assert_eq!(tsm.header.nrrow, 3);
+        assert_eq!(tsm.header.cubes[0].cube_shape, vec![3, 2, 3]);
+        let data = dat.desc.column("DATA").unwrap();
+        for row in 0..3u64 {
+            let cell = tsm.read_cell(data, row).unwrap();
+            match cell {
+                RecordValue::Array(a) => {
+                    assert_eq!(a.shape, vec![2, 3], "row {row}");
+                    match &a.data {
+                        ArrayData::DComplex(v) => {
+                            let expect: Vec<(f64, f64)> =
+                                (1..=6).map(|k| (row as f64, k as f64)).collect();
+                            assert_eq!(&v[..], &expect[..], "row {row}");
+                        }
+                        other => panic!("expected dcomplex, got {other:?}"),
+                    }
+                }
+                other => panic!("expected array, got {other:?}"),
+            }
+        }
     }
 
     #[test]

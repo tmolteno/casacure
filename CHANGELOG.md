@@ -130,6 +130,29 @@ subtasks are moved here.
   interop proven: python-casacore reads a casacure-written table combining
   SSM scalars, long strings, fixed-shape arrays, **and** ISM TIME/ANT1 —
   4 files, all values exact.
+- TiledColumnStMan support (the MS visibility-data storage manager): the
+  `table.f{seq}` reader parses the canonical big-endian `"TiledColumnStMan"`
+  header (fixed cell shape), the nested `"TiledStMan"` object (row count,
+  column types, hypercolumn name, tile files, hypercubes), and each
+  hypercube's `cubeShape`/`tileShape`/file offset. The tile data file
+  (`table.f{seq}_TSM{fileSeqNr}`) is a bucket file: tile `t` at
+  `fileOffset + t*bucketSize`, and a row's fixed-shape cell spans the full
+  non-row tile dims (verified against the real casacore `tsm.tab`: cell
+  `[3,2]` dcomplex, tile `[3,2,5461]`, bucket 524256 bytes).
+- `write_tsm_file` + `create_table` support for TiledColumnStMan columns
+  (one fixed-shape array column per group; the DM ColumnSet blob is empty —
+  the spec lives in the header file, which carries the DM sequence number
+  that casacore validates on open).
+- **Bug fix**: the SSM index-bucket `[checkNr][nextBucket]` header is written
+  in **big-endian canonical** regardless of the data-file endianness; both
+  the reader and writer now do so (the reader previously followed
+  little-endian next-pointers, breaking chained indexes in little-endian
+  tables — caught by the `tsm.tab` fixture where the index spills across a
+  chain into a reused free bucket).
+- Full-MS-pattern interop proven: python-casacore reads a casacure-written
+  table combining StandardStMan scalars + long strings + `table.f0i` arrays,
+  IncrementalStMan TIME/ANT1, and TiledColumnStMan DATA — 6 files, every
+  value exact.
 - `table` module: `parse_table_header` parses the `table.dat` root object
   (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit
   tests plus a manifest-driven fixture test asserting the header of the real

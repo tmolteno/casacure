@@ -180,6 +180,49 @@ def make_ism_table(fixtures: Path) -> dict:
         }
 
 
+def make_tsm_table(fixtures: Path) -> dict:
+    """A table whose DATA column (fixed-shape 2x3 dcomplex) is stored with
+    TiledColumnStMan — the MS visibility-data storage pattern."""
+    import numpy as np
+
+    path = fixtures / "tsm.tab"
+    acd = ct.makearrcoldesc(
+        "DATA", 0.0 + 0.0j, 2, [2, 3], "TiledColumnStMan", "TiledData_GROUP", 4
+    )
+    scd = ct.makescacoldesc("IDX", 0)
+    td = ct.maketabdesc([acd, scd])
+    nrow = 3
+    with ct.table(str(path), td, nrow=nrow, ack=False) as t:
+        for r in range(nrow):
+            cells = np.array(
+                [
+                    [r + 1j, r + 2j, r + 3j],
+                    [r + 4j, r + 5j, r + 6j],
+                ],
+                dtype=np.complex128,
+            )
+            t.putcell("DATA", r, cells)
+            t.putcell("IDX", r, r)
+        first = t.getcell("DATA", 0)
+        return {
+            "path": path.name,
+            "nrows": nrow,
+            "big_endian": sys.byteorder == "big",
+            "array_shape": list(first.shape),
+            "array_dtype": first.dtype.str,
+            "columns": {
+                "DATA": {
+                    "value_type": t.getcoldesc("DATA")["valueType"],
+                    "getcol_dtype": first.dtype.str,
+                },
+                "IDX": {
+                    "value_type": t.getcoldesc("IDX")["valueType"],
+                    "getcol_dtype": t.getcol("IDX").dtype.str,
+                },
+            },
+        }
+
+
 def main() -> None:
     if FIXTURES.exists():
         shutil.rmtree(FIXTURES)
@@ -193,6 +236,7 @@ def main() -> None:
             "array": make_array_table(FIXTURES),
             "longstr": make_long_string_table(FIXTURES),
             "ism": make_ism_table(FIXTURES),
+            "tsm": make_tsm_table(FIXTURES),
         },
     }
     (FIXTURES / "manifest.json").write_text(json.dumps(manifest, indent=2))

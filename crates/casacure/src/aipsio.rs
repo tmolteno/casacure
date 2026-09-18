@@ -86,6 +86,12 @@ impl<'a> Reader<'a> {
         self.pos
     }
 
+    /// Skip `n` bytes.
+    pub fn skip(&mut self, n: usize) -> Result<(), AipsIoError> {
+        self.take(n)?;
+        Ok(())
+    }
+
     fn take(&mut self, n: usize) -> Result<&'a [u8], AipsIoError> {
         if self.buf.len() - self.pos < n {
             return Err(AipsIoError::Truncated {

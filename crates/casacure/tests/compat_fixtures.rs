@@ -315,7 +315,7 @@ fn fixture_table_descs_parse() {
             assert!(
                 matches!(
                     desc.data_manager_type.as_str(),
-                    "StandardStMan" | "IncrementalStMan"
+                    "StandardStMan" | "IncrementalStMan" | "TiledColumnStMan"
                 ),
                 "{name}.{col_name}: unsupported data manager {}",
                 desc.data_manager_type
@@ -538,6 +538,76 @@ fn fixture_ism_read() {
             got,
             RecordValue::Double(t.values["VAL"][row as usize].as_f64().unwrap()),
             "ism VAL row {row}"
+        );
+    }
+}
+/// Reads the real casacore-written `tsm.tab`: the fixed-shape (2x3 dcomplex)
+/// DATA column comes back through the TiledColumnStMan tile file
+/// (`table.f0_TSM0`).
+#[test]
+fn fixture_tsm_read() {
+    use casacure::record::{ArrayData, RecordValue};
+    let Some(manifest) = load_manifest() else {
+        return;
+    };
+    let Some(t) = manifest.tables.get("tsm") else {
+        return;
+    };
+    let fixtures_dir = manifest_path().parent().unwrap().to_path_buf();
+    let dir = fixtures_dir.join(&t.path);
+    let dat_bytes = std::fs::read(dir.join("table.dat")).expect("cannot read table.dat");
+    let dat = casacure::parse_table_dat(&dat_bytes)
+        .unwrap_or_else(|e| panic!("tsm: table.dat failed to parse: {e}"));
+
+    let tsm = casacure::TsmFile::open(&dir, 0, dat.header.big_endian)
+        .unwrap_or_else(|e| panic!("tsm: data file failed to open: {e}"));
+    // TiledColumnStMan hypercolumn: cell [3,2] (CASA order) + rows.
+    assert_eq!(tsm.header.hypercolumn_name, "TiledData_GROUP");
+    assert_eq!(tsm.header.nrrow, 3, "tsm: row count");
+    let cube = &tsm.header.cubes[0];
+    assert_eq!(
+        cube.cube_shape,
+        vec![3, 2, 3],
+        "tsm: cube shape (cell + rows)"
+    );
+    assert_eq!(cube.tile_shape[..2], [3, 2], "tsm: per-cell tile shape");
+    assert_eq!(
+        tsm.header.data_types,
+        vec![casacure::record::DataType::DComplex]
+    );
+
+    let data_desc = dat.desc.column("DATA").unwrap();
+    for row in 0..3u64 {
+        let cell = tsm
+            .read_cell(data_desc, row)
+            .unwrap_or_else(|e| panic!("tsm DATA row {row}: {e}"));
+        match cell {
+            RecordValue::Array(a) => {
+                assert_eq!(a.shape, vec![2, 3], "tsm: logical shape row {row}");
+                match &a.data {
+                    ArrayData::DComplex(vals) => {
+                        let expect: Vec<(f64, f64)> =
+                            (1..=6).map(|k| (row as f64, k as f64)).collect();
+                        assert_eq!(&vals[..], &expect[..], "tsm: values row {row}");
+                    }
+                    other => panic!("tsm: expected dcomplex, got {other:?}"),
+                }
+            }
+            other => panic!("tsm: expected array value, got {other:?}"),
+        }
+    }
+    // IDX lives in the StandardStMan DM (table.f1).
+    let ssm = casacure::StandardStManFile::open(&dir, 1, dat.header.big_endian).unwrap();
+    let dm1 = &dat.column_set.data_managers[1];
+    let spec = match &dm1.blob {
+        casacure::DataManagerBlob::StandardStMan(s) => s,
+        _ => panic!("tsm: expected StandardStMan spec"),
+    };
+    for row in 0..3u64 {
+        assert_eq!(
+            ssm.read_scalar_cell(spec, 0, dat.desc.column("IDX").unwrap(), row)
+                .unwrap(),
+            RecordValue::Int(row as i32)
         );
     }
 }
