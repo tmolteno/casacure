@@ -37,3 +37,11 @@ subtasks are moved here.
   casacore fixtures, runs `cargo test --workspace`, `cargo fmt --check`,
   `cargo clippy -D warnings`, builds the bindings with `pip install .`, and
   runs the pytest comparison suite.
+- `aipsio` module: cursor-based reader for casacore's canonical (big-endian)
+  AipsIO byte format — magic check, u32/u64, length-prefixed strings, and
+  typed object headers (root vs nested) — 5 unit tests.
+- `table` module: `parse_table_header` parses the `table.dat` root object
+  (`Table` v2/v3: row count, data-file endianness flag, table kind) — 5 unit
+  tests plus a manifest-driven fixture test asserting the header of the real
+  casacore-written `typed.tab` (nrows and host byte order now recorded in
+  `tests/fixtures/manifest.json` by `tests/make_fixtures.py`).

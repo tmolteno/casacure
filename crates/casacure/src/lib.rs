@@ -3,6 +3,9 @@
 //!
 //! See `CASACORE_TO_CASA_RS.md` for the required functionality inventory.
 
+pub mod aipsio;
+pub mod table;
 pub mod types;
 
+pub use table::{parse_table_header, TableError, TableHeader};
 pub use types::{UnknownValueType, ValueType};

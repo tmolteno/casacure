@@ -45,13 +45,21 @@ def make_typed_table(fixtures: Path) -> dict:
     with table(str(path), readonly=False, ack=False) as t:
         for name, (_, value) in zip(colnames, COLUMN_CASES):
             t.putcol(name, [value])
+        nrows = t.nrows()
         for name in colnames:
             data = t.getcol(name)
             columns[name] = {
                 "value_type": t.getcoldesc(name)["valueType"],
                 "getcol_dtype": getattr(data, "dtype", None).str if hasattr(data, "dtype") else "list",
             }
-    return {"path": path.name, "columns": columns}
+    return {
+        "path": path.name,
+        "nrows": nrows,
+        # casacore writes data files in host byte order; table.dat itself is
+        # always big-endian canonical AipsIO.
+        "big_endian": sys.byteorder == "big",
+        "columns": columns,
+    }
 
 
 def main() -> None:

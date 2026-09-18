@@ -9,14 +9,14 @@ Work areas are tracked as GitHub issues; subtasks live in `TODO.md`.
 
 | Suite | Command | Passing | Coverage |
 |---|---|---|---|
-| Rust unit + fixture tests | `cargo test` | 10/10 | type system, fixture manifest |
+| Rust unit + fixture tests | `cargo test` | 21/21 | type system, AipsIO reader, `table.dat` header |
 | casacore comparison tests | `.venv/bin/python -m pytest tests/` | 5/5 | type system only |
 
 ## Progress by area (per CASACORE_TO_CASA_RS.md)
 
 | Area | Status | Notes |
 |---|---|---|
-| §1 CASA table on-disk format | 0% | not started |
+| §1 CASA table on-disk format | ~5% | `table.dat` header parsing (magic, version, row count, endianness) done |
 | §2 Table lifecycle & locking | 0% | not started |
 | §3 Column data access | 0% | not started |
 | §4 Type system | ~90% | `ValueType` + numpy mapping done, verified against casacore 3.8.1 |

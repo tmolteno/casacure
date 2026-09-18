@@ -24,6 +24,8 @@ struct Manifest {
 #[derive(Debug, Deserialize)]
 struct TableFixture {
     path: String,
+    nrows: u64,
+    big_endian: bool,
     columns: BTreeMap<String, ColumnFixture>,
 }
 
@@ -124,4 +126,25 @@ fn manifest_reports_casacore_version() {
         !manifest.casacore_version.is_empty(),
         "manifest has no casacore_version"
     );
+}
+
+#[test]
+fn fixture_table_dat_headers_parse() {
+    let Some(manifest) = load_manifest() else {
+        return;
+    };
+    let fixtures_dir = manifest_path().parent().unwrap().to_path_buf();
+    for (name, table) in &manifest.tables {
+        let buf = std::fs::read(fixtures_dir.join(&table.path).join("table.dat"))
+            .expect("cannot read table.dat");
+        let hdr = casacure::parse_table_header(&buf)
+            .unwrap_or_else(|e| panic!("{name}: table.dat header failed to parse: {e}"));
+        assert_eq!(hdr.version, 2, "{name}: unexpected Table version");
+        assert_eq!(hdr.nrow, table.nrows, "{name}: wrong row count");
+        assert_eq!(
+            hdr.big_endian, table.big_endian,
+            "{name}: wrong endianness flag"
+        );
+        assert_eq!(hdr.kind, "PlainTable", "{name}: wrong table kind");
+    }
 }
