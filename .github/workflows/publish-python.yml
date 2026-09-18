@@ -28,8 +28,10 @@ jobs:
   # `--find-interpreter` covers all ABIs in one job per target; the sdist is
   # produced exactly once (the x86_64 Linux job).
   #
-  # macOS / Windows: one job per CPython version (3.10-3.14; 3.9 is provided
-  # on Linux via manylinux).
+  # macOS: one job per CPython version on arm64 runners (3.10-3.14; 3.9 is
+  # provided on Linux via manylinux). Intel-macOS (x86_64) wheels are not
+  # built: GitHub no longer hosts Intel-mac runners; Intel Mac users install
+  # the source distribution instead.
   build:
     name: Build wheels (${{ matrix.target }} ${{ matrix.python || 'manylinux' }})
     strategy:
@@ -44,21 +46,6 @@ jobs:
             target: aarch64-unknown-linux-gnu
             manylinux: auto
             sdist: false
-          - platform: macos-13
-            target: x86_64-apple-darwin
-            python: "3.10"
-          - platform: macos-13
-            target: x86_64-apple-darwin
-            python: "3.11"
-          - platform: macos-13
-            target: x86_64-apple-darwin
-            python: "3.12"
-          - platform: macos-13
-            target: x86_64-apple-darwin
-            python: "3.13"
-          - platform: macos-13
-            target: x86_64-apple-darwin
-            python: "3.14"
           - platform: macos-14
             target: aarch64-apple-darwin
             python: "3.10"
