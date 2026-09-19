@@ -81,7 +81,7 @@ uses and check casacure compatibility. Survey method/result → ARE_WE_CURED.md.
 - [X] AlecThomson/FixMS — MS repair/edit tool
 - [X] KrasnitzLab/sgains — gain-table reader/writer
 - [X] MicheleDelliVeneri/ALMASim — ALMA observation simulator
-- [ ] RobertJaro/solar-viewer — solar image viewer
+- [X] RobertJaro/solar-viewer — solar image viewer
 - [ ] StephanSilvaS/polynomial_preprocessing — visibility preprocessing
 - [ ] askap-vast/dstools — ASKAP VAST data tools
 - [ ] avikhagol/avica — VLA calibrator/catalog pipeline
