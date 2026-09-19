@@ -107,7 +107,7 @@ uses and check casacure compatibility. Survey method/result → ARE_WE_CURED.md.
 - [X] DDFacet (saopicc/DDFacet) — surveyed (ARE_WE_CURED): tables API only; query/select/sort/getkeyword added
 - [X] killMS — surveyed (ARE_WE_CURED)
 - [X] meqtrees-cattery (ska-sa/meqtrees-cattery) — MeqTrees simulation/cattery
-- [ ] cubical (ratt-ru/CubiCal) — direction-dependent calibration
+- [X] cubical (ratt-ru/CubiCal) — direction-dependent calibration
 
 Python 3.14: supported (pyo3 0.27 / numpy 0.27; full dask-ms suite green on 3.14; requires-python >=3.9,<3.15).
 
