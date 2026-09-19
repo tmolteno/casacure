@@ -1710,14 +1710,13 @@ fn ndarray_cells<T: numpy::Element + Copy>(
         for e in flat.iter().skip(start).take(stop - start) {
             corder.push(f(*e));
         }
-        if corder.len() == 1 && cell == 1 {
-            out.push(corder.pop().unwrap());
-        } else {
-            out.push(RecordValue::Array(core::record::ArrayValue {
-                shape: casa_shape.clone(),
-                data: array_data_of(&corder),
-            }));
-        }
+        // Array columns always store `RecordValue::Array` cells, even for a
+        // 1-element cell (e.g. an ncorr=1 CORR_TYPE column in an MS): the
+        // storage managers and readers expect an Array value there.
+        out.push(RecordValue::Array(core::record::ArrayValue {
+            shape: casa_shape.clone(),
+            data: array_data_of(&corder),
+        }));
     }
     Ok(out)
 }

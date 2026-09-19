@@ -261,6 +261,33 @@ def test_default_ms_subtable_uses_standard_schema(tmp_path):
     s.close()
 
 
+def test_putcol_array_column_single_element_cell(tmp_path):
+    """A 1-element array cell on an array column stays an Array value (not a
+    scalar): an MS with ncorr=1 stores and reads back [[9]]."""
+    td = maketabdesc([makearrcoldesc("arr", 1, 0, [1])])
+    with table(tmp_path / "t.tab", td, ack=False) as t:
+        t.addrows(1)
+        t.putcol("arr", np.array([[7]], dtype=np.int64))
+    t = table(tmp_path / "t.tab", ack=False)
+    np.testing.assert_array_equal(t.getcol("arr"), [[7]])
+    t.close()
+
+
+def test_ms_polarization_corr_type_single_corr(tmp_path):
+    """The skarabina MS fixture path: write CORR_TYPE (ncorr=1) into the
+    standard POLARIZATION subtable and read it back."""
+    from casacore.tables import complete_ms_desc, default_ms
+
+    p = tmp_path / "ms"
+    default_ms(str(p))
+    with table(str(p / "POLARIZATION"), readonly=False) as t:
+        t.addrows(1)
+        t.putcol("CORR_TYPE", np.array([[9]], dtype=np.int32))
+    t = table(str(p / "POLARIZATION"), ack=False)
+    np.testing.assert_array_equal(t.getcol("CORR_TYPE"), [[9]])
+    t.close()
+
+
 def test_getsubtables_via_table_keyword(tmp_path):
     """A "Table: <path>" string keyword becomes a TpTable and is listed by
     getsubtables() (mirrors casacore's subtable linkage)."""
