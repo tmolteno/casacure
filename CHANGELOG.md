@@ -7,6 +7,28 @@ subtasks are moved here.
 
 ### Added
 
+- **`casacure-test` and `casacure-bench` console scripts** (wheel entry
+  points `casacure:run_tests` / `casacure:run_benchmark`, implemented in the
+  extension so they run from the installed wheel):
+  - `casacure-test`: 14 self-tests over the public `casacure.tables` API —
+    scalar/array/string round-trips, fixed-shape arrays, dcomplex/int16 dtype
+    coercion, variable-array putvarcol/getvarcol, record columns, taql SELECT,
+    `table.query()/sort()` (the DDFacet/killMS pattern), getkeyword,
+    default_ms subtables + TpTable keyword, multidim strings, addrows
+    persistence. Prints a per-check summary; exit code = number of failures.
+  - `casacure-bench`: times putcol / getcol / taql WHERE+ORDERBY on an n-row
+    table, and compares against real python-casacore when it is importable as
+    a distinct module (the `casacore` shim and a missing casacore are both
+    detected and reported as casacure-only).
+- **Fixed a real bug the self-test exposed**: `putcol` of int64/int16 (and any
+  non-column-dtype) numpy arrays into *scalar* columns silently wrote zeros —
+  dtype coercion now applies to scalar columns too (it already covered array
+  columns). Verified int32/int64/int16 all round-trip.
+
+## [Unreleased]
+
+### Added
+
 - Table selection API driven by DDFacet's casacore usage (DDFacet's MS data
   path uses only `casacore.tables`: `getcol`/`putcol`/`addcols`/
   `getcoldesc`/`colnames`/`nrows`/`getkeyword`/`query`/`sort`/`getcolslice`):

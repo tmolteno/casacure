@@ -43,6 +43,10 @@ classifiers = [
 dependencies = []
 dynamic = ["version"]
 
+[project.scripts]
+casacure-test = "casacure:run_tests"
+casacure-bench = "casacure:run_benchmark"
+
 [project.urls]
 Homepage = "https://github.com/tmolteno/casacure"
 Repository = "https://github.com/tmolteno/casacure"

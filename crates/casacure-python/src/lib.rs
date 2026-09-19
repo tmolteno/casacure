@@ -3,6 +3,7 @@
 //! `taql`, `default_ms` and the type mapping helpers.
 
 mod convert;
+mod selftest;
 mod table;
 
 use ::casacure::ValueType;
@@ -150,6 +151,8 @@ fn casacure(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(numpy_dtype, m)?)?;
     m.add_function(wrap_pyfunction!(casa_type, m)?)?;
+    m.add_function(wrap_pyfunction!(selftest::run_tests, m)?)?;
+    m.add_function(wrap_pyfunction!(selftest::run_benchmark, m)?)?;
     tables_submodule(m)?;
     Ok(())
 }

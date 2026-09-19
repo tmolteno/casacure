@@ -1256,26 +1256,25 @@ impl Table {
         is_array_col: bool,
         varcol: bool,
     ) -> PyResult<Vec<RecordValue>> {
-        // Coerce numeric ndarrays to the column's element type (casacore
-        // casts, e.g. complex64 -> dcomplex when the column is C8).
+        // Coerce numeric ndarrays (scalar AND array columns) to the column's
+        // element type (casacore casts, e.g. complex64 -> dcomplex when the
+        // column is C8, int64/int16 -> int32 for an Int column).
         let mut coerced: Option<Bound<'_, PyAny>> = None;
-        if is_array_col {
-            if let Some(npd) = core::record::data_type_to_np(
-                self.desc().columns.get(_col_idx).map(|c| &c.data_type),
-            ) {
-                // Any ndarray (typed ndarrays don't all downcast to the
-                // `PyArrayDyn<PyAny>` form, e.g. complex64).
-                if value.getattr("dtype").is_ok()
-                    && value.cast::<PyList>().is_err()
-                    && value.cast::<PyDict>().is_err()
-                {
-                    let dtype = value.getattr("dtype")?;
-                    let kind: String = dtype.getattr("kind")?.extract()?;
-                    let itemsize: i64 = dtype.getattr("itemsize")?.extract()?;
-                    let have = core::record::np_kind_itemsize(&kind, itemsize);
-                    if have != Some(npd) {
-                        coerced = Some(value.call_method1("astype", (npd,))?);
-                    }
+        if let Some(npd) =
+            core::record::data_type_to_np(self.desc().columns.get(_col_idx).map(|c| &c.data_type))
+        {
+            // Any ndarray (typed ndarrays don't all downcast to the
+            // `PyArrayDyn<PyAny>` form, e.g. complex64).
+            if value.getattr("dtype").is_ok()
+                && value.cast::<PyList>().is_err()
+                && value.cast::<PyDict>().is_err()
+            {
+                let dtype = value.getattr("dtype")?;
+                let kind: String = dtype.getattr("kind")?.extract()?;
+                let itemsize: i64 = dtype.getattr("itemsize")?.extract()?;
+                let have = core::record::np_kind_itemsize(&kind, itemsize);
+                if have != Some(npd) {
+                    coerced = Some(value.call_method1("astype", (npd,))?);
                 }
             }
         }
