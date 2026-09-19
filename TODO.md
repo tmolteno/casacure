@@ -104,7 +104,7 @@ uses and check casacure compatibility. Survey method/result → ARE_WE_CURED.md.
 ### PyPI `requires_dist` dependents (and prior survey)
 
 - [X] dask-ms (ratt-ru/dask-ms) — surveyed: 219/219 suite green via shim + direct backend
-- [X] DDFacet (saopicc/DDFacet) — surveyed (ARE_WE_CURED): tables API only; query/select/sort/getkeyword added
+- [X] DDFacet (saopicc/DDFacet) — rechecked from the GitHub tarball (ARE_WE_CURED): tables MS path covered; images/measures/quanta outside the table system
 - [X] killMS — surveyed (ARE_WE_CURED)
 - [X] meqtrees-cattery (ska-sa/meqtrees-cattery) — MeqTrees simulation/cattery
 - [X] cubical (ratt-ru/CubiCal) — direction-dependent calibration
