@@ -960,7 +960,15 @@ impl Table {
                         && c.shape.as_deref().is_none_or(|s| s.is_empty())
                 })
                 .unwrap_or(false);
-            if varcol && !a.shape.is_empty() && a.shape[0] == 1 {
+            // Strip a leading row singleton only when the remainder is a
+            // real (non-trivial) cell shape; a cell like (1, 1) from an
+            // nchan=1/ncorr=1 MS keeps both dims so consumers (e.g. dask-ms's
+            // exemplar read) see a 2-D cell that matches the descriptor.
+            if varcol
+                && a.shape.len() >= 2
+                && a.shape[0] == 1
+                && a.shape[1..].iter().any(|&d| d > 1)
+            {
                 let mut trimmed = a.clone();
                 trimmed.shape.remove(0);
                 return convert::array_to_ndarray(py, &trimmed);

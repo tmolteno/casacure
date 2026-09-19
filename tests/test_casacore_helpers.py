@@ -360,6 +360,31 @@ def test_tiledshapestman_created_as_standard(tmp_path):
     t.close()
 
 
+def test_getcell_keeps_singleton_dims(tmp_path):
+    """A (1,1) array cell from an nchan=1/ncorr=1 MS stays 2-D on getcell
+    (no leading-row-singleton trim), so dask-ms's exemplar read sees a shape
+    matching the ndim=2 descriptor."""
+    td = maketabdesc([makearrcoldesc("arr", 1, 0, [1, 1])])
+    with table(tmp_path / "t.tab", td, ack=False) as t:
+        t.addrows(1)
+        t.putcol("arr", np.array([[[7]]], dtype=np.int64))
+    t = table(tmp_path / "t.tab", ack=False)
+    got = t.getcell("arr", 0)
+    assert np.shape(got) == (1, 1)
+    np.testing.assert_array_equal(np.asarray(got), [[7]])
+    t.close()
+    # a genuine (1, nchan>1) cell still trims the leading row singleton
+    td = maketabdesc([makearrcoldesc("arr2", 1, 0, [1, 3])])
+    with table(tmp_path / "t2.tab", td, ack=False) as t:
+        t.addrows(1)
+        t.putcol("arr2", np.array([[[1, 2, 3]]], dtype=np.int64))
+    t = table(tmp_path / "t2.tab", ack=False)
+    got = t.getcell("arr2", 0)
+    assert np.shape(got) == (3,)
+    np.testing.assert_array_equal(np.asarray(got), [1, 2, 3])
+    t.close()
+
+
 def test_getsubtables_via_table_keyword(tmp_path):
     """A "Table: <path>" string keyword becomes a TpTable and is listed by
     getsubtables() (mirrors casacore's subtable linkage)."""
