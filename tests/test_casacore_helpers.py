@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from casacore.tables import (
+    default_ms_subtable,
     makecoldesc,
     makearrcoldesc,
     makedminfo,
@@ -230,6 +231,34 @@ def test_tablecopy_deep_copies_subtables(tmp_path):
     t = table(out / "sub.tab", ack=False)
     np.testing.assert_array_equal(t.getcol("s"), [7])
     t.close()
+
+
+def test_default_ms_subtable_uses_standard_schema(tmp_path):
+    """default_ms_subtable(name, path) creates the standard subtable schema
+    (like python-casacore) when no tabdesc is given; the subtable is
+    writable and reads back."""
+    ms = tmp_path / "ms"
+    from casacore.tables import default_ms
+
+    default_ms(str(ms))
+    sub = ms / "SOURCE"
+    with default_ms_subtable("SOURCE", str(sub)) as s:
+        assert "SOURCE_ID" in s.colnames()
+        assert "NAME" in s.colnames()
+        s.addrows(2)
+        s.putcol("SOURCE_ID", [0, 1])
+        s.putcol("NAME", ["T1", "T2"])
+    from casacore.tables import table
+
+    t = table(str(sub), ack=False)
+    np.testing.assert_array_equal(t.getcol("SOURCE_ID"), [0, 1])
+    assert t.getcol("NAME") == ["T1", "T2"]
+    t.close()
+    # a caller-supplied tabdesc still wins
+    custom = maketabdesc(makescacoldesc("x", 1))
+    with default_ms_subtable("WEATHER", str(ms / "W"), custom) as s:
+        assert sorted(s.colnames()) == ["x"]
+    s.close()
 
 
 def test_getsubtables_via_table_keyword(tmp_path):

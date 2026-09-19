@@ -87,9 +87,23 @@ fn default_ms_subtable(
     dminfo: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyAny>> {
     let _path_str = table::path_string(path)?;
-    // Create the subtable at `path` from the provided desc (like the
-    // python-casacore `default_ms_subtable`, which honours the given
-    // tabdesc) and return it as a context manager (`with ...:`).
+    // Create the subtable at `path`. Like python-casacore's
+    // `default_ms_subtable`, a missing tabdesc means "use the standard
+    // schema for this subtable" (required_ms_desc(name)); creating a table
+    // with no descriptor is not supported.
+    let owned_desc = match tabdesc {
+        Some(d) if !d.is_none() => None,
+        _ => {
+            let desc = ::casacure::ms::required_ms_desc(Some(name))
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            Some(table::desc_to_pydict(py, &desc, None)?)
+        }
+    };
+    let tabdesc: Option<&Bound<'_, PyAny>> = match (&tabdesc, owned_desc.as_ref()) {
+        (Some(d), _) => Some(d),
+        (None, Some(o)) => Some(o.as_any()),
+        (None, None) => None,
+    };
     let t = table::table(
         py,
         path,
@@ -101,7 +115,6 @@ fn default_ms_subtable(
         &PyTuple::empty(py),
         None,
     )?;
-    let _ = name;
     Ok(t.into_pyobject(py)?.into_any().unbind())
 }
 
