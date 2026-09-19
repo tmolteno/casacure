@@ -37,4 +37,7 @@ jobs:
         run: pip install .
 
       - name: casacore comparison tests
-        run: pytest tests/
+        # Run the suite against casacure: the shim redirects `casacore.tables`
+        # to `casacure.tables` (real python-casacore is installed above only to
+        # generate the fixture tables).
+        run: PYTHONPATH=tests/shim pytest tests/

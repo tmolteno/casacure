@@ -85,7 +85,16 @@ fn keyword_value(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<RecordVal
         let name = value.call_method0("name")?.extract::<String>()?;
         Ok(RecordValue::Table(name))
     } else {
-        convert::pyobject_to_record(py, value)
+        let rec = convert::pyobject_to_record(py, value)?;
+        // A string keyword of the form "Table: <path>" is a subtable
+        // reference (casacore stores MS subtable links exactly this way), so
+        // it is stored as a TpTable value and surfaces via `getsubtables()`.
+        if let RecordValue::String(s) = &rec {
+            if let Some(rest) = s.strip_prefix("Table:") {
+                return Ok(RecordValue::Table(rest.trim().to_string()));
+            }
+        }
+        Ok(rec)
     }
 }
 
@@ -657,6 +666,71 @@ impl Table {
         let tables = PyList::empty(py);
         tables.append(slf.clone().into_any())?;
         crate::table::taql(py, query, Some(&tables), "Python", None)
+    }
+
+    /// `getsubtables()` — the subtable reference strings held by the table's
+    /// `Table:` keywords, as stored (matches python-casacore, which returns
+    /// e.g. `["./[ANTENNA]"]` for a keyword `"Table: ./ANTENNA"`).
+    ///
+    /// [FIXME]: The docstring is kept deliberately simple; the returned
+    /// strings are exactly what was written.
+    #[pyo3(signature = ())]
+    fn getsubtables(&self, _py: Python<'_>) -> PyResult<Vec<String>> {
+        let desc = self.desc();
+        let mut out: Vec<String> = Vec::new();
+        fn walk(v: &RecordValue, out: &mut Vec<String>) {
+            match v {
+                RecordValue::Table(s) => {
+                    if !out.contains(s) {
+                        out.push(s.clone());
+                    }
+                }
+                RecordValue::Record(r) => {
+                    for v in &r.values {
+                        walk(v, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for v in &desc.keywords.values {
+            walk(v, &mut out);
+        }
+        for v in &desc.private_keywords.values {
+            walk(v, &mut out);
+        }
+        Ok(out)
+    }
+
+    /// `copy(newtablename, deep=False, ...)` — copy this table on disk; `deep`
+    /// also copies the subtable directories referenced by `Table:` keywords
+    /// (like python-casacore's `table.copy`).
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (new_table_name, deep = false, valuecopy = false, dminfo = None, _endian = "aipsrc", _memorytable = false, _copynorows = false))]
+    fn copy(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        new_table_name: &Bound<'_, PyAny>,
+        deep: bool,
+        valuecopy: bool,
+        dminfo: Option<&Bound<'_, PyAny>>,
+        _endian: &str,
+        _memorytable: bool,
+        _copynorows: bool,
+    ) -> PyResult<()> {
+        let own: String = slf.call_method0("name")?.extract()?;
+        let src = pyo3::types::PyString::new(py, &own);
+        crate::helpers::tablecopy(
+            py,
+            src.as_any(),
+            new_table_name,
+            deep,
+            valuecopy,
+            dminfo,
+            "aipsrc",
+            false,
+            false,
+        )
     }
 
     /// `toascii(filename, columnnames=None)` — write the table (or the given

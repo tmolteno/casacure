@@ -418,6 +418,13 @@ pub fn tablecopy(
                 } else {
                     dbase.join(rel)
                 };
+                // Copying a table into the same parent directory leaves the
+                // subtable reference pointing at the same location, so the
+                // subtable is already in place — copying it onto itself would
+                // truncate the data files.
+                if ssub == dsub {
+                    continue;
+                }
                 if ssub.is_dir() && !copied.contains(&ssub) {
                     copy_dir(&ssub, &dsub)?;
                     copied.push(ssub.clone());

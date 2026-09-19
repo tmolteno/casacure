@@ -232,6 +232,90 @@ def test_tablecopy_deep_copies_subtables(tmp_path):
     t.close()
 
 
+def test_getsubtables_via_table_keyword(tmp_path):
+    """A "Table: <path>" string keyword becomes a TpTable and is listed by
+    getsubtables() (mirrors casacore's subtable linkage)."""
+    sub = table(tmp_path / "sub.tab", maketabdesc(makescacoldesc("s", 1)),
+                ack=False)
+    sub.close()
+    with table(tmp_path / "parent", maketabdesc(makescacoldesc("a", 1)),
+               ack=False) as t:
+        t.putkeyword("K", "Table: ./sub.tab")
+    t = table(tmp_path / "parent", ack=False)
+    assert t.getsubtables() == ["./sub.tab"]
+    # a table-object keyword also lists it
+    sub = table(tmp_path / "sub2.tab", maketabdesc(makescacoldesc("s", 1)),
+                ack=False)
+    with table(tmp_path / "parent2", maketabdesc(makescacoldesc("a", 1)),
+               ack=False) as t:
+        t.putkeyword("K", sub)
+    sub.close()
+    t = table(tmp_path / "parent2", ack=False)
+    assert t.getsubtables() == ["./sub2.tab"]
+    t.close()
+    # plain string keyword is not a subtable
+    with table(tmp_path / "parent3", maketabdesc(makescacoldesc("a", 1)),
+               ack=False) as t:
+        t.putkeyword("K", "not a table reference")
+    t = table(tmp_path / "parent3", ack=False)
+    assert t.getsubtables() == []
+    t.close()
+
+
+def test_table_copy_shallow_and_deep(tmp_path):
+    """table.copy(dest) copies the table; deep=True also copies subtables."""
+    sub = table(tmp_path / "sub.tab", maketabdesc(makescacoldesc("s", 1)),
+                ack=False)
+    sub.addrows(1)
+    sub.putcol("s", (9,))
+    sub.close()
+    with table(tmp_path / "parent", maketabdesc(makescacoldesc("a", 1)),
+               ack=False) as t:
+        t.addrows(2)
+        t.putcol("a", (1, 2))
+        t.putkeyword("K", "Table: ./sub.tab")
+
+    out = tmp_path / "out"
+    out.mkdir()
+    # shallow: subtable dir is not copied into the new parent (reference
+    # resolves to a path that does not exist yet)
+    t = table(tmp_path / "parent", ack=False)
+    t.copy(str(out / "shallow.tab"), deep=False)
+    t.close()
+    assert tableexists(out / "shallow.tab")
+    assert not tableexists(out / "sub.tab")
+
+    # deep: subtable lands next to the copy and is re-linked
+    t = table(tmp_path / "parent", ack=False)
+    t.copy(str(out / "deep.tab"), deep=True)
+    t.close()
+    assert tableexists(out / "deep.tab")
+    assert tableexists(out / "sub.tab")
+    c = table(out / "deep.tab", ack=False)
+    assert c.getsubtables() == ["./sub.tab"]
+    np.testing.assert_array_equal(c.getcol("a"), [1, 2])
+    c.close()
+    s = table(out / "sub.tab", ack=False)
+    np.testing.assert_array_equal(s.getcol("s"), [9])
+    s.close()
+
+    # deep copy into the SAME parent shares the subtable (no self-copy, and
+    # the original subtable is left intact)
+    t = table(tmp_path / "parent", ack=False)
+    t.copy(str(tmp_path / "same.tab"), deep=True)
+    t.close()
+    assert tableexists(tmp_path / "same.tab")
+    s = table(tmp_path / "sub.tab", ack=False)
+    np.testing.assert_array_equal(s.getcol("s"), [9])
+    s.close()
+
+    # destination must not pre-exist
+    t = table(tmp_path / "parent", ack=False)
+    with pytest.raises(RuntimeError):
+        t.copy(str(out / "shallow.tab"))
+    t.close()
+
+
 def test_table_taql_method(tmp_path):
     with table(tmp_path / "t.tab", maketabdesc(makescacoldesc("a", 1)),
                ack=False) as t:
