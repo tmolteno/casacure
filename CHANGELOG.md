@@ -3,6 +3,50 @@
 All notable changes to this project are documented here. Completed `TODO.md`
 subtasks are moved here.
 
+## [0.2.3] - 2026-09-19
+
+### Added
+
+- `Table.getsubtables()` — the subtable references from `Table:` keywords,
+  resolved to absolute paths (matching python-casacore); a string keyword of
+  the form `"Table: <path>"` is stored as a TpTable value (containers write
+  subtable links exactly this way).
+- `Table.copy(newtablename, deep=False, ...)` — on-disk table copy; `deep`
+  also copies subtable directories (with a same-parent guard so a subtable is
+  never copied onto itself).
+- `Table.toascii(filename)` (0.2.2 work) plus `removecol(s)` — drop columns
+  and their data from a writable table (accepts a single name or a sequence).
+- `default_ms_subtable(name, path)` builds the standard subtable schema when
+  no `tabdesc` is given (python-casacore behaviour); previously it created a
+  zero-column table (unsupported).
+- Descriptor builders and lifecycle helpers `makescacoldesc`, `makearrcoldesc`,
+  `makecoldesc`, `maketabdesc`, `makedminfo`, `tableexists`, `tabledelete`,
+  `tablecopy` (0.2.2 work) — the python-casacore `casacore.tables` helper
+  surface that dependent packages import.
+- `DASK_MS_BACKEND=casacure` support (tmolteno/dask-ms fork) makes dask-ms run
+  on casacure with no casacore shim; skarabina (352/355 tests) runs
+  end-to-end on casacure.
+
+### Fixed
+
+- Array-column `putcol`/`putvarcol` with Python list/tuple values (0.2.2),
+  and 1-element array cells now stay `RecordValue::Array` (an ncorr=1 CORR_TYPE
+  writes `[[9]]` instead of a scalar the storage managers reject).
+- numpy `<U`/`<S` string ndarrays now store into scalar and array string
+  columns (dask-ms writes subtable strings this way).
+- `getcell` keeps `(1,1)` cells 2-D — an nchan=1/ncorr=1 MS's FLAG/DATA cells
+  no longer read back as 1-D, so dask-ms's exemplar inference matches the
+  descriptor.
+- Columns declared `TiledShapeStMan`/`TiledCellStMan`/`TSM*Bounded*` are
+  created with StandardStMan (no variable-shape tiled manager; values
+  round-trip, only the on-disk layout differs) — skarabina's flag-version
+  tables.
+- `ci.yml` runs the ported/type suites against casacure via the in-repo
+  `tests/shim` (they assert casacure's strict unset-cell contract).
+- scalar dtype coercion for list/tuple/pure-Python-complex puts (0.2.2);
+  `getcol` dtype fidelity incl. uchar→uint16 promotion and complex ndarrays
+  (0.2.2); `ORDER BY` spaced form (0.2.2); Path support (0.2.2).
+
 ## [0.2.2] - 2026-09-19
 
 ### Added
