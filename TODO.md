@@ -89,7 +89,7 @@ uses and check casacure compatibility. Survey method/result → ARE_WE_CURED.md.
 - [X] caracal-pipeline/RFInder — RFI flagging (caracal)
 - [X] casangi/astroviper — MS fetch/convert library
 - [X] casangi/graphviper — data-model/imaging graph library
-- [ ] casangi/xradio — MS/other radio data ↔ xarray interop
+- [X] casangi/xradio — MS/other radio data ↔ xarray interop
 - [ ] devojyoti96/P-AIRCARS — EHT imaging pipeline
 - [ ] epfl-radio-astro/bipp — EPFL radio interferometry pipeline
 - [ ] flint-crew/flint — FLINT calibration/imaging framework
