@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. Completed `TODO.md`
 subtasks are moved here.
 
-## [Unreleased]
+## [0.2.2] - 2026-09-19
 
 ### Added
 
