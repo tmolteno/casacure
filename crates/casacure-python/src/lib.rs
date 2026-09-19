@@ -3,6 +3,7 @@
 //! `taql`, `default_ms` and the type mapping helpers.
 
 mod convert;
+mod helpers;
 mod selftest;
 mod table;
 
@@ -133,6 +134,14 @@ fn tables_submodule(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(required_ms_desc, &m)?)?;
     m.add_function(wrap_pyfunction!(complete_ms_desc, &m)?)?;
     m.add_function(wrap_pyfunction!(tablefromascii, &m)?)?;
+    m.add_function(wrap_pyfunction!(helpers::makescacoldesc, &m)?)?;
+    m.add_function(wrap_pyfunction!(helpers::makearrcoldesc, &m)?)?;
+    m.add_function(wrap_pyfunction!(helpers::makecoldesc, &m)?)?;
+    m.add_function(wrap_pyfunction!(helpers::maketabdesc, &m)?)?;
+    m.add_function(wrap_pyfunction!(helpers::makedminfo, &m)?)?;
+    m.add_function(wrap_pyfunction!(helpers::tableexists, &m)?)?;
+    m.add_function(wrap_pyfunction!(helpers::tabledelete, &m)?)?;
+    m.add_function(wrap_pyfunction!(helpers::tablecopy, &m)?)?;
     // Give the factories a resolvable `__module__` so dask-ms can pickle the
     // TableProxy (which pickles the factory callable).
     for name in ["table", "taql", "default_ms", "default_ms_subtable"] {

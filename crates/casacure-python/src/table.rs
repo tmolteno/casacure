@@ -649,6 +649,16 @@ impl Table {
         self.column_to_python(py, col_idx, &cells)
     }
 
+    /// `taql(query)` — run a TaQL query against this table (the `$1`/`$t`
+    /// reference), like python-casacore's `table.taql`. Returns the result
+    /// table.
+    #[pyo3(signature = (query))]
+    fn taql(slf: &Bound<'_, Self>, py: Python<'_>, query: &str) -> PyResult<Py<PyAny>> {
+        let tables = PyList::empty(py);
+        tables.append(slf.clone().into_any())?;
+        crate::table::taql(py, query, Some(&tables), "Python", None)
+    }
+
     /// `toascii(filename, columnnames=None)` — write the table (or the given
     /// columns) to an ascii file in the `tablefromascii` format.
     #[pyo3(signature = (filename, columnnames = None))]
@@ -1390,6 +1400,26 @@ impl Table {
             if value.cast::<PyDict>().is_ok() {
                 let rec = convert::py_to_string_array(py, value)?;
                 return Ok(vec![rec]);
+            }
+            // Plain Python list/tuple (putvarcol row values, or putcol with
+            // lists-of-rows): normalize to a typed ndarray of the column's
+            // element type and fall through to the ndarray handling below.
+            let mut normalized: Vec<Bound<'_, PyAny>> = Vec::new();
+            let mut value = value;
+            if value.cast::<PyList>().is_ok() || value.cast::<PyTuple>().is_ok() {
+                let mut arr = py.import("numpy")?.getattr("asarray")?.call1((value,))?;
+                if let Some(npd) = core::record::data_type_to_np(
+                    self.desc().columns.get(col_idx).map(|c| &c.data_type),
+                ) {
+                    let dt = arr.getattr("dtype")?;
+                    let kind: String = dt.getattr("kind")?.extract()?;
+                    let itemsize: i64 = dt.getattr("itemsize")?.extract()?;
+                    if core::record::np_kind_itemsize(&kind, itemsize) != Some(npd) {
+                        arr = arr.call_method1("astype", (npd,))?;
+                    }
+                }
+                normalized.push(arr);
+                value = normalized.last().unwrap();
             }
             // Complex arrays (the coercion above has already matched the
             // array to the column precision); numpy 0.26 names: Complex32 =
