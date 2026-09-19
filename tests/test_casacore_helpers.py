@@ -373,8 +373,9 @@ def test_getcell_keeps_singleton_dims(tmp_path):
     assert np.shape(got) == (1, 1)
     np.testing.assert_array_equal(np.asarray(got), [[7]])
     t.close()
-    # a genuine (1, nchan>1) cell still trims the leading row singleton
-    td = maketabdesc([makearrcoldesc("arr2", 1, 0, [1, 3])])
+    # a variable-shape (1, nchan>1) cell still trims the leading row
+    # singleton
+    td = maketabdesc([makearrcoldesc("arr2", 1, ndim=2)])
     with table(tmp_path / "t2.tab", td, ack=False) as t:
         t.addrows(1)
         t.putcol("arr2", np.array([[[1, 2, 3]]], dtype=np.int64))
