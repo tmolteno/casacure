@@ -288,6 +288,78 @@ def test_ms_polarization_corr_type_single_corr(tmp_path):
     t.close()
 
 
+def test_putcol_numpy_unicode_strings(tmp_path):
+    """numpy '<U'/'<S' string arrays store into scalar and array string
+    columns (dask-ms writes subtable string columns this way)."""
+    td = maketabdesc([makescacoldesc("name", "")])
+    with table(tmp_path / "s.tab", td, ack=False) as t:
+        t.addrows(2)
+        t.putcol("name", np.array(["a", "b"], dtype="<U4"))
+    t = table(tmp_path / "s.tab", ack=False)
+    assert t.getcol("name") == ["a", "b"]
+    t.close()
+    # string array column
+    td = maketabdesc([makearrcoldesc("arr", "", 0, [2])])
+    with table(tmp_path / "a.tab", td, ack=False) as t:
+        t.addrows(1)
+        t.putcol("arr", np.array([["x", "y"]], dtype="<U1"))
+    t = table(tmp_path / "a.tab", ack=False)
+    got = t.getcol("arr")
+    assert got["shape"] == [1, 2]
+    assert got["array"] == ["x", "y"]
+    t.close()
+
+
+def test_removecols(tmp_path):
+    """removecols drops columns and their data; remaining columns survive."""
+    with table(tmp_path / "t.tab",
+               maketabdesc([makescacoldesc("a", 1), makescacoldesc("b", 0.0),
+                            makescacoldesc("c", "")]), ack=False) as t:
+        t.addrows(1)
+        t.putcol("a", [1])
+        t.putcol("b", [2.0])
+        t.putcol("c", ["x"])
+    with table(tmp_path / "t.tab", readonly=False) as t:
+        t.removecols(["b"])
+    t = table(tmp_path / "t.tab", ack=False)
+    assert sorted(t.colnames()) == ["a", "c"]
+    np.testing.assert_array_equal(t.getcol("a"), [1])
+    assert t.getcol("c") == ["x"]
+    t.close()
+    with pytest.raises(KeyError):
+        with table(tmp_path / "t.tab", readonly=False) as t:
+            t.removecols(["z"])
+
+
+def test_removecol_single(tmp_path):
+    with table(tmp_path / "t.tab",
+               maketabdesc([makescacoldesc("a", 1), makescacoldesc("b", 1)]),
+               ack=False) as t:
+        t.addrows(1)
+    with table(tmp_path / "t.tab", readonly=False) as t:
+        t.removecol("a")
+    t = table(tmp_path / "t.tab", ack=False)
+    assert sorted(t.colnames()) == ["b"]
+    t.close()
+
+
+def test_tiledshapestman_created_as_standard(tmp_path):
+    """A column declared TiledShapeStMan (skarabina's flag versions) is
+    created writable, stored via StandardStMan, and round-trips."""
+    desc = {
+        "FLAG": {"valueType": "boolean", "ndim": 2, "_c_order": True,
+                 "dataManagerType": "TiledShapeStMan",
+                 "dataManagerGroup": "TiledFlag"}
+    }
+    with table(tmp_path / "fv.tab", desc, ack=False) as t:
+        assert t.getcoldesc("FLAG")["dataManagerType"] == "StandardStMan"
+        t.addrows(1)
+        t.putcol("FLAG", np.zeros((1, 8), dtype=bool))
+    t = table(tmp_path / "fv.tab", ack=False)
+    np.testing.assert_array_equal(t.getcol("FLAG"), np.zeros((1, 8), bool))
+    t.close()
+
+
 def test_getsubtables_via_table_keyword(tmp_path):
     """A "Table: <path>" string keyword becomes a TpTable and is listed by
     getsubtables() (mirrors casacore's subtable linkage)."""

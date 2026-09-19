@@ -188,6 +188,16 @@ pub(crate) fn column_from_desc_dict(
         Some(RecordValue::String(s)) if !s.is_empty() => s.clone(),
         _ => "StandardStMan".to_string(),
     };
+    // TiledShapeStMan / TiledCellStMan (variable-shape tiled managers) are not
+    // implemented by casacure's storage engine; create them with StandardStMan
+    // instead (same values round-trip; only the on-disk layout differs).
+    // TiledColumnStMan IS supported and is left alone.
+    let data_manager_type = match data_manager_type.as_str() {
+        "TiledShapeStMan" | "TiledCellStMan" | "TSMBoundedStMan" | "TSMExpStMan" => {
+            "StandardStMan".to_string()
+        }
+        other => other.to_string(),
+    };
     let data_manager_group = match get("dataManagerGroup") {
         Some(RecordValue::String(s)) if !s.is_empty() => s.clone(),
         _ => "StandardStMan".to_string(),

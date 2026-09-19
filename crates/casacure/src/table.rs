@@ -1382,6 +1382,17 @@ impl WritableTable {
         self.cells.push(vec![None; n]);
     }
 
+    /// Remove a column by index (`Table::removecols`); the data is discarded
+    /// at the next flush.
+    pub fn removecol(&mut self, col_idx: usize) {
+        if col_idx < self.desc.columns.len() {
+            self.desc.columns.remove(col_idx);
+        }
+        if col_idx < self.cells.len() {
+            self.cells.remove(col_idx);
+        }
+    }
+
     /// The number of rows in the in-memory cell store.
     pub fn col_len(&self, col_idx: usize) -> usize {
         self.cells.get(col_idx).map_or(0, Vec::len)

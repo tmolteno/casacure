@@ -584,6 +584,46 @@ impl Table {
         Ok(())
     }
 
+    /// `removecols(names)` — drop columns (and their data) from the table.
+    fn removecols(&self, columns: Vec<String>) -> PyResult<()> {
+        // Resolve column indices against the current descriptor before taking
+        // the write lock (col_index would re-lock the same mutex).
+        let desc = self.desc();
+        let mut indices: Vec<usize> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for name in &columns {
+            let col_idx = desc
+                .columns
+                .iter()
+                .position(|c| &c.name == name)
+                .ok_or_else(|| PyKeyError::new_err(format!("no such column: {name}")))?;
+            if seen.insert(col_idx) {
+                indices.push(col_idx);
+            }
+        }
+        indices.sort_unstable();
+        {
+            let mut inner = self.inner.lock().unwrap();
+            match &mut *inner {
+                Inner::Write { shared, dirty, .. } => {
+                    let mut s = shared.lock().unwrap();
+                    for idx in indices.iter().rev() {
+                        s.wt.removecol(*idx);
+                    }
+                    *dirty = true;
+                }
+                _ => return Err(PyValueError::new_err("table is not writable")),
+            }
+        }
+        self.flush()?;
+        Ok(())
+    }
+
+    /// `removecol(name)` — drop a single column (and its data).
+    fn removecol(&self, column: String) -> PyResult<()> {
+        self.removecols(vec![column])
+    }
+
     /// `addrows(n)`; grows the table by `n` empty rows.
     fn addrows(&self, n: u64) -> PyResult<()> {
         {
@@ -1443,25 +1483,45 @@ impl Table {
         // The column's declared element type, for scalar (list/tuple) values:
         // casacore casts every element to it on putcol.
         let col_dt = self.desc().columns.get(col_idx).map(|c| c.data_type);
+        // Normalize numpy unicode/byte string arrays to nested Python lists
+        // so the string handling paths (the scalar list branch and the array
+        // list->typed-ndarray normalization) see them.
+        let stringified: Option<Bound<'_, PyAny>> = if value.getattr("dtype").is_ok() {
+            let kind: String = value.getattr("dtype")?.getattr("kind")?.extract()?;
+            if kind == "U" || kind == "S" {
+                Some(value.call_method0("tolist")?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let value = match &stringified {
+            Some(s) => s,
+            None => value,
+        };
         // Coerce numeric ndarrays (scalar AND array columns) to the column's
         // element type (casacore casts, e.g. complex64 -> dcomplex when the
-        // column is C8, int64/int16 -> int32 for an Int column).
+        // column is C8, int64/int16 -> int32 for an Int column). String
+        // arrays are already handled by `stringified` above, so skip them.
         let mut coerced: Option<Bound<'_, PyAny>> = None;
-        if let Some(npd) =
-            core::record::data_type_to_np(self.desc().columns.get(col_idx).map(|c| &c.data_type))
-        {
-            // Any ndarray (typed ndarrays don't all downcast to the
-            // `PyArrayDyn<PyAny>` form, e.g. complex64).
-            if value.getattr("dtype").is_ok()
-                && value.cast::<PyList>().is_err()
-                && value.cast::<PyDict>().is_err()
-            {
-                let dtype = value.getattr("dtype")?;
-                let kind: String = dtype.getattr("kind")?.extract()?;
-                let itemsize: i64 = dtype.getattr("itemsize")?.extract()?;
-                let have = core::record::np_kind_itemsize(&kind, itemsize);
-                if have != Some(npd) {
-                    coerced = Some(value.call_method1("astype", (npd,))?);
+        if stringified.is_none() {
+            if let Some(npd) = core::record::data_type_to_np(
+                self.desc().columns.get(col_idx).map(|c| &c.data_type),
+            ) {
+                // Any ndarray (typed ndarrays don't all downcast to the
+                // `PyArrayDyn<PyAny>` form, e.g. complex64).
+                if value.getattr("dtype").is_ok()
+                    && value.cast::<PyList>().is_err()
+                    && value.cast::<PyDict>().is_err()
+                {
+                    let dtype = value.getattr("dtype")?;
+                    let kind: String = dtype.getattr("kind")?.extract()?;
+                    let itemsize: i64 = dtype.getattr("itemsize")?.extract()?;
+                    let have = core::record::np_kind_itemsize(&kind, itemsize);
+                    if have != Some(npd) {
+                        coerced = Some(value.call_method1("astype", (npd,))?);
+                    }
                 }
             }
         }
@@ -1482,9 +1542,20 @@ impl Table {
             let mut value = value;
             if value.cast::<PyList>().is_ok() || value.cast::<PyTuple>().is_ok() {
                 let mut arr = py.import("numpy")?.getattr("asarray")?.call1((value,))?;
-                if let Some(npd) = core::record::data_type_to_np(
+                // String columns have no numpy mapping in `data_type_to_np`;
+                // unicode/byte arrays must become object arrays for the
+                // string-cell handler to see them.
+                let npd = core::record::data_type_to_np(
                     self.desc().columns.get(col_idx).map(|c| &c.data_type),
-                ) {
+                )
+                .or_else(|| {
+                    matches!(
+                        self.desc().columns.get(col_idx).map(|c| c.data_type),
+                        Some(core::record::DataType::String)
+                    )
+                    .then_some("object")
+                });
+                if let Some(npd) = npd {
                     let dt = arr.getattr("dtype")?;
                     let kind: String = dt.getattr("kind")?.extract()?;
                     let itemsize: i64 = dt.getattr("itemsize")?.extract()?;
