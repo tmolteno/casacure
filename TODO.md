@@ -69,6 +69,46 @@ selection patch to dask-ms upstream (real python-casacore, when installed,
 still wins by default).
 - [ ] Register as a store type in `fsspec_store.py`/`dask_ms.py` dispatch (upstream, later)
 
+## 8. python-casacore dependent-package surveys
+
+Reverse dependents of python-casacore (sources: GitHub PACKAGE-dependents for
+`casacore/python-casacore`, PyPI `requires_dist`, and the previous
+ARE_WE_CURED.md survey). One entry per package: survey which casacore APIs it
+uses and check casacure compatibility. Survey method/result → ARE_WE_CURED.md.
+
+### GitHub PACKAGE dependents (casacore/python-casacore)
+
+- [ ] AlecThomson/FixMS — MS repair/edit tool
+- [ ] KrasnitzLab/sgains — gain-table reader/writer
+- [ ] MicheleDelliVeneri/ALMASim — ALMA observation simulator
+- [ ] RobertJaro/solar-viewer — solar image viewer
+- [ ] StephanSilvaS/polynomial_preprocessing — visibility preprocessing
+- [ ] askap-vast/dstools — ASKAP VAST data tools
+- [ ] avikhagol/avica — VLA calibrator/catalog pipeline
+- [ ] b4r-dev/b4r — VLBI correlation-sandbox tools
+- [ ] caracal-pipeline/RFInder — RFI flagging (caracal)
+- [ ] casangi/astroviper — MS fetch/convert library
+- [ ] casangi/graphviper — data-model/imaging graph library
+- [ ] casangi/xradio — MS/other radio data ↔ xarray interop
+- [ ] devojyoti96/P-AIRCARS — EHT imaging pipeline
+- [ ] epfl-radio-astro/bipp — EPFL radio interferometry pipeline
+- [ ] flint-crew/flint — FLINT calibration/imaging framework
+- [ ] flint-crew/jolly-roger — observation selection tool
+- [ ] haavee/jiveplot — VLBI data plotting
+- [ ] lofar-astron/spinifex — LOFAR beamformer/transient tools
+- [ ] radionets-project/radiotools — radio-astronomy utility functions
+- [ ] ratt-ru/solarkat — solar quick-look pipeline
+- [X] ratt-ru/tricolour — surveyed (ARE_WE_CURED: uses table/table//getcol in tests only; works)
+- [ ] ska-telescope/ska-sdp-wflow-low-selfcal — SKA low self-calibration workflow
+
+### PyPI `requires_dist` dependents (and prior survey)
+
+- [X] dask-ms (ratt-ru/dask-ms) — surveyed: 219/219 suite green via shim + direct backend
+- [X] DDFacet (saopicc/DDFacet) — surveyed (ARE_WE_CURED): tables API only; query/select/sort/getkeyword added
+- [X] killMS — surveyed (ARE_WE_CURED)
+- [ ] meqtrees-cattery (ska-sa/meqtrees-cattery) — MeqTrees simulation/cattery
+- [ ] cubical (ratt-ru/CubiCal) — direction-dependent calibration
+
 Python 3.14: supported (pyo3 0.27 / numpy 0.27; full dask-ms suite green on 3.14; requires-python >=3.9,<3.15).
 
 DDFacet survey (crates/casacure): DDFacet's MS data path uses only the tables
