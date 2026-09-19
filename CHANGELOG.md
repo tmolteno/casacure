@@ -5,6 +5,16 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-19
+
+### Added
+
+- `casacure-test` / `casacure-bench` console scripts (wheel entry points,
+  run outside pytest), and the scalar-column dtype-coercion fix they surfaced
+  (see the Unreleased section).
+
+## [Unreleased]
+
 ### Added
 
 - **`casacure-test` and `casacure-bench` console scripts** (wheel entry
