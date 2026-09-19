@@ -585,13 +585,20 @@ impl Table {
     }
 
     /// `removecols(names)` — drop columns (and their data) from the table.
-    fn removecols(&self, columns: Vec<String>) -> PyResult<()> {
+    fn removecols(&self, py: Python<'_>, columns: &Bound<'_, PyAny>) -> PyResult<()> {
+        let _ = py;
+        // Accept a single column name or a sequence of names.
+        let names: Vec<String> = if let Ok(name) = columns.extract::<String>() {
+            vec![name]
+        } else {
+            columns.extract()?
+        };
         // Resolve column indices against the current descriptor before taking
         // the write lock (col_index would re-lock the same mutex).
         let desc = self.desc();
         let mut indices: Vec<usize> = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for name in &columns {
+        for name in &names {
             let col_idx = desc
                 .columns
                 .iter()
@@ -620,8 +627,9 @@ impl Table {
     }
 
     /// `removecol(name)` — drop a single column (and its data).
-    fn removecol(&self, column: String) -> PyResult<()> {
-        self.removecols(vec![column])
+    fn removecol(&self, py: Python<'_>, column: &str) -> PyResult<()> {
+        let s = pyo3::types::PyString::new(py, column);
+        self.removecols(py, s.as_any())
     }
 
     /// `addrows(n)`; grows the table by `n` empty rows.
@@ -717,6 +725,14 @@ impl Table {
     #[pyo3(signature = ())]
     fn getsubtables(&self, _py: Python<'_>) -> PyResult<Vec<String>> {
         let desc = self.desc();
+        // The table's own directory, made absolute, so the returned subtable
+        // paths open from any working directory (like python-casacore).
+        let name: String = match &*self.inner.lock().unwrap() {
+            Inner::Read(dir) => dir.to_string_lossy().into_owned(),
+            _ => self.name()?,
+        };
+        let table_dir = std::fs::canonicalize(&name).unwrap_or_else(|_| name.clone().into());
+        let base = table_dir.parent().unwrap_or(std::path::Path::new("."));
         let mut out: Vec<String> = Vec::new();
         fn walk(v: &RecordValue, out: &mut Vec<String>) {
             match v {
@@ -739,7 +755,25 @@ impl Table {
         for v in &desc.private_keywords.values {
             walk(v, &mut out);
         }
-        Ok(out)
+        // Resolve each reference to an absolute path. Our own subtables are
+        // stored relative to the table's parent ("./ms/ANTENNA"); bare names
+        // are relative to the table directory.
+        let resolved: Vec<String> = out
+            .into_iter()
+            .map(|s| {
+                let p = std::path::Path::new(&s);
+                if p.is_absolute() {
+                    return s;
+                }
+                let joined = if let Some(rest) = s.strip_prefix("./") {
+                    base.join(rest)
+                } else {
+                    table_dir.join(&s)
+                };
+                joined.to_string_lossy().into_owned()
+            })
+            .collect();
+        Ok(resolved)
     }
 
     /// `copy(newtablename, deep=False, ...)` — copy this table on disk; `deep`

@@ -370,7 +370,7 @@ def test_getsubtables_via_table_keyword(tmp_path):
                ack=False) as t:
         t.putkeyword("K", "Table: ./sub.tab")
     t = table(tmp_path / "parent", ack=False)
-    assert t.getsubtables() == ["./sub.tab"]
+    assert t.getsubtables() == [str((tmp_path / "sub.tab").resolve())]
     # a table-object keyword also lists it
     sub = table(tmp_path / "sub2.tab", maketabdesc(makescacoldesc("s", 1)),
                 ack=False)
@@ -379,7 +379,7 @@ def test_getsubtables_via_table_keyword(tmp_path):
         t.putkeyword("K", sub)
     sub.close()
     t = table(tmp_path / "parent2", ack=False)
-    assert t.getsubtables() == ["./sub2.tab"]
+    assert t.getsubtables() == [str((tmp_path / "sub2.tab").resolve())]
     t.close()
     # plain string keyword is not a subtable
     with table(tmp_path / "parent3", maketabdesc(makescacoldesc("a", 1)),
@@ -420,7 +420,7 @@ def test_table_copy_shallow_and_deep(tmp_path):
     assert tableexists(out / "deep.tab")
     assert tableexists(out / "sub.tab")
     c = table(out / "deep.tab", ack=False)
-    assert c.getsubtables() == ["./sub.tab"]
+    assert c.getsubtables() == [str((out / "sub.tab").resolve())]
     np.testing.assert_array_equal(c.getcol("a"), [1, 2])
     c.close()
     s = table(out / "sub.tab", ack=False)
