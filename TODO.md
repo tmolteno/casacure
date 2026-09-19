@@ -95,7 +95,7 @@ uses and check casacure compatibility. Survey method/result → ARE_WE_CURED.md.
 - [X] flint-crew/flint — FLINT calibration/imaging framework
 - [X] flint-crew/jolly-roger — observation selection tool
 - [X] haavee/jiveplot — VLBI data plotting
-- [ ] lofar-astron/spinifex — LOFAR beamformer/transient tools
+- [X] lofar-astron/spinifex — LOFAR beamformer/transient tools
 - [ ] radionets-project/radiotools — radio-astronomy utility functions
 - [ ] ratt-ru/solarkat — solar quick-look pipeline
 - [X] ratt-ru/tricolour — surveyed (ARE_WE_CURED: uses table/table//getcol in tests only; works)
