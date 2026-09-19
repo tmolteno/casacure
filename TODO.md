@@ -86,7 +86,7 @@ uses and check casacure compatibility. Survey method/result → ARE_WE_CURED.md.
 - [X] askap-vast/dstools — ASKAP VAST data tools
 - [X] avikhagol/avica — VLA calibrator/catalog pipeline
 - [X] b4r-dev/b4r — VLBI correlation-sandbox tools
-- [ ] caracal-pipeline/RFInder — RFI flagging (caracal)
+- [X] caracal-pipeline/RFInder — RFI flagging (caracal)
 - [ ] casangi/astroviper — MS fetch/convert library
 - [ ] casangi/graphviper — data-model/imaging graph library
 - [ ] casangi/xradio — MS/other radio data ↔ xarray interop
