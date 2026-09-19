@@ -92,7 +92,7 @@ uses and check casacure compatibility. Survey method/result → ARE_WE_CURED.md.
 - [X] casangi/xradio — MS/other radio data ↔ xarray interop
 - [X] devojyoti96/P-AIRCARS — EHT imaging pipeline
 - [X] epfl-radio-astro/bipp — EPFL radio interferometry pipeline
-- [ ] flint-crew/flint — FLINT calibration/imaging framework
+- [X] flint-crew/flint — FLINT calibration/imaging framework
 - [ ] flint-crew/jolly-roger — observation selection tool
 - [ ] haavee/jiveplot — VLBI data plotting
 - [ ] lofar-astron/spinifex — LOFAR beamformer/transient tools
