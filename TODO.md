@@ -84,7 +84,7 @@ uses and check casacure compatibility. Survey method/result → ARE_WE_CURED.md.
 - [X] RobertJaro/solar-viewer — solar image viewer
 - [X] StephanSilvaS/polynomial_preprocessing — visibility preprocessing
 - [X] askap-vast/dstools — ASKAP VAST data tools
-- [ ] avikhagol/avica — VLA calibrator/catalog pipeline
+- [X] avikhagol/avica — VLA calibrator/catalog pipeline
 - [ ] b4r-dev/b4r — VLBI correlation-sandbox tools
 - [ ] caracal-pipeline/RFInder — RFI flagging (caracal)
 - [ ] casangi/astroviper — MS fetch/convert library
