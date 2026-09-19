@@ -3,6 +3,22 @@
 All notable changes to this project are documented here. Completed `TODO.md`
 subtasks are moved here.
 
+## [3.8.1] - 2026-09-19
+
+### Versioning policy (from 0.2.x)
+
+casacure now versions against the casacore / python-casacore interface it
+mirrors: the casacure release number is the casacore version whose table
+surface it implements (3.8.1 == the casacore 3.8.x / python-casacore 3.8.1
+interface). `casacure.__version__` therefore reports the same value
+python-casacore would, so version-gated consumers behave identically.
+PEP 440 floors like `casacure>=0.2.3` keep resolving (3.8.1 > 0.2.3).
+
+All history from the 0.2.2 / 0.2.3 releases (helper surface, Path support,
+array-column dtype fidelity, `getsubtables`/`copy`/`removecols`,
+`DASK_MS_BACKEND=casacure` backend support, skarabina fixes) is carried
+forward.
+
 ## [0.2.3] - 2026-09-19
 
 ### Added
