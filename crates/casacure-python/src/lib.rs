@@ -41,10 +41,11 @@ fn casa_type(numpy_dtype: &str) -> PyResult<String> {
 #[pyo3(signature = (path, tabdesc = None, dminfo = None))]
 fn default_ms(
     py: Python<'_>,
-    path: &str,
+    path: &Bound<'_, PyAny>,
     tabdesc: Option<&Bound<'_, PyAny>>,
     dminfo: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyAny>> {
+    let path_str = table::path_string(path)?;
     let _ = dminfo;
     let extra = match tabdesc {
         Some(d) if !d.is_none() => {
@@ -57,7 +58,7 @@ fn default_ms(
         }
         _ => None,
     };
-    ::casacure::ms::default_ms(std::path::Path::new(path), extra.as_deref())
+    ::casacure::ms::default_ms(std::path::Path::new(&path_str), extra.as_deref())
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let t = table::table(
         py,
@@ -80,10 +81,11 @@ fn default_ms(
 fn default_ms_subtable(
     py: Python<'_>,
     name: &str,
-    path: &str,
+    path: &Bound<'_, PyAny>,
     tabdesc: Option<&Bound<'_, PyAny>>,
     dminfo: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyAny>> {
+    let _path_str = table::path_string(path)?;
     // Create the subtable at `path` from the provided desc (like the
     // python-casacore `default_ms_subtable`, which honours the given
     // tabdesc) and return it as a context manager (`with ...:`).
@@ -163,10 +165,17 @@ fn casacure(m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// `X<base>,<digits>` complex), then whitespace-separated data rows.
 #[pyfunction]
 #[pyo3(signature = (path, ascii_file, ack = true))]
-fn tablefromascii(py: Python<'_>, path: &str, ascii_file: &str, ack: bool) -> PyResult<Py<PyAny>> {
+fn tablefromascii(
+    py: Python<'_>,
+    path: &Bound<'_, PyAny>,
+    ascii_file: &Bound<'_, PyAny>,
+    ack: bool,
+) -> PyResult<Py<PyAny>> {
     let _ = ack;
+    let path = table::path_string(path)?;
+    let ascii_file = table::path_string(ascii_file)?;
     use numpy::Complex64;
-    let text = std::fs::read_to_string(ascii_file)
+    let text = std::fs::read_to_string(&ascii_file)
         .map_err(|e| PyValueError::new_err(format!("cannot read {ascii_file}: {e}")))?;
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
     let header = lines
@@ -204,17 +213,20 @@ fn tablefromascii(py: Python<'_>, path: &str, ascii_file: &str, ack: bool) -> Py
         desc.set_item(name, col)?;
     }
     let tdesc = desc.into_any();
-    let t = table::table(
-        py,
-        path,
-        Some(&tdesc),
-        0,
-        None,
-        false,
-        true,
-        &PyTuple::empty(py),
-        None,
-    )?;
+    let t = {
+        let name = pyo3::types::PyString::new(py, &path);
+        table::table(
+            py,
+            name.as_any(),
+            Some(&tdesc),
+            0,
+            None,
+            false,
+            true,
+            &PyTuple::empty(py),
+            None,
+        )?
+    };
 
     // Data rows -> one typed numpy array per column.
     let rows: Vec<&str> = lines.collect();

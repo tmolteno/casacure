@@ -77,6 +77,46 @@ fn err<E: std::fmt::Display>(e: E) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
+/// A `casacure.tables.table` object stored as an MS keyword becomes a table
+/// reference (like python-casacore's `TpTable`); anything else is a normal
+/// value.
+fn keyword_value(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<RecordValue> {
+    if value.is_instance_of::<Table>() {
+        let name = value.call_method0("name")?.extract::<String>()?;
+        Ok(RecordValue::Table(name))
+    } else {
+        convert::pyobject_to_record(py, value)
+    }
+}
+
+/// Type letter for the ascii dump of a column (matches `tablefromascii`).
+fn toascii_type(cells: &[RecordValue]) -> char {
+    match cells.first() {
+        Some(RecordValue::Bool(_)) => 'S',
+        Some(RecordValue::UChar(_)) | Some(RecordValue::UShort(_)) => 'I',
+        Some(RecordValue::Int(_)) | Some(RecordValue::Int64(_)) => 'I',
+        Some(RecordValue::Float(_)) => 'R',
+        Some(RecordValue::Double(_)) => 'D',
+        Some(RecordValue::Complex(..)) | Some(RecordValue::DComplex(..)) => 'X',
+        Some(RecordValue::String(_)) | Some(RecordValue::Table(_)) => 'S',
+        _ => 'S',
+    }
+}
+
+/// Accept a `str` or any `os.PathLike` (e.g. `pathlib.Path`) and return the
+/// filesystem string, like python-casacore's table constructors.
+pub(crate) fn path_string(c: &Bound<'_, PyAny>) -> PyResult<String> {
+    if let Ok(s) = c.extract::<String>() {
+        return Ok(s);
+    }
+    if let Ok(p) = c.call_method0("__fspath__") {
+        return p.extract::<String>();
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "expected a str or os.PathLike",
+    ))
+}
+
 // Helper: read a sub-range of a column as `Vec<RecordValue>` (CASA order).
 fn column_cells(
     t: &::casacure::Table,
@@ -609,6 +649,66 @@ impl Table {
         self.column_to_python(py, col_idx, &cells)
     }
 
+    /// `toascii(filename, columnnames=None)` — write the table (or the given
+    /// columns) to an ascii file in the `tablefromascii` format.
+    #[pyo3(signature = (filename, columnnames = None))]
+    fn toascii(
+        &self,
+        _py: Python<'_>,
+        filename: &Bound<'_, PyAny>,
+        columnnames: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let filename = path_string(filename)?;
+        let cols: Vec<String> = match columnnames {
+            Some(c) if !c.is_none() => c.extract()?,
+            _ => self.colnames()?,
+        };
+        let total = self.row_count();
+        let mut name_line = Vec::with_capacity(cols.len());
+        let mut type_line = Vec::with_capacity(cols.len());
+        let mut col_cells: Vec<Vec<RecordValue>> = Vec::with_capacity(cols.len());
+        for name in &cols {
+            let col_idx = self.col_index(name)?;
+            let cells = self.read_col(col_idx, 0, total)?;
+            name_line.push(name.clone());
+            type_line.push(toascii_type(&cells).to_string());
+            col_cells.push(cells);
+        }
+        // tablefromascii splits name/type lines on whitespace.
+        let mut lines = vec![name_line.join(" "), type_line.join(" ")];
+        for r in 0..total as usize {
+            let mut row = Vec::new();
+            for cells in &col_cells {
+                let cell = &cells[r];
+                match cell {
+                    RecordValue::Bool(b) => row.push(if *b { "1" } else { "0" }.to_string()),
+                    RecordValue::UChar(b) => row.push(b.to_string()),
+                    RecordValue::UShort(b) => row.push(b.to_string()),
+                    RecordValue::Int(i) => row.push(i.to_string()),
+                    RecordValue::Int64(i) => row.push(i.to_string()),
+                    RecordValue::Float(f) => row.push(format!("{f}")),
+                    RecordValue::Double(d) => row.push(format!("{d}")),
+                    RecordValue::Complex(re, im) => {
+                        row.push(format!("{re}"));
+                        row.push(format!("{im}"));
+                    }
+                    RecordValue::DComplex(re, im) => {
+                        row.push(format!("{re}"));
+                        row.push(format!("{im}"));
+                    }
+                    RecordValue::String(s) | RecordValue::Table(s) => {
+                        row.push(s.clone());
+                    }
+                    other => row.push(format!("{other:?}")),
+                }
+            }
+            lines.push(row.join(" "));
+        }
+        std::fs::write(&filename, format!("{}\n", lines.join("\n")))
+            .map_err(|e| PyValueError::new_err(format!("cannot write {filename}: {e}")))?;
+        Ok(())
+    }
+
     /// `getcolnp(column, buf, startrow=0, nrow=-1)` — fill an existing numpy
     /// buffer.
     #[pyo3(signature = (column, buf, startrow = 0, nrow = -1))]
@@ -763,7 +863,7 @@ impl Table {
         value: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let col_idx = self.col_index(column)?;
-        let rec = convert::pyobject_to_record(py, value)?;
+        let rec = keyword_value(py, value)?;
         self.put_cell(col_idx, row, rec)?;
         self.flush()?;
         Ok(())
@@ -1023,7 +1123,7 @@ impl Table {
 
     /// `putkeyword(name, value)`.
     fn putkeyword(&self, py: Python<'_>, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        let rec = convert::pyobject_to_record(py, value)?;
+        let rec = keyword_value(py, value)?;
         {
             let mut inner = self.inner.lock().unwrap();
             match &mut *inner {
@@ -1250,18 +1350,21 @@ impl Table {
     fn value_to_cells(
         &self,
         py: Python<'_>,
-        _col_idx: usize,
+        col_idx: usize,
         value: &Bound<'_, PyAny>,
         nrow: u64,
         is_array_col: bool,
         varcol: bool,
     ) -> PyResult<Vec<RecordValue>> {
+        // The column's declared element type, for scalar (list/tuple) values:
+        // casacore casts every element to it on putcol.
+        let col_dt = self.desc().columns.get(col_idx).map(|c| c.data_type);
         // Coerce numeric ndarrays (scalar AND array columns) to the column's
         // element type (casacore casts, e.g. complex64 -> dcomplex when the
         // column is C8, int64/int16 -> int32 for an Int column).
         let mut coerced: Option<Bound<'_, PyAny>> = None;
         if let Some(npd) =
-            core::record::data_type_to_np(self.desc().columns.get(_col_idx).map(|c| &c.data_type))
+            core::record::data_type_to_np(self.desc().columns.get(col_idx).map(|c| &c.data_type))
         {
             // Any ndarray (typed ndarrays don't all downcast to the
             // `PyArrayDyn<PyAny>` form, e.g. complex64).
@@ -1380,11 +1483,27 @@ impl Table {
                 value.getattr("dtype")?.str()?.to_str()?
             )));
         }
-        // Scalar column: 1-D array (or list) of scalars.
+        // Scalar column: 1-D array (or list/tuple) of scalars. Each element
+        // is cast to the column's declared type (byte-identical semantics).
         if let Ok(list) = value.cast::<PyList>() {
             let mut out = Vec::with_capacity(list.len());
             for item in list.iter() {
-                out.push(convert::pyobject_to_record(py, &item)?);
+                let rec = convert::pyobject_to_record(py, &item)?;
+                out.push(match col_dt.as_ref() {
+                    Some(dt) => convert::cast_scalar_to(dt, &rec),
+                    None => rec,
+                });
+            }
+            return Ok(out);
+        }
+        if let Ok(tup) = value.cast::<PyTuple>() {
+            let mut out = Vec::with_capacity(tup.len());
+            for item in tup.iter() {
+                let rec = convert::pyobject_to_record(py, &item)?;
+                out.push(match col_dt.as_ref() {
+                    Some(dt) => convert::cast_scalar_to(dt, &rec),
+                    None => rec,
+                });
             }
             return Ok(out);
         }
@@ -1687,7 +1806,7 @@ fn spec_to_dict(py: Python<'_>, spec: &core::DmSpec) -> PyResult<Py<PyAny>> {
 #[pyo3(signature = (name, tabledesc = None, nrow = 0, _dminfo = None, readonly = false, _ack = true, *_args, **_kwargs))]
 pub fn table(
     py: Python<'_>,
-    name: &str,
+    name: &Bound<'_, PyAny>,
     tabledesc: Option<&Bound<'_, PyAny>>,
     nrow: i64,
     _dminfo: Option<&Bound<'_, PyAny>>,
@@ -1696,6 +1815,7 @@ pub fn table(
     _args: &Bound<'_, PyTuple>,
     _kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Table> {
+    let name = path_string(name)?;
     let desc_json = match tabledesc {
         Some(d) if !d.is_none() => {
             if let Ok(dict) = d.cast::<PyDict>() {
@@ -1709,7 +1829,7 @@ pub fn table(
     };
     Table::open_or_create(
         py,
-        name,
+        &name,
         desc_json.as_deref(),
         nrow.max(0) as u64,
         !readonly,

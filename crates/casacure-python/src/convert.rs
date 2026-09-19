@@ -6,7 +6,7 @@ use numpy::PyArrayMethods;
 use numpy::{Complex32, Complex64};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+use pyo3::types::{PyBool, PyComplex, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 
 // ---------------------------------------------------------------------------
 // Shapes / index transposition
@@ -224,12 +224,69 @@ pub(crate) fn scalars_cells_to_array(py: Python<'_>, cells: &[RecordValue]) -> P
             .collect();
         return Ok(numpy::PyArray1::from_vec(py, vec).into_any().unbind());
     }
+    // python-casacore promotes uchar columns to uint16 on getcol; casacure
+    // matches that (storage stays uint8).
     if let RecordValue::UChar(_) = cells.first().unwrap_or(&RecordValue::Int(0)) {
-        let vec: Vec<u8> = cells
+        let vec: Vec<u16> = cells
             .iter()
             .map(|v| match v {
-                RecordValue::UChar(u) => *u,
+                RecordValue::UChar(u) => u16::from(*u),
                 _ => 0,
+            })
+            .collect();
+        return Ok(numpy::PyArray1::from_vec(py, vec).into_any().unbind());
+    }
+    if let RecordValue::Short(_) = cells.first().unwrap_or(&RecordValue::Int(0)) {
+        let vec: Vec<i16> = cells
+            .iter()
+            .map(|v| match v {
+                RecordValue::Short(s) => *s,
+                RecordValue::Int(i) => *i as i16,
+                _ => 0,
+            })
+            .collect();
+        return Ok(numpy::PyArray1::from_vec(py, vec).into_any().unbind());
+    }
+    if let RecordValue::UShort(_) = cells.first().unwrap_or(&RecordValue::Int(0)) {
+        let vec: Vec<u16> = cells
+            .iter()
+            .map(|v| match v {
+                RecordValue::UShort(s) => *s,
+                _ => 0,
+            })
+            .collect();
+        return Ok(numpy::PyArray1::from_vec(py, vec).into_any().unbind());
+    }
+    if let RecordValue::UInt(_) = cells.first().unwrap_or(&RecordValue::Int(0)) {
+        let vec: Vec<u32> = cells
+            .iter()
+            .map(|v| match v {
+                RecordValue::UInt(u) => *u,
+                RecordValue::Int(i) => *i as u32,
+                _ => 0,
+            })
+            .collect();
+        return Ok(numpy::PyArray1::from_vec(py, vec).into_any().unbind());
+    }
+    if let RecordValue::Complex(_, _) = cells.first().unwrap_or(&RecordValue::Int(0)) {
+        let vec: Vec<numpy::Complex32> = cells
+            .iter()
+            .map(|v| match v {
+                RecordValue::Complex(re, im) => numpy::Complex32::new(*re, *im),
+                _ => numpy::Complex32::new(0.0, 0.0),
+            })
+            .collect();
+        return Ok(numpy::PyArray1::from_vec(py, vec).into_any().unbind());
+    }
+    if let RecordValue::DComplex(_, _) = cells.first().unwrap_or(&RecordValue::Int(0)) {
+        let vec: Vec<numpy::Complex64> = cells
+            .iter()
+            .map(|v| match v {
+                RecordValue::DComplex(re, im) => numpy::Complex64::new(*re, *im),
+                RecordValue::Complex(re, im) => {
+                    numpy::Complex64::new(f64::from(*re), f64::from(*im))
+                }
+                _ => numpy::Complex64::new(0.0, 0.0),
             })
             .collect();
         return Ok(numpy::PyArray1::from_vec(py, vec).into_any().unbind());
@@ -683,6 +740,10 @@ pub(crate) fn pyobject_to_record(py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResu
     if let Ok(f) = v.cast::<PyFloat>() {
         return Ok(RecordValue::Double(f.value()));
     }
+    // Pure-Python and numpy complex scalars.
+    if let Ok(c) = v.cast::<PyComplex>() {
+        return Ok(RecordValue::DComplex(c.real(), c.imag()));
+    }
     // numpy floating scalars (expose `__float__`).
     if let Ok(f) = v.extract::<f64>() {
         return Ok(RecordValue::Double(f));
@@ -953,6 +1014,107 @@ pub(crate) fn cell_logical_flat(cell: &RecordValue) -> Vec<RecordValue> {
     match cell {
         RecordValue::Array(a) => a.elements(),
         other => vec![other.clone()],
+    }
+}
+
+/// Cast a scalar `RecordValue` to a column's declared element type the way
+/// casacore does on `putcol`: numerics convert between integer widths
+/// (exactly, without a float round-trip) and to/from float/double, and
+/// real values become zero-imaginary complex values. Strings and booleans
+/// pass through unchanged unless trivially convertible.
+pub(crate) fn cast_scalar_to(dt: &DataType, v: &RecordValue) -> RecordValue {
+    use DataType::*;
+    match dt {
+        Bool => match v {
+            RecordValue::Bool(b) => RecordValue::Bool(*b),
+            _ => v.clone(),
+        },
+        UChar => match v {
+            RecordValue::Int(x) => RecordValue::UChar(*x as u8),
+            RecordValue::Int64(x) => RecordValue::UChar(*x as u8),
+            RecordValue::UShort(x) => RecordValue::UChar(*x as u8),
+            RecordValue::Short(x) => RecordValue::UChar(*x as u8),
+            RecordValue::UChar(x) => RecordValue::UChar(*x),
+            _ => v.clone(),
+        },
+        Short => match v {
+            RecordValue::Int(x) => RecordValue::Short(*x as i16),
+            RecordValue::Int64(x) => RecordValue::Short(*x as i16),
+            RecordValue::Short(x) => RecordValue::Short(*x),
+            RecordValue::UChar(x) => RecordValue::Short(i16::from(*x)),
+            RecordValue::UShort(x) => RecordValue::Short(*x as i16),
+            _ => v.clone(),
+        },
+        UShort => match v {
+            RecordValue::Int(x) => RecordValue::UShort(*x as u16),
+            RecordValue::Int64(x) => RecordValue::UShort(*x as u16),
+            RecordValue::UShort(x) => RecordValue::UShort(*x),
+            RecordValue::UChar(x) => RecordValue::UShort(u16::from(*x)),
+            RecordValue::Short(x) => RecordValue::UShort(*x as u16),
+            _ => v.clone(),
+        },
+        Int => match v {
+            RecordValue::Int64(x) => RecordValue::Int(*x as i32),
+            RecordValue::Short(x) => RecordValue::Int(i32::from(*x)),
+            RecordValue::UShort(x) => RecordValue::Int(i32::from(*x)),
+            RecordValue::UChar(x) => RecordValue::Int(i32::from(*x)),
+            RecordValue::Int(x) => RecordValue::Int(*x),
+            _ => v.clone(),
+        },
+        UInt => match v {
+            RecordValue::Int(x) => RecordValue::UInt(*x as u32),
+            RecordValue::Int64(x) => RecordValue::UInt(*x as u32),
+            RecordValue::UChar(x) => RecordValue::UInt(u32::from(*x)),
+            RecordValue::UShort(x) => RecordValue::UInt(u32::from(*x)),
+            RecordValue::UInt(x) => RecordValue::UInt(*x),
+            _ => v.clone(),
+        },
+        Int64 => match v {
+            RecordValue::Int(x) => RecordValue::Int64(i64::from(*x)),
+            RecordValue::Int64(x) => RecordValue::Int64(*x),
+            RecordValue::UChar(x) => RecordValue::Int64(i64::from(*x)),
+            RecordValue::UShort(x) => RecordValue::Int64(i64::from(*x)),
+            RecordValue::Short(x) => RecordValue::Int64(i64::from(*x)),
+            RecordValue::UInt(x) => RecordValue::Int64(i64::from(*x)),
+            _ => v.clone(),
+        },
+        Float => match v {
+            RecordValue::Float(x) => RecordValue::Float(*x),
+            RecordValue::Double(x) => RecordValue::Float(*x as f32),
+            RecordValue::Int(x) => RecordValue::Float(*x as f32),
+            RecordValue::Int64(x) => RecordValue::Float(*x as f32),
+            RecordValue::UChar(x) => RecordValue::Float(f32::from(*x)),
+            RecordValue::UShort(x) => RecordValue::Float(f32::from(*x)),
+            _ => v.clone(),
+        },
+        Double => match v {
+            RecordValue::Double(x) => RecordValue::Double(*x),
+            RecordValue::Float(x) => RecordValue::Double(f64::from(*x)),
+            RecordValue::Int(x) => RecordValue::Double(f64::from(*x)),
+            RecordValue::Int64(x) => RecordValue::Double(*x as f64),
+            RecordValue::UChar(x) => RecordValue::Double(f64::from(*x)),
+            RecordValue::UShort(x) => RecordValue::Double(f64::from(*x)),
+            _ => v.clone(),
+        },
+        Complex => match v {
+            RecordValue::Complex(re, im) => RecordValue::Complex(*re, *im),
+            RecordValue::DComplex(re, im) => RecordValue::Complex(*re as f32, *im as f32),
+            RecordValue::Double(x) => RecordValue::Complex(*x as f32, 0.0),
+            RecordValue::Float(x) => RecordValue::Complex(*x, 0.0),
+            RecordValue::Int(x) => RecordValue::Complex(*x as f32, 0.0),
+            RecordValue::Int64(x) => RecordValue::Complex(*x as f32, 0.0),
+            _ => v.clone(),
+        },
+        DComplex => match v {
+            RecordValue::DComplex(re, im) => RecordValue::DComplex(*re, *im),
+            RecordValue::Complex(re, im) => RecordValue::DComplex(f64::from(*re), f64::from(*im)),
+            RecordValue::Double(x) => RecordValue::DComplex(*x, 0.0),
+            RecordValue::Float(x) => RecordValue::DComplex(f64::from(*x), 0.0),
+            RecordValue::Int(x) => RecordValue::DComplex(f64::from(*x), 0.0),
+            RecordValue::Int64(x) => RecordValue::DComplex(*x as f64, 0.0),
+            _ => v.clone(),
+        },
+        _ => v.clone(),
     }
 }
 

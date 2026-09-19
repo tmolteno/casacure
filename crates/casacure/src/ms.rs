@@ -60,13 +60,23 @@ fn schema_desc(table: &str, complete: bool) -> Result<TableDesc, MsError> {
 
 /// `required_ms_desc()` / `required_ms_desc(subtable)` — the vendored
 /// canonical required descriptors.
+// The main MS is stored under the "MS" schema key; python-casacore also
+// accepts "MAIN" for it.
+fn schema_name(table: Option<&str>) -> &str {
+    match table {
+        Some(t) if t.eq_ignore_ascii_case("MAIN") => "MS",
+        Some(t) => t,
+        None => "MS",
+    }
+}
+
 pub fn required_ms_desc(table: Option<&str>) -> Result<TableDesc, MsError> {
-    schema_desc(table.unwrap_or("MS"), false)
+    schema_desc(schema_name(table), false)
 }
 
 /// `complete_ms_desc()` / `complete_ms_desc(subtable)`.
 pub fn complete_ms_desc(table: Option<&str>) -> Result<TableDesc, MsError> {
-    schema_desc(table.unwrap_or("MS"), true)
+    schema_desc(schema_name(table), true)
 }
 
 /// Merge extra columns (a python-casacore desc dict) into a `TableDesc`,

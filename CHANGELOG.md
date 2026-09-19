@@ -5,6 +5,49 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Added
+
+- **`tests/test_casacore_ported.py`**: 9 tests ported from python-casacore's
+  `tests/test_table.py` (`test_check_datatypes`, `test_check_putdata`,
+  `test_addcolumns`, `test_keywords`, `test_subset`, `test_subtables`,
+  `test_tableascii`, `test_complete_desc`, `test_required_desc`) with the
+  python-casacore builder helpers (`makescacoldesc`, `makearrcoldesc`,
+  `maketabdesc`, `makecoldesc`, `makedminfo`) inlined. Tests run through the
+  `casacore` shim; porting them surfaced and fixed the real gaps below.
+- **`Table.toascii(filename, columnnames=None)`** — writes the
+  `tablefromascii`-compatible ascii format (whitespace-separated name/type
+  lines, one data row per line).
+- **`DIFFERENCES.md`** — documents deliberate behavioural contracts where
+  casacure diverges from casacore/python-casacore (unset cells raise instead
+  of reading the type default), and why.
+
+### Fixed
+
+- **Scalar `putcol`/`putcell` element types**: Python lists/tuples (and pure
+  python complex values) now cast each element to the column's declared type,
+  matching casacore — `uchar`/`short`/`uint`/`float`/`complex` columns no
+  longer store value as int/int/double/… (`cast_scalar_to` in convert.rs;
+  `value_to_cells` in table.rs).
+- **`getcol` dtype fidelity**: `scalars_cells_to_array` now covers
+  Short/UShort/UInt/Complex/DComplex cells and promotes `uchar` columns to
+  `uint16` on read (python-casacore quirk), so casacure-crafted tables round-
+  trip at the declared precision.
+- **`os.PathLike` in constructors**: `table()`, `default_ms()`,
+  `default_ms_subtable()`, `tablefromascii()` accept `pathlib.Path` via a
+  shared `__fspath__` coercion (python-casacore's `test_path_support`).
+- **`complete_ms_desc("MAIN")` / `required_ms_desc("MAIN")`** now alias the
+  main MS (schema key `"MS"`), matching python-casacore.
+- **Empty `dataManagerType`/`dataManagerGroup`** in a column descriptor now
+  means `StandardStMan` (python-casacore's `makescacoldesc(x, val)` writes
+  `''`), instead of failing with "unsupported data-manager type".
+- **`putkeyword`/`putcolkeyword` accept a table object** — stored as a
+  `TpTable` reference (like python-casacore) and read back as `Table: <path>`.
+- **`pyobject_to_record` handles `PyComplex`** for complex keyword/cell
+  values instead of stringifying them.
+- **TaQL accepts `ORDER BY <expr>`** (casacore's spaced form) as an alias of
+  `ORDERBY` — the ported `test_subset` uses the real syntax; covered by a new
+  Rust parser test (`order_by_spaced_form_matches_orderby`).
+
 ## [0.2.1] - 2026-09-19
 
 ### Added

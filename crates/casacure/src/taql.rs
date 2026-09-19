@@ -594,8 +594,19 @@ impl Parser {
                     self.next();
                     where_ = Some(self.parse_expr()?);
                 }
-                Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("orderby") => {
+                Some(Tok::Ident(w))
+                    if w.eq_ignore_ascii_case("order") || w.eq_ignore_ascii_case("orderby") =>
+                {
+                    let spaced = w.eq_ignore_ascii_case("order");
                     self.next();
+                    // `ORDER BY <expr>` (casacore's spaced form) vs `ORDERBY`.
+                    if spaced {
+                        if let Some(Tok::Ident(b)) = self.peek() {
+                            if b.eq_ignore_ascii_case("by") {
+                                self.next();
+                            }
+                        }
+                    }
                     loop {
                         let expr = self.parse_expr()?;
                         let mut desc = false;
@@ -1977,6 +1988,17 @@ mod tests {
             "SELECT ROWID() AS __tablerow__ FROM $1 ORDERBY VAL DESC",
         );
         assert_eq!(ints(r.getcol("__tablerow__").unwrap()), [2, 0, 3, 1, 4]);
+    }
+
+    #[test]
+    fn order_by_spaced_form_matches_orderby() {
+        // casacore's `ORDER BY col` (spaced) must behave like `ORDERBY`.
+        let (_dir, t) = probe_table();
+        let a = query(&t, "SELECT ROWID() AS r FROM $1 ORDER BY ANT");
+        let b = query(&t, "SELECT ROWID() AS r FROM $1 ORDERBY ANT");
+        assert_eq!(ints(a.getcol("r").unwrap()), ints(b.getcol("r").unwrap()));
+        let d = query(&t, "SELECT ROWID() AS r FROM $1 ORDER BY VAL DESC");
+        assert_eq!(ints(d.getcol("r").unwrap()), [2, 0, 3, 1, 4]);
     }
 
     #[test]

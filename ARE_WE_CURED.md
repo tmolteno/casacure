@@ -10,7 +10,7 @@ Work areas are tracked as GitHub issues; subtasks live in `TODO.md`.
 | Suite | Command | Passing | Coverage |
 |---|---|---|---|
 | Rust unit + fixture tests | `cargo test` | 85/85 | type system, AipsIO read+write (both endians), `table.dat`, StandardStMan data file + `table.f0i` + string buckets, IncrementalStMan (interval index, multi-DM tables) — all read+write |
-| casacore comparison tests | `.venv/bin/python -m pytest tests/` | 5/5 | type system only |
+| casacore comparison tests | `PYTHONPATH=/tmp/cpb:/tmp/shim .venv/bin/python -m pytest tests/` | 14/14 | type system + python-casacore `test_table.py` port (9 tests: datatypes, putdata, addcolumns, keywords, subset, subtables, tableascii, complete/required descs) |
 | write interop (manual) | `examples/create_sample_table.rs` + python-casacore | ✓ | casacure-write → casacore-read: SSM scalars, arrays, long strings, and ISM TIME/ANT1 in one 4-file table; 3-row and 100-row variants return exactly the written values |
 
 ## Casacure-compatible packages

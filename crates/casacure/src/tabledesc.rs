@@ -182,12 +182,14 @@ pub(crate) fn column_from_desc_dict(
         Some(RecordValue::String(s)) => s.clone(),
         _ => String::new(),
     };
+    // An empty data-manager type/group means StandardStMan (python-casacore's
+    // default when `makescacoldesc(..., datamanagertype='')` is used).
     let data_manager_type = match get("dataManagerType") {
-        Some(RecordValue::String(s)) => s.clone(),
+        Some(RecordValue::String(s)) if !s.is_empty() => s.clone(),
         _ => "StandardStMan".to_string(),
     };
     let data_manager_group = match get("dataManagerGroup") {
-        Some(RecordValue::String(s)) => s.clone(),
+        Some(RecordValue::String(s)) if !s.is_empty() => s.clone(),
         _ => "StandardStMan".to_string(),
     };
     let options = match get("option") {

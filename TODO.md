@@ -45,7 +45,9 @@ Work areas follow `CASACORE_TO_CASA_RS.md` (tracked as GitHub issues).
 
 - [X] `SELECT ... FROM $N` with `$N` table references
 - [X] `WHERE` expression evaluator (user `taql_where` passthrough)
-- [X] `ORDERBY`, `ROWID()`
+- [X] `ORDERBY`, `ROWID()`, and casacore's spaced `ORDER BY <expr>` form
+      (python-casacore `test_table.py` port uses `order by ... desc`; covered
+      by `order_by_spaced_form_matches_orderby`)
 - [X] `GROUPBY` + `GROWID()`/`GAGGR()`/`GCOUNT()`
 - [X] `SELECT UNIQUE col`, scalar subqueries
 - [X] DDL: `CREATE TABLE ... LIMIT n` for test fixtures
