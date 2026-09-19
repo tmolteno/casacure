@@ -94,7 +94,7 @@ uses and check casacure compatibility. Survey method/result → ARE_WE_CURED.md.
 - [X] epfl-radio-astro/bipp — EPFL radio interferometry pipeline
 - [X] flint-crew/flint — FLINT calibration/imaging framework
 - [X] flint-crew/jolly-roger — observation selection tool
-- [ ] haavee/jiveplot — VLBI data plotting
+- [X] haavee/jiveplot — VLBI data plotting
 - [ ] lofar-astron/spinifex — LOFAR beamformer/transient tools
 - [ ] radionets-project/radiotools — radio-astronomy utility functions
 - [ ] ratt-ru/solarkat — solar quick-look pipeline
