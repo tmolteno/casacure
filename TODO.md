@@ -99,7 +99,7 @@ uses and check casacure compatibility. Survey method/result → ARE_WE_CURED.md.
 - [X] radionets-project/radiotools — radio-astronomy utility functions
 - [X] ratt-ru/solarkat — solar quick-look pipeline
 - [X] ratt-ru/tricolour — surveyed (ARE_WE_CURED: uses table/table//getcol in tests only; works)
-- [ ] ska-telescope/ska-sdp-wflow-low-selfcal — SKA low self-calibration workflow
+- [X] ska-telescope/ska-sdp-wflow-low-selfcal — SKA low self-calibration workflow
 
 ### PyPI `requires_dist` dependents (and prior survey)
 
