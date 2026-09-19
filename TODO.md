@@ -78,7 +78,7 @@ uses and check casacure compatibility. Survey method/result → ARE_WE_CURED.md.
 
 ### GitHub PACKAGE dependents (casacore/python-casacore)
 
-- [ ] AlecThomson/FixMS — MS repair/edit tool
+- [X] AlecThomson/FixMS — MS repair/edit tool
 - [ ] KrasnitzLab/sgains — gain-table reader/writer
 - [ ] MicheleDelliVeneri/ALMASim — ALMA observation simulator
 - [ ] RobertJaro/solar-viewer — solar image viewer
