@@ -83,9 +83,34 @@ Which packages that depend on casacore can run on casacure.
 | §3 Column data access | DONE (core) | read hot path (getcell/getcol/getcolslice/getcellslice/getvarcol across SSM/ISM/TSM/strings) + `WritableTable` writes (addrows/putcol/putcell/flush, `setmaxcachesize` no-op). Remaining: the pyo3 numpy/dict binding layer (getcolnp buffers, `{"shape","array"}` string dicts). |
 | §4 Type system | ~90% | `ValueType` + numpy mapping done, verified against casacore 3.8.1 |
 | §5 Metadata & descriptors | ~85% | read + write done incl. subtable linkage: nrows/colnames/getcoldesc/getdesc, getkeywords/getcolkeywords, putkeyword/putcolkeyword/removekeyword/removecolkeyword (nested records), `TpTable` subtable keywords with `"Table: <path>"` resolution both ways |
-| §6 TaQL subset | ~80% | `taql` module: SELECT ($N / `'path'` / DDL), WHERE evaluator, ORDERBY/ROWID, GROUPBY+GROWID/GAGGR/GCOUNT, UNIQUE, subqueries, CREATE TABLE — verified against casacore ordering/grouping probes and casacore reading a casacure-built DDL table. `'path'` FROM + pyo3 surface still pending |
+| §6 TaQL subset | DONE for Tiers A+B (dask-ms dialect since 0.2.2) | `taql` module: SELECT ($N / `'path'` / DDL), WHERE evaluator, ORDERBY/ROWID, GROUPBY+GROWID/GAGGR/GCOUNT, UNIQUE, subqueries, CREATE TABLE — plus the full Tier A function library, `LIKE`/`IN`, `HAVING`/`OFFSET`/`COUNT`/`g*` aggregates/array-cell aggregates/presence tests, and the Tier B statements (UPDATE/DELETE/INSERT/DROPTABLE/ALTER/SHOW/HELP/CALC) — all shipped through the `taql`/`table.taql()` pyo3 surface, verified against casacore ordering/grouping probes and casacore reading a casacure-built DDL table. The dialect dask-ms and the surveyed packages generate is complete; the remaining surface (Tier C) is assessed in the "TaQL surface beyond the dask-ms dialect" section below and tracked in TODO.md §5. |
 | §7 MS schema / descriptors | ~90% | vendored required/complete descs (MS + 17 subtables), default_ms with full subtable tree + TpTable linkage, default_ms_subtable, maketabdesc; casacore opens/writes/reads a casacure-created MS end-to-end |
 | §8 dask-ms integration / bindings | ~100% | Python 3.9-3.14 supported (pyo3 0.27); dask-ms 0.2.32's entire test suite passes: 219 passed / 0 failed both via the `casacore` shim AND via the direct backend prototype (`DASK_MS_BACKEND=casacure`, no shim). Real python-casacore full-MS write-back round-trip verified. Live reads, shared write state, eager persistence, dtype coercion, taql array projection, record columns, variable-array ndim semantics. Remaining: submit the backend-selection patch upstream | SSM multidim string-array cells (read+write, casacore-interop), multidim-string getcol/putcol forms, suite: test_table_proxy 14/14, ~82 combined via the shim; remaining: addcols, putvarcol edges, subtable-path normalization, upstream store dispatch | dask-ms 0.2.32 suite via the casacore.tables shim: test_table_proxy 14/14, 80 combined across proxy/ordering/table/columns/dataset; chunked putcolslice + dict/numpy-scalar putcol + logical-orientation fixed defaults added; remaining: addcols, SSM string-array cells (format decoded), putvarcol edges, subtable-path normalization | pyo3 binding + **full dask-ms MS lifecycle on casacure**: xds_from_table/xds_to_table read+write, group_cols GROUPBY partitioning, and xds_to_ms/xds_from_ms create/write/read of a full MS (default_ms context manager, 12 subtables) via a `casacore.tables` shim (`tests/daskms_smoke.py`), cross-checked with real casacore; remaining: broader fixtures (tablefromascii/apps) + upstream store dispatch |
+
+### TaQL: the full casacore surface vs the implemented subset
+
+§6 implements the dialect dask-ms and the surveyed dependent packages generate
+plus a DDL subset for fixtures — a deliberate scope, not an accident (the
+`TODO.md` §8 surveys exercise only that dialect). `'path'` FROM and the
+`taql` / `table.taql()` pyo3 surface are shipped; the earlier row note calling
+them "pending" was stale.
+
+Tier A and Tier B below are **implemented** (shipped through the same
+`taql`/`table.taql()` surface); the table keeps their portability notes as the
+record of how they were built. Only Tier C remains out of scope.
+
+The remaining casacore TaQL surface beyond the shipped subset (inventoried
+from `casacore/tables/TaQL/TableGram.yy` + `TableParseFunc.cc`; casacore
+ships 50 TaQL test files as the reference) splits into three tiers:
+
+| Tier | What | Status / effort |
+|---|---|---|
+| **A — query-language completion** | scalar/string/stats/array-function library (the ~215 dispatched names → ~120 implemented incl. the `s`/`running`/`boxed` statistic families), `IN` set operator, `LIKE`/`ILIKE`/regex/`sqlpattern`, `HAVING`, `OFFSET`, `COUNT`, GROUPBY-specific `g*` aggregates, array-cell aggregates in SELECT, presence tests (`isnull`/`isdefined`/`iscolumn`/…) | **DONE** — pure `taql.rs` work on the existing read/write primitives (a small internal regex engine covers the `~` operators, so no dependency was needed) |
+| **B — new statements** | `UPDATE ... SET`, `INSERT INTO`, `SELECT ... INTO TABLE`, `DELETE FROM`, `DROPTABLE`, `ALTER TABLE` (ADD/DROP/RENAME COLUMN, SET/REMOVE keyword), `SHOW TABLE`/`HELP`, `CALC` | **DONE** — sits on the existing write primitives (addrows / putcol / addcols / `removerows` / `renamecol` as cell-store operations), all exposed through the pyo3 `taql()`/`table.taql()` surface |
+| **C — other subsystems** | units & quantities (`5*deg`), spherical-angle geometry (`angdist`/`cones`/`findcone`), masked arrays, the `VirtualTaQLColumn` data manager, `derivedmscal.*`/`mscal.*` UDFs | needs measures-quanta-class machinery or a masked-array value type — separate projects, outside the "replace casacore as the dask-ms I/O backend" goal |
+
+Bottom line: **Tiers A + B are shipped**; the remaining TaQL language is
+Tier C, which is out of scope for the current goal. Tracked in TODO.md §5.
 
 ## Known casacore behaviour discovered by the comparison tests
 

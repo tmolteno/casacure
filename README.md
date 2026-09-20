@@ -43,6 +43,42 @@ Linux, macOS and Windows).
 Status is tracked in [ARE_WE_CURED.md](ARE_WE_CURED.md); the outline is in
 [CASACORE_TO_CASA_RS.md](CASACORE_TO_CASA_RS.md).
 
+## Why choose casacure?
+
+- **Drop-in replacement for `casacore.tables`.** `casacure.tables` mirrors the
+  python-casacore interface, so existing packages — most notably **dask-ms** —
+  run unchanged. The full dask-ms 0.2.32 test suite passes against it
+  (219/219 on Python 3.13 and 3.14), reading, writing and updating real
+  Measurement Sets.
+- **No C++ casacore library.** The table engine is pure Rust. There is no
+  casacore build, no multi-hour C++ dependency compile, and no Fortran/C
+  system library (`wcs`, `measures`, `images`, …) to install. `pip install
+  casacure` is the entire setup; building from source needs only a Rust
+  toolchain plus maturin — still no C++ compiler.
+- **Real on-disk interop.** casacure is byte-compatible with the casacore
+  table formats it implements (StandardStMan, IncrementalStMan,
+  TiledColumnStMan): tables it writes open in real casacore and vice-versa,
+  verified against casacore 3.8.1 — including full Measurement Sets with
+  their subtable tree and multi-manager tables.
+- **Endian-correct anywhere.** The engine reads and writes both big- and
+  little-endian tables, so it behaves identically on any host endianness.
+- **Self-contained wheels.** Prebuilt wheels for Linux, macOS and Windows on
+  CPython 3.9–3.14 — including `aarch64`, the machines where casacore is
+  most painful to build (see "Platforms and architectures").
+- **One engine, two packages.** The same Rust core ships as the `casacure`
+  crate on crates.io (Rust) and as the `casacure` Python package on PyPI.
+- **Memory-safe by construction.** A Rust implementation removes the segfault
+  and memory-management warts of the C++ python-casacore bindings: for
+  example, `putcol` accepts numpy object arrays directly — behaviours that
+  crash the C++ build are absent by construction.
+- **TaQL included.** A real TaQL subset ships in the same package: `SELECT`
+  with WHERE / ORDERBY / GROUPBY / HAVING / UNIQUE / subqueries, a
+  casacore-style function library (numeric/string/date-time/stats families,
+  `g*` aggregates, `LIKE` / `IN`), and the write statements (`UPDATE`,
+  `DELETE`, `INSERT INTO`, `ALTER TABLE`, `DROPTABLE`, `SHOW`/`CALC`) — all
+  reachable through `taql()` / `table.taql()`, so no separate query layer is
+  needed.
+
 ## Using casacure in place of casacore
 
 casacure provides a python-casacore-compatible surface. The whole dask-ms 0.2.32
@@ -145,12 +181,66 @@ pip install .                # maturin builds the cdylib for your interpreter
 ```
 
 The Rust core is published to crates.io as the `casacure` crate; add
-`casacure = "0.2"` to `Cargo.toml` if you want the table engine in Rust
+`casacure = "3"` to `Cargo.toml` (casacure versions against the casacore
+interface: 3.x == casacore 3.x) if you want the table engine in Rust
 directly.
 
 `pip install casacure` on Python 3.9–3.14 installs a self-contained package —
 no `casacore` C++ library, no `wcs/measures` harness — which is the point: MS
 support on machines (including `aarch64`) where casacore is painful to build.
+
+## Dependencies
+
+**Rust core (`casacure` crate).** A single small runtime dependency:
+`thiserror` (error-type plumbing). `serde` / `serde_json` are dev-only
+dependencies, used by the casacore-comparison fixture tests
+(`crates/casacure/tests/compat_fixtures.rs`). The core is pure Rust and
+compiles for any Rust target; there is no unsafe system linkage.
+
+**Python bindings (`casacure` wheel).** Built from `crates/casacure-python`,
+which links the two standard Rust↔Python bridge crates — `pyo3` (CPython
+binding, 0.27) and `numpy` (0.27) — against the core crate. The *installed*
+Python package has **zero runtime dependencies** (`dependencies = []` in
+`pyproject.toml`): it is a self-contained extension module importable on its
+own.
+
+**Explicitly not needed — the point of the project:**
+
+- the C++ casacore library or its build system (no `wcs`, `measures`,
+  `images` harnesses);
+- any system C / Fortran library or header — the only native code is Rust;
+- a C++ toolchain to install or to build wheels.
+
+Building from source adds only the Rust toolchain plus `maturin` (the
+pyproject `[build-system]`):
+`pip install .` compiles the `cdylib` for your interpreter without invoking a
+C++ compiler.
+
+## Platforms and architectures
+
+The pure-Rust core is portable to any Rust target and handles both byte
+orders, so it runs on any architecture where a Rust toolchain exists. On top
+of that, the `Publish Python package` workflow (maturin) builds **prebuilt
+wheels** for the following matrix:
+
+| Platform | Architectures | CPython versions |
+|---|---|---|
+| Linux (manylinux) | `x86_64`, `aarch64` | 3.9 – 3.14 |
+| macOS | `aarch64` (Apple Silicon) | 3.10 – 3.14 |
+| Windows (MSVC) | `x86_64` | 3.10 – 3.14 |
+
+Notes:
+
+- Linux wheels are built from the manylinux image, whose `--find-interpreter`
+  pass covers every supported CPython (3.9–3.14) in a single build per
+  target; the source distribution is produced from the `x86_64` Linux job.
+- Intel-macOS (`x86_64`) wheels are deliberately not built: GitHub no longer
+  hosts Intel-mac runners. Intel Mac users install the source distribution,
+  which still needs only Rust + maturin — no C++.
+- The Rust `casacure` crate itself is endian- and target-agnostic: cargo
+  builds it for any supported target (the CI gate runs on Linux, but the
+  engine's portability is what makes the cross-compiled wheel matrix above
+  possible).
 
 ## Development
 

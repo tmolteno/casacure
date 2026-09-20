@@ -646,4 +646,103 @@ mod tests {
             );
         }
     }
+
+    /// Round-trip a `write_ism_file` output through `IsmFile::parse` in
+    /// either byte order. `icomp` repeats values so the writer must use
+    /// interval compression; `jcol` changes every row.
+    fn writer_round_trip(big: bool) {
+        let n: u64 = 9;
+        let icomp = [5i32, 5, 5, 7, 7, 2, 2, 9, 9];
+        let jcol = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let icol = scalar_desc("I", DataType::Int);
+        let dcol = scalar_desc("J", DataType::Double);
+        let mut ibytes = Vec::new();
+        let mut jbytes = Vec::new();
+        for i in 0..n as usize {
+            ibytes.extend_from_slice(
+                &crate::ssm::encode_scalar_cell(big, &icol, &RecordValue::Int(icomp[i])).unwrap(),
+            );
+            jbytes.extend_from_slice(
+                &crate::ssm::encode_scalar_cell(big, &dcol, &RecordValue::Double(jcol[i])).unwrap(),
+            );
+        }
+        let cols = [
+            WriteIsmColumn {
+                cell_size: 4,
+                bytes: &ibytes,
+            },
+            WriteIsmColumn {
+                cell_size: 8,
+                bytes: &jbytes,
+            },
+        ];
+        let file = write_ism_file(big, n, &cols);
+        let f = IsmFile::parse(&file, big).unwrap();
+        assert_eq!(f.header.bucket_size, 32768);
+        assert_eq!(f.header.nbucket, 1);
+        assert_eq!(f.index.rows, vec![0, 9]);
+        for i in 0..n {
+            assert_eq!(
+                f.read_scalar_cell(0, &icol, i).unwrap(),
+                RecordValue::Int(icomp[i as usize]),
+                "col0 row {i}"
+            );
+            assert_eq!(
+                f.read_scalar_cell(1, &dcol, i).unwrap(),
+                RecordValue::Double(jcol[i as usize]),
+                "col1 row {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn writer_round_trips_both_endians() {
+        writer_round_trip(true);
+        writer_round_trip(false);
+    }
+
+    #[test]
+    fn writer_spans_buckets() {
+        // One Int column: rows_per_bucket = (32768 - 4)/12 = 2730, so 2800
+        // rows force a second ISM bucket; check around the boundary.
+        let n: u64 = 2800;
+        let icol = scalar_desc("I", DataType::Int);
+        let vals: Vec<i32> = (0..n as i32).map(|i| i % 7 - 3).collect();
+        let mut bytes = Vec::with_capacity(n as usize * 4);
+        for &v in &vals {
+            bytes.extend_from_slice(
+                &crate::ssm::encode_scalar_cell(false, &icol, &RecordValue::Int(v)).unwrap(),
+            );
+        }
+        let cols = [WriteIsmColumn {
+            cell_size: 4,
+            bytes: &bytes,
+        }];
+        let file = write_ism_file(false, n, &cols);
+        let f = IsmFile::parse(&file, false).unwrap();
+        assert!(
+            f.header.nbucket > 1,
+            "must span buckets: nbucket={}",
+            f.header.nbucket
+        );
+        assert_eq!(f.index.rows.first(), Some(&0));
+        assert_eq!(f.index.rows.last(), Some(&2800));
+        for (i, &v) in vals.iter().enumerate().skip(2700).take(150) {
+            assert_eq!(
+                f.read_scalar_cell(0, &icol, i as u64).unwrap(),
+                RecordValue::Int(v),
+                "row {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn writer_ism_blob_parses_as_spec() {
+        let blob = write_ism_blob("IncrementalStMan");
+        let mut r = crate::aipsio::Reader::new(&blob);
+        let obj = r.read_object_start(true).unwrap();
+        assert_eq!(obj.type_name, "ISM");
+        assert_eq!(obj.version, 3);
+        assert_eq!(r.read_string().unwrap(), "IncrementalStMan");
+    }
 }

@@ -187,3 +187,160 @@ pub static SCHEMAS: &[(&str, bool, &str)] = &[
         r##"{"ANTENNA_ID":{"valueType":"int","dataManagerType":"StandardStMan","dataManagerGroup":"StandardStMan","option":0,"maxlen":0,"comment":"Antenna number","keywords":{}},"INTERVAL":{"valueType":"double","dataManagerType":"StandardStMan","dataManagerGroup":"StandardStMan","option":0,"maxlen":0,"comment":"Interval over which data is relevant","keywords":{"QuantumUnits":["s"]}},"TIME":{"valueType":"double","dataManagerType":"StandardStMan","dataManagerGroup":"StandardStMan","option":0,"maxlen":0,"comment":"An MEpoch specifying the midpoint of the time forwhich data is relevant","keywords":{"QuantumUnits":["s"],"MEASINFO":{"type":"epoch","Ref":"UTC"}}},"_define_hypercolumn_":{},"_keywords_":{},"_private_keywords_":{}}"##,
     ),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::RecordValue;
+    use crate::tabledesc::TableDesc;
+    use std::collections::BTreeSet;
+
+    /// The 18 schema keys: the main MS plus casacore's 17 subtables.
+    fn schema_names() -> BTreeSet<&'static str> {
+        SCHEMAS.iter().map(|(t, _, _)| *t).collect()
+    }
+
+    const SUBTABLES: [&str; 17] = [
+        "ANTENNA",
+        "DATA_DESCRIPTION",
+        "DOPPLER",
+        "FEED",
+        "FIELD",
+        "FLAG_CMD",
+        "FREQ_OFFSET",
+        "HISTORY",
+        "OBSERVATION",
+        "POINTING",
+        "POLARIZATION",
+        "PROCESSOR",
+        "SOURCE",
+        "SPECTRAL_WINDOW",
+        "STATE",
+        "SYSCAL",
+        "WEATHER",
+    ];
+
+    #[test]
+    fn covers_ms_and_all_seventeen_subtables() {
+        let names = schema_names();
+        assert_eq!(names.len(), 18, "MS + 17 subtables: {names:?}");
+        for s in SUBTABLES {
+            assert!(names.contains(s), "missing subtable {s}");
+        }
+        assert!(names.contains("MS"));
+    }
+
+    #[test]
+    fn every_table_has_both_completeness_variants() {
+        let mut seen = BTreeSet::new();
+        for (t, c, _) in SCHEMAS {
+            assert!(
+                seen.insert((*t, *c)),
+                "duplicate schema entry ({t}, complete={c})"
+            );
+        }
+        for t in schema_names() {
+            assert!(
+                seen.contains(&(t, true)),
+                "{t} missing the complete descriptor"
+            );
+            assert!(
+                seen.contains(&(t, false)),
+                "{t} missing the required descriptor"
+            );
+        }
+        assert_eq!(SCHEMAS.len(), 36);
+    }
+
+    #[test]
+    fn every_schema_parses_to_a_desc_with_columns() {
+        for (table, complete, json) in SCHEMAS {
+            let desc = TableDesc::from_desc_json(json)
+                .unwrap_or_else(|e| panic!("{table} (complete={complete}) failed: {e}"));
+            assert!(!desc.columns.is_empty(), "{table} has no columns");
+            for c in &desc.columns {
+                assert!(!c.name.is_empty(), "{table} has an unnamed column");
+                assert_eq!(
+                    desc.column(&c.name).map(|x| &x.name),
+                    Some(&c.name),
+                    "{table}: column lookup by name"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn required_ms_is_a_subset_of_complete_ms() {
+        let req = TableDesc::from_desc_json(
+            SCHEMAS
+                .iter()
+                .find(|(t, c, _)| *t == "MS" && !*c)
+                .unwrap()
+                .2,
+        )
+        .unwrap();
+        let comp =
+            TableDesc::from_desc_json(SCHEMAS.iter().find(|(t, c, _)| *t == "MS" && *c).unwrap().2)
+                .unwrap();
+        let req_names: BTreeSet<&str> = req.columns.iter().map(|c| c.name.as_str()).collect();
+        let comp_names: BTreeSet<&str> = comp.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(req.columns.len(), 21);
+        assert_eq!(comp.columns.len(), 39);
+        assert!(
+            req_names.is_subset(&comp_names),
+            "required columns must be a subset: {:?}",
+            req_names.difference(&comp_names)
+        );
+        // The complete MS adds the data/model columns python-casacore 3.8
+        // ships; the required descriptor does not carry them.
+        assert!(comp.column("DATA").is_some());
+        assert!(req.column("DATA").is_none());
+    }
+
+    #[test]
+    fn complete_ms_carries_ms_version_keyword() {
+        let desc =
+            TableDesc::from_desc_json(SCHEMAS.iter().find(|(t, c, _)| *t == "MS" && *c).unwrap().2)
+                .unwrap();
+        assert_eq!(
+            desc.keywords.get("MS_VERSION"),
+            Some(&RecordValue::Double(2.0))
+        );
+        // The MS TIME fixed corners of the schema parse to the canonical
+        // descriptors (fixed shapes stored in CASA order).
+        let time = desc.column("TIME").unwrap();
+        assert_eq!(time.data_type, crate::record::DataType::Double);
+        let data = desc.column("DATA").unwrap();
+        assert_eq!(data.data_type, crate::record::DataType::Complex);
+        assert_eq!(data.kind, crate::tabledesc::ColumnKind::Array);
+    }
+
+    #[test]
+    fn antenna_complete_has_position_shape_and_measinfo() {
+        let desc = TableDesc::from_desc_json(
+            SCHEMAS
+                .iter()
+                .find(|(t, c, _)| *t == "ANTENNA" && *c)
+                .unwrap()
+                .2,
+        )
+        .unwrap();
+        let pos = desc.column("POSITION").unwrap();
+        // Logical [3] -> stored CASA shape [3].
+        assert_eq!(pos.shape.as_deref(), Some(&[3i64][..]));
+        assert_eq!(
+            pos.keywords.get("QuantumUnits"),
+            Some(&RecordValue::Array(crate::record::ArrayValue {
+                shape: vec![3],
+                data: crate::record::ArrayData::String(vec!["m".into(), "m".into(), "m".into()]),
+            }))
+        );
+        match pos.keywords.get("MEASINFO") {
+            Some(RecordValue::Record(r)) => {
+                assert_eq!(r.get("type"), Some(&RecordValue::String("position".into())));
+                assert_eq!(r.get("Ref"), Some(&RecordValue::String("ITRF".into())));
+            }
+            other => panic!("MEASINFO: {other:?}"),
+        }
+    }
+}

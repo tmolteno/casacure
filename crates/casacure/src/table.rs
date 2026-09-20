@@ -381,7 +381,18 @@ pub fn create_table(
 
     let table_dat = build_table_dat(big_endian, nrow, desc, &dms, &col_dm_seq)?;
 
+    // Regenerate in place: remove this table's own data files so stale
+    // columns / renumbered data-manager files cannot linger. Subtable
+    // subdirectories and `table.info`/`table.lock` are preserved.
     std::fs::create_dir_all(table_dir)?;
+    if let Ok(entries) = std::fs::read_dir(table_dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().into_string().unwrap_or_default();
+            if name == "table.dat" || name.starts_with("table.f") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
     let mut written = Vec::new();
     let dat_path = table_dir.join("table.dat");
     std::fs::write(&dat_path, table_dat)?;
@@ -1391,6 +1402,66 @@ impl WritableTable {
         if col_idx < self.cells.len() {
             self.cells.remove(col_idx);
         }
+    }
+
+    /// Open an existing table for editing: materialise every cell into the
+    /// in-memory store. `flush()` then rewrites the whole table in place
+    /// (regenerating `table.dat` and each data file via `create_table`),
+    /// which is how casacure does in-place `UPDATE` / `DELETE` / `ALTER`.
+    pub fn from_table(
+        dir: std::path::PathBuf,
+        t: &Table,
+    ) -> Result<WritableTable, WriteTableError> {
+        let mut wt = WritableTable::create(&dir, t.dat.desc.clone());
+        let n = t.nrows();
+        if n > 0 {
+            wt.addrows(n);
+        }
+        for j in 0..wt.desc.columns.len() {
+            let vals = t
+                .getcol(j, 0, n)
+                .map_err(|e| WriteTableError::Storage(format!("read column {j}: {e}")))?;
+            for (r, v) in vals.iter().enumerate() {
+                wt.putcell(j, r as u64, v.clone())?;
+            }
+        }
+        Ok(wt)
+    }
+
+    /// Remove the given rows (`removerows`); the surviving rows are
+    /// renumbered in the surviving order at the next flush.
+    pub fn drop_rows(&mut self, rows: &[u64]) {
+        if rows.is_empty() || self.cells.is_empty() {
+            return;
+        }
+        let mut drop: Vec<bool> = vec![false; self.cells[0].len()];
+        for &r in rows {
+            if let Some(slot) = drop.get_mut(r as usize) {
+                *slot = true;
+            }
+        }
+        for col in &mut self.cells {
+            let mut j = 0;
+            col.retain(|_| {
+                let keep = !drop[j];
+                j += 1;
+                keep
+            });
+        }
+    }
+
+    /// Rename a column (`ALTER TABLE ... RENAME COLUMN from TO to`).
+    pub fn renamecol(&mut self, from: &str, to: &str) -> Result<(), WriteTableError> {
+        let col = self
+            .desc
+            .columns
+            .iter_mut()
+            .find(|c| c.name == from)
+            .ok_or_else(|| WriteTableError::NoSuchColumn {
+                name: from.to_string(),
+            })?;
+        col.name = to.to_string();
+        Ok(())
     }
 
     /// The number of rows in the in-memory cell store.

@@ -158,6 +158,136 @@ forward.
   `pyrap.measures`/`quanta` usage appears only in the montblanc/utilities
   paths (`GiveDate`), tracked as optional future work.
 
+### Fixed
+
+- **int64 `TiledColumnStMan` columns written by casacure were unreadable by
+  casacore** (two defects of the same class; surfaced by the new `tsm` write
+  round-trip tests and confirmed by a casacure-write → casacore-read interop
+  check):
+  1. the TSM header's per-column type map omitted `Int64`, falling through
+     to `TpTable` (12) instead of `TpInt64` (29) — wrong header metadata and
+     a casacore "mismatch in data type" rejection;
+  2. the `table.dat` column-descriptor class name used the lowercase type id
+     `int64   ` in `ArrayColumnDesc<int64   `, but casacore's ColumnDesc
+     registry (`ColumnDesc.cc` `initRegisterMap`) keys on the exact spelling
+     and writes `Int64   ` — casacore aborted in `ColumnDesc::getFile` on
+     open; every other type id already matched.
+  Both fixed (`casaure_dtype_code: Int64 => 29`;
+  `tabledesc::data_type_id: Int64 => "Int64"`) and pinned by unit tests; a
+  casacure-written int64 TSM table now opens in python-casacore with exact
+  values.
+
+### Added
+
+- **Unit-test expansion**: +28 tests, from 71 to 99.
+  - `tsm` (was 0): `write_tsm_file`/`parse_header`/`read_cell` round-trip
+    for every tiled element type in both byte orders, one-byte-per-element
+    Bool tiles, multi-tile row spill (tile-offset math), and the
+    row-out-of-range / unsupported-type / tile-too-small / bad-root error
+    paths.
+  - `tabledesc` (was 0): binary `write_table_desc`/`parse_table_desc`
+    round-trip across scalar/array/record columns, `from_desc_json`
+    (scalar+array+record kinds, CASA shape reversal, keyword capture,
+    data-manager normalization), every `data_type_id` spelling pinned to the
+    casacore on-disk form, and parse-error paths.
+  - `ms_schema` (was 0): all 36 vendored descriptor entries parse, the
+    MS + 17-subtable coverage and complete/required pairing, required ⊆
+    complete MS, and the `MS_VERSION` keyword / fixed-shape spot checks.
+  - `ism` (was 2): `write_ism_file` round-trips (both endians, interval
+    compression, multi-bucket boundary), and the `write_ism_blob` spec.
+  - `record` (was 5): scalar write/read round-trip for every scalar type in
+    both byte orders, and a nested table-record write/read round-trip.
+
+- **TaQL function library (Tier A)**: the expression evaluator grew from 7
+  scalar functions to a real casacore-style library in `taql.rs` —
+  numeric/trig/constants (`pi e c abs sign square cube floor ceil round int
+  sqrt cbrt exp ln log log10 sin cos tan asin acos atan atan2 sinh cosh tanh
+  pow fmod`), complex parts (`complex real imag ampl arg phase conj norm`),
+  strings (`len upcase downcase capitalize reversestring trim/l/rtrim substr
+  replace str`), presence/predicates (`isnan isinf isfinite isdefined isnull
+  iscolumn iskeyword`), arrays (`array shape ndim nelements transpose
+  reversearray flatten`), and the plain statistic families over scalars and
+  array cells (`min max sum product sumsqr mean variance samplevariance
+  stddev samplestddev avdev rms median fractile any all ntrue nfalse`) with
+  int-preserving typing. Group context gained the typed `g*` aggregates
+  (`gmin gmax gsum gsumsqr gproduct gmean gavg gvariance gstddev grms gmedian
+  gfractile gfirst glast gany gall gntrue gnfalse`), and nested group
+  functions now work (`nelements(gaggr(col))`). Row aliases `rowid`/
+  `rownumber`/`rownr` and `iif` too.
+- **TaQL `LIKE` / `ILIKE` / `NOT LIKE` and `IN`**: SQL `%`/`_` pattern
+  matching with `\` escapes (case-insensitive for `ILIKE`), and the `IN`
+  / `NOT IN` set operator over `(...)` and `[...]` literal sets (empty sets
+  match nothing); both at comparison precedence with `NOT` handling.
+  Date/time functions and the `s`/`running`/`boxed` statistic variants remain
+  TODO (§5).
+- **TaQL `HAVING`, `OFFSET`, `COUNT` and grouped `ORDERBY`**: the GROUPBY
+  pipeline now supports a post-group `HAVING` filter (with aggregate
+  expressions such as `HAVING GCOUNT() > 1`, which required enabling binary
+  expressions in group context with the full group visible), `ORDERBY`/`DESC`
+  on grouped output (via a group-context `sort_groups`), and `OFFSET` in
+  `LIMIT n OFFSET m` (row and group modes). The standalone `COUNT [col|*]
+  FROM table [WHERE expr]` command returns a one-row count table.
+- **TaQL date/time functions**: the MJD calendar family with casacore MVTime
+  semantics (`mjd`, `mjdtodate`, `datetime` (ISO string parse), `date`,
+  `time` (fraction-of-day as radians), `year`, `month`, `day`, `week`
+  (year-week), `weekday`/`dow` (1=Mon..7=Sun), `cmonth`, `cdow`/`cweekday`,
+  `cdate` (`DD-Mon-YYYY`), `ctime`, `cdatetime`/`ctod`) — numeric output
+  verified against real casacore 3.8.1 for anchors (2000-01-01 = MJD 51544,
+  1858-11-17 = 0, 1970-01-01 weekdays/week values).
+- **TaQL plural statistic variants**: `sums`/`products`/`sumsqrs`/`mins`/
+  `maxs`/`means`/`avgs`/`variances`/`samplevariances`/`stddevs`/
+  `samplestddevs`/`avdevs`/`rmss`/`medians`/`fractiles`/`anys`/`alls`/
+  `ntrues`/`nfalses` apply the aggregate element-wise across equal-length
+  arrays (scalars broadcast; mismatched lengths error).
+- **TaQL write statements (Tier B)**: `UPDATE table SET col = expr [WHERE]
+  [ORDERBY] [LIMIT] [OFFSET]` (expression results are coerced to the column
+  type, so `WHAT * 10` into an `Int` column writes 200, not 0), `DELETE FROM
+  table [WHERE ...]`, `INSERT INTO table [(cols)] SELECT ...`, `SELECT ...
+  INTO table FROM ...` (result column types inferred from the values),`
+  DROPTABLE table`, `ALTER TABLE` (ADD / DROP / RENAME COLUMN, SET / REMOVE
+  keyword), `SHOW TABLE` / `SHOW` / `HELP`, and `CALC expr FROM table`.
+  In-place edits follow the existing materialise → mutate → `WritableTable`
+  → `flush()` path the pyo3 layer already uses; `create_table` now removes
+  stale data files so an in-place regeneration cannot leave orphaned columns
+  or renumbered managers behind (subtable dirs and `table.info`/`lock` are
+  preserved). Paths may be quoted (`'...'`) to avoid keyword collisions.
+- **TaQL `~`/`!~` pattern operator and `hms`/`dms`/`hdms`, running/boxed**:
+  completes the scalar-function set. `regex('p')` / `pattern('p')` /
+  `sqlpattern('p')` build pattern values matched against a string with the
+  `~` / `!~` comparison operator (a plain string RHS is a bare regex); a
+  small internal backtracking regex engine covers literals, `.`, `^`/`$`,
+  `*`/`+`/`?`, `[...]`/`[^...]`, `(...)` and `a|b` — no new dependency.
+  `running*`/`boxed*` return the cumulative (prefix) statistic over an array
+  (`runningsum`, `boxedmean`, ...). `hms`/`dms`/`hdms` format radians as
+  sexagesimal strings (`06h00m00.000`, `+090d00m00.000`), matching casacore
+  for the anchored values.
+- **TaQL statements exposed through the pyo3 `taql` / `table.taql()` surface**:
+  the module-level `taql()` previously accepted only `SELECT`/`CREATE`; it now
+  dispatches every statement the core implements — `UPDATE`, `DELETE`,
+  `INSERT INTO`, `ALTER TABLE`, `DROPTABLE`, `SHOW TABLE`/`SHOW`/`HELP`,
+  `CALC`, and `COUNT` — and returns the statement's result table (an empty
+  table for UPDATE/DELETE/INSERT/DROPTABLE, the column listing for SHOW,
+  the evaluated expressions for CALC, the count row for COUNT). Statement
+  references work both as `$N` tables (passed in the `tables=[...]` list or
+  via `table.taql()`) and as on-disk paths, quoted or bare.
+- **Fixed stale reads / clobbering after a mutating TaQL statement**: a
+  writable `table` handle opened before (or reopened after) a statement that
+  rewrote the table kept a stale in-memory snapshot — reads showed the
+  pre-statement values, and `close()` regenerated from the old cells,
+  silently reverting the change on disk. `execute_into` now reports every
+  directory a mutating statement writes, and the pyo3 layer re-materialises
+  the shared writable backing for those directories, so live handles and the
+  next open read the fresh files. (A `DROPTABLE`d directory drops its cached
+  entry.)
+- **Fixed `INSERT INTO` typing**: result values are coerced to the target
+  column type like `UPDATE` (an `Int64` SELECT expression `INTO` an `Int`
+  column previously stored 0 — now 105 lands as 105).
+- **Uniform table references**: `SELECT ... FROM` and `COUNT ... FROM`
+  accept the same forms as the statements — quoted `'path'`, `$N`, and
+  unquoted (relative or absolute) paths — by routing through the shared
+  table-reference parser (`#test_taql_*` / `#test_table_taql_*` regression
+  suite in `tests/test_casacore_helpers.py` pins all of the above).
+
 ## [Unreleased]
 
 ## [0.2.0] - 2026-09-19

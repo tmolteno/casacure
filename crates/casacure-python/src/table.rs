@@ -126,7 +126,41 @@ pub(crate) fn path_string(c: &Bound<'_, PyAny>) -> PyResult<String> {
     ))
 }
 
-// Helper: read a sub-range of a column as `Vec<RecordValue>` (CASA order).
+/// Re-materialise a directory's shared writable backing (`WriteData`) from
+/// the current on-disk files, after an out-of-band TaQL statement
+/// (UPDATE/DELETE/INSERT/ALTER/...) rewrote them. Live handles that share
+/// `shared` then read — and, on `close()`, flush — the fresh state instead
+/// of a stale pre-statement snapshot (which would otherwise clobber the
+/// change back). Returns false when the directory no longer holds a table
+/// (e.g. `DROPTABLE`), so the caller can drop the cached entry.
+fn refresh_write(
+    dir: &std::path::Path,
+    shared: &std::sync::Arc<std::sync::Mutex<WriteData>>,
+) -> bool {
+    let read = match ::casacure::Table::open(dir, false) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let mut wt = core::WritableTable::create(dir.to_path_buf(), read.dat.desc.clone());
+    let n = read.nrows();
+    if n > 0 {
+        wt.addrows(n);
+    }
+    for j in 0..read.dat.desc.columns.len() {
+        let Ok(vals) = read.getcol(j, 0, n) else {
+            continue;
+        };
+        for (r, v) in vals.iter().enumerate() {
+            let _ = wt.putcell(j, r as u64, v.clone());
+        }
+    }
+    let mut s = shared.lock().unwrap();
+    s.read = read;
+    s.wt = wt;
+    true
+}
+
+/// Read a sub-range of a column as `Vec<RecordValue>` (CASA order).
 fn column_cells(
     t: &::casacure::Table,
     col_idx: usize,
@@ -2063,97 +2097,89 @@ pub fn taql(
     _readonly: Option<bool>,
 ) -> PyResult<Py<PyAny>> {
     let _ = style;
-    // DDL: CREATE TABLE ... -> create the table and return it writable.
-    if query
-        .trim_start()
-        .to_ascii_lowercase()
-        .starts_with("create")
-    {
-        match core::taql::execute(query, &[]).map_err(err)? {
-            core::taql::TaqlResult::Created(path) => {
-                let t = Table::open_or_create(py, &path.display().to_string(), None, 0, true)?;
-                return Ok(t.into_pyobject(py)?.into_any().unbind());
-            }
-            other => {
-                return Err(PyRuntimeError::new_err(format!(
-                    "taql: expected created table, got {other:?}"
-                )));
-            }
-        }
-    }
     // Collect the wrapped core tables from any `casacure.tables.table`
-    // arguments.
-    if query
-        .trim_start()
-        .to_ascii_lowercase()
-        .starts_with("select")
-    {
-        // Hold every mutex guard for the whole call so the inner core
-        // tables stay borrowed.
-        let objects: Vec<PyRef<'_, Table>>;
-        let locks: Vec<std::sync::MutexGuard<'_, Inner>>;
-        let shared_guards: Vec<Option<std::sync::MutexGuard<'_, WriteData>>>;
-        let read_tables: Vec<::casacure::Table>;
-        let core_refs: Vec<&::casacure::Table>;
-        if let Some(ts) = tables {
-            objects = ts
-                .iter()
-                .map(|item| {
-                    item.extract::<PyRef<'_, Table>>()
-                        .map_err(|_| PyValueError::new_err("taql: expected table objects"))
-                })
-                .collect::<PyResult<_>>()?;
-            locks = objects.iter().map(|t| t.inner.lock().unwrap()).collect();
-            read_tables = locks
-                .iter()
-                .filter_map(|g| match &**g {
-                    Inner::Read(dir) => Some(::casacure::Table::open(dir, false)),
-                    _ => None,
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(err)?;
-            shared_guards = locks
-                .iter()
-                .map(|g| match &**g {
-                    Inner::Write { shared, .. } => Some(shared.lock().unwrap()),
-                    _ => None,
-                })
-                .collect();
-            let mut read_it = read_tables.iter();
-            core_refs = locks
-                .iter()
-                .zip(shared_guards.iter())
-                .map(|(g, sg)| match &**g {
-                    Inner::Read(_) => read_it.next().expect("read table iterator exhausted"),
-                    Inner::Write { .. } => {
-                        &sg.as_ref().expect("write table has a shared guard").read
-                    }
-                })
-                .collect();
-        } else {
-            objects = Vec::new();
-            locks = Vec::new();
-            read_tables = Vec::new();
-            shared_guards = Vec::new();
-            core_refs = Vec::new();
-            // objects/locks/guards only exist to keep borrows alive.
-            let _ = (&objects, &locks, &read_tables, &shared_guards);
-        }
-        let result = core::taql::execute(query, &core_refs).map_err(err)?;
-        return match result {
-            core::taql::TaqlResult::Query(out) => Ok(taql_result_to_table(py, out)?
-                .into_pyobject(py)?
-                .into_any()
-                .unbind()),
-            core::taql::TaqlResult::Created(path) => {
-                let t = Table::open_or_create(py, &path.display().to_string(), None, 0, true)?;
-                Ok(t.into_pyobject(py)?.into_any().unbind())
-            }
-        };
+    // arguments and hold every mutex guard for the whole call so the inner
+    // core tables stay borrowed. All statements (SELECT, UPDATE, DELETE,
+    // INSERT, ALTER, DROPTABLE, SHOW/HELP, CALC, COUNT, CREATE TABLE) may
+    // reference `$N` tables; CREATE TABLE takes only an on-disk path, so
+    // the `tables` list is optional for it.
+    let objects: Vec<PyRef<'_, Table>>;
+    let locks: Vec<std::sync::MutexGuard<'_, Inner>>;
+    let shared_guards: Vec<Option<std::sync::MutexGuard<'_, WriteData>>>;
+    let read_tables: Vec<::casacure::Table>;
+    let core_refs: Vec<&::casacure::Table>;
+    if let Some(ts) = tables {
+        objects = ts
+            .iter()
+            .map(|item| {
+                item.extract::<PyRef<'_, Table>>()
+                    .map_err(|_| PyValueError::new_err("taql: expected table objects"))
+            })
+            .collect::<PyResult<_>>()?;
+        locks = objects.iter().map(|t| t.inner.lock().unwrap()).collect();
+        read_tables = locks
+            .iter()
+            .filter_map(|g| match &**g {
+                Inner::Read(dir) => Some(::casacure::Table::open(dir, false)),
+                _ => None,
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(err)?;
+        shared_guards = locks
+            .iter()
+            .map(|g| match &**g {
+                Inner::Write { shared, .. } => Some(shared.lock().unwrap()),
+                _ => None,
+            })
+            .collect();
+        let mut read_it = read_tables.iter();
+        core_refs = locks
+            .iter()
+            .zip(shared_guards.iter())
+            .map(|(g, sg)| match &**g {
+                Inner::Read(_) => read_it.next().expect("read table iterator exhausted"),
+                Inner::Write { .. } => &sg.as_ref().expect("write table has a shared guard").read,
+            })
+            .collect();
+    } else {
+        objects = Vec::new();
+        locks = Vec::new();
+        read_tables = Vec::new();
+        shared_guards = Vec::new();
+        core_refs = Vec::new();
+        // objects/locks/guards only exist to keep borrows alive.
+        let _ = (&objects, &locks, &read_tables, &shared_guards);
     }
-    Err(PyValueError::new_err(format!(
-        "taql: unsupported query (only SELECT/CREATE supported): {query}"
-    )))
+    let mut touched: Vec<std::path::PathBuf> = Vec::new();
+    let result = core::taql::execute_into(query, &core_refs, &mut touched).map_err(err)?;
+    // A mutating statement (UPDATE/DELETE/INSERT/ALTER/DROPTABLE, CREATE,
+    // SELECT INTO) rewrote the on-disk tables; refresh any materialised
+    // writable state cached for those directories so live handles and the
+    // next open see the fresh files instead of a stale snapshot (a stale
+    // handle's `close()` would otherwise regenerate the old cells and
+    // clobber the change). A directory that no longer holds a table
+    // (`DROPTABLE`) drops its cached entry instead.
+    drop(shared_guards); // release the WriteData locks before refresh() re-locks them
+    if !touched.is_empty() {
+        let mut reg = write_registry().lock().unwrap();
+        for dir in &touched {
+            if let Some(shared) = reg.get(dir) {
+                if !refresh_write(dir, shared) {
+                    reg.remove(dir);
+                }
+            }
+        }
+    }
+    Ok(match result {
+        core::taql::TaqlResult::Query(out) => taql_result_to_table(py, out)?
+            .into_pyobject(py)?
+            .into_any()
+            .unbind(),
+        core::taql::TaqlResult::Created(path) => {
+            let t = Table::open_or_create(py, &path.display().to_string(), None, 0, true)?;
+            t.into_pyobject(py)?.into_any().unbind()
+        }
+    })
 }
 
 /// Materialise a TaQL result into a real table on disk (in a temp

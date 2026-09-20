@@ -484,3 +484,103 @@ def test_table_taql_method(tmp_path):
     r1.close()
     r2.close()
     t.close()
+
+
+def _make_id_table(path):
+    """A one-column writable table with rows [5, 2, 9]."""
+    t = table(path, maketabdesc(makescacoldesc("ID", 0)), ack=False)
+    t.addrows(3)
+    t.putcol("ID", np.array([5, 2, 9], dtype=np.int64))
+    t.flush()
+    t.close()
+
+
+def _read_ids(path):
+    t = table(path, ack=False)
+    try:
+        return t.getcol("ID").tolist()
+    finally:
+        t.close()
+
+
+def test_taql_update_via_module_persists(tmp_path):
+    """UPDATE rewrites the on-disk table; a fresh open sees the change."""
+    p = tmp_path / "m.tab"
+    _make_id_table(p)
+    taql(f"update {p} set ID = ID*10 where ID = 2")
+    assert sorted(_read_ids(p)) == [5, 9, 20]
+
+
+def test_taql_delete_insert_persist(tmp_path):
+    p = tmp_path / "m.tab"
+    _make_id_table(p)
+    taql(f"delete from {p} where ID = 2")
+    assert _read_ids(p) == [5, 9]
+    taql(f"insert into {p} (ID) select ID+100 from {p} where ID = 9")
+    assert sorted(_read_ids(p)) == [5, 9, 109]
+
+
+def test_taql_alter_drop_rename_persist(tmp_path):
+    p = tmp_path / "m.tab"
+    _make_id_table(p)
+    taql(f"alter table {p} rename column ID to VAL")
+    t = table(p, ack=False)
+    assert t.colnames() == ["VAL"]
+    np.testing.assert_array_equal(t.getcol("VAL"), [5, 2, 9])
+    t.close()
+    taql(f"alter table {p} drop column VAL")
+    t = table(p, ack=False)
+    assert t.colnames() == []
+    t.close()
+
+
+def test_taql_droptable_show_calc_count(tmp_path):
+    p = tmp_path / "m.tab"
+    _make_id_table(p)
+    # SHOW TABLE: one row per column with name/datatype.
+    r = taql(f"show table {p}")
+    assert r.colnames() == ["name", "datatype", "ndim", "shape", "comment"]
+    assert r.getcell("name", 0) == "ID"
+    r.close()
+    # CALC: a one-row table of the evaluated expressions.
+    r = taql(f"calc 2*3, 'x' from {p}")
+    assert r.nrows() == 1
+    assert r.getcell(r.colnames()[0], 0) == 6
+    assert r.getcell(r.colnames()[1], 0) == "x"
+    r.close()
+    # COUNT: the number of matching rows.
+    r = taql(f"count from {p} where ID > 2")
+    assert r.getcell(r.colnames()[0], 0) == 2
+    r.close()
+    # DROPTABLE removes the directory (and cached writable state).
+    taql(f"droptable {p}")
+    assert not tableexists(p)
+
+
+def test_table_taql_update_using_dollar_one(tmp_path):
+    """table.taql('update $1 ...') mutates the same table on disk."""
+    p = tmp_path / "m.tab"
+    _make_id_table(p)
+    t = table(p, ack=False)
+    t.taql("update $1 set ID = ID*100 where ID = 2")
+    t.close()
+    assert sorted(_read_ids(p)) == [5, 9, 200]
+
+
+def test_taql_statement_result_does_not_go_stale_after_reopen(tmp_path):
+    """Regression: a writable open after a mutating statement must read the
+    new on-disk state, not a stale in-memory snapshot cached from the first
+    write (which could also clobber the change on close)."""
+    p = tmp_path / "m.tab"
+    writer = table(p, maketabdesc(makescacoldesc("ID", 0)), ack=False)
+    writer.addrows(3)
+    writer.putcol("ID", np.array([5, 2, 9], dtype=np.int64))
+    writer.flush()
+    writer.close()
+    taql(f"update {p} set ID = ID*10 where ID = 2")
+    reader = table(p, ack=False)
+    try:
+        assert reader.getcol("ID").tolist() == [5, 20, 9]
+    finally:
+        reader.close()  # must not regenerate from stale state
+    assert _read_ids(p) == [5, 20, 9]

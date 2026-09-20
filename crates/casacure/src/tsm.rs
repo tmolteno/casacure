@@ -472,6 +472,7 @@ fn casaure_dtype_code(dt: DataType) -> i32 {
         DataType::Complex => 9,
         DataType::DComplex => 10,
         DataType::String => 11,
+        DataType::Int64 => 29,
         _ => 12,
     }
 }
@@ -497,4 +498,285 @@ pub fn tsm_encode_cell(
     }
     crate::ssm::encode_array_data(big_endian, data)
         .map_err(|_| TsmError::UnsupportedType(data_type))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tabledesc::{ColumnDesc, ColumnKind};
+
+    /// The fixed descriptor for a `TiledColumnStMan` array column: CASA
+    /// (reversed logical) shape `[3, 2]` for a logical 2x3 cell. `read_cell`
+    /// only consults `data_type`/`data_manager_type`, but keep the rest
+    /// realistic.
+    fn array_desc(dt: DataType) -> ColumnDesc {
+        ColumnDesc {
+            name: "DATA".into(),
+            comment: String::new(),
+            data_type: dt,
+            data_manager_type: "TiledColumnStMan".into(),
+            data_manager_group: "TiledData_GROUP".into(),
+            options: 0,
+            ndim: 2,
+            shape: Some(vec![3, 2]),
+            max_length: 0,
+            keywords: crate::record::TableRecord {
+                desc: Default::default(),
+                record_type: 0,
+                values: Vec::new(),
+            },
+            kind: ColumnKind::Array,
+        }
+    }
+
+    /// Every type TiledColumnStMan can store on disk, each with a per-row
+    /// value so offset errors surface.
+    fn sample_cell(dt: DataType, row: i32) -> ArrayData {
+        let r = row as f32;
+        let d = row as f64;
+        match dt {
+            DataType::Bool => ArrayData::Bool(vec![true, false, true, true, false, false]),
+            DataType::UChar => ArrayData::UChar(vec![row as u8, 1, 2, 3, 4, 5]),
+            DataType::Short => ArrayData::Short(vec![-(row as i16), 1, -2, 3, -4, 5]),
+            DataType::UShort => ArrayData::UShort(vec![row as u16, 1, 2, 3, 4, 5]),
+            DataType::Int => ArrayData::Int(vec![row, -1, 2, -3, 4, 5]),
+            DataType::UInt => ArrayData::UInt(vec![row as u32, 1, 2, 3, 4, 5]),
+            DataType::Int64 => ArrayData::Int64(vec![i64::from(row), -1, 2, -3, 4, 5]),
+            DataType::Float => ArrayData::Float(vec![r, 1.5, -2.5, 3.5, -4.5, 5.5]),
+            DataType::Double => ArrayData::Double(vec![d, 1.5, -2.5, 3.5, -4.5, 5.5]),
+            DataType::Complex => ArrayData::Complex(vec![
+                (r, 1.0),
+                (2.0, -3.0),
+                (4.0, 5.0),
+                (-6.0, 7.0),
+                (8.0, -9.0),
+                (10.0, 11.0),
+            ]),
+            DataType::DComplex => ArrayData::DComplex(vec![
+                (d, 1.0),
+                (2.0, -3.0),
+                (4.0, 5.0),
+                (-6.0, 7.0),
+                (8.0, -9.0),
+                (10.0, 11.0),
+            ]),
+            other => panic!("{other:?} is not a tiled element type"),
+        }
+    }
+
+    /// Write `data` (one logical 2x3 cell per row) through the serializers,
+    /// parse the header back, and check every row reads back exactly.
+    fn round_trip(big_endian: bool, dt: DataType, data: &[ArrayData]) {
+        // CASA cell shape (reversed logical): 2 rows x 3 cols.
+        let casa_shape: Vec<i64> = vec![3, 2];
+        let cells: Vec<Vec<u8>> = data
+            .iter()
+            .map(|d| tsm_encode_cell(big_endian, dt, d).unwrap())
+            .collect();
+        let (header_bytes, tile_data) =
+            write_tsm_file(big_endian, 0, "TiledData_GROUP", dt, &casa_shape, &cells).unwrap();
+        let header = parse_header(&header_bytes).unwrap();
+
+        // Header geometry: fixed cell dims + the extensible row axis.
+        assert_eq!(header.nrrow, data.len() as u64);
+        assert_eq!(header.hypercolumn_name, "TiledData_GROUP");
+        assert_eq!(header.data_types, vec![dt]);
+        assert_eq!(header.nrdim, 3);
+        assert_eq!(header.files.len(), 1);
+        assert_eq!(header.files[0].sequence_nr, 0);
+        let cube = &header.cubes[0];
+        assert_eq!(cube.nrdim, 3);
+        assert_eq!(cube.cube_shape, vec![3, 2, data.len() as i64]);
+        assert_eq!(cube.tile_shape[..2], [3, 2]);
+        assert_eq!(cube.file_seq_nr, 0);
+        assert_eq!(cube.file_offset, 0);
+        // If it were version >= 2 the stored big-endian flag must agree.
+        if big_endian {
+            assert_eq!(header.version, 1, "big-endian TSM header has no flag");
+        } else {
+            assert_eq!(
+                header.version, 2,
+                "little-endian TSM header carries the flag"
+            );
+        }
+
+        let tsm = TsmFile {
+            header,
+            tile_data,
+            big_endian,
+        };
+        let desc = array_desc(dt);
+        for (row, d) in data.iter().enumerate() {
+            let want = RecordValue::Array(ArrayValue {
+                shape: vec![2, 3],
+                data: d.clone(),
+            });
+            assert_eq!(
+                tsm.read_cell(&desc, row as u64).unwrap(),
+                want,
+                "row {row}, dtype {dt:?}, endian {big_endian}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_read_cell_round_trip_all_types_both_endians() {
+        for &big in &[false, true] {
+            for dt in [
+                DataType::Bool,
+                DataType::UChar,
+                DataType::Short,
+                DataType::UShort,
+                DataType::Int,
+                DataType::UInt,
+                DataType::Int64,
+                DataType::Float,
+                DataType::Double,
+                DataType::Complex,
+                DataType::DComplex,
+            ] {
+                let data: Vec<ArrayData> = (0..3).map(|row| sample_cell(dt, row)).collect();
+                round_trip(big, dt, &data);
+            }
+        }
+    }
+
+    /// Bool tiles must store one byte per element (not SSM's bit-packing).
+    #[test]
+    fn bool_tiles_store_one_byte_per_element() {
+        let data = ArrayData::Bool(vec![true, false, true, true, false, false]);
+        let cells = vec![tsm_encode_cell(false, DataType::Bool, &data).unwrap()];
+        let (header, tile_data) =
+            write_tsm_file(false, 0, "g", DataType::Bool, &[3, 2], &cells).unwrap();
+        // First cell starts at tile offset 0: the six raw bool bytes.
+        assert_eq!(&tile_data[..6], &[1, 0, 1, 1, 0, 0]);
+        // And it still decodes to the original cell.
+        let header = parse_header(&header).unwrap();
+        let tsm = TsmFile {
+            header,
+            tile_data,
+            big_endian: false,
+        };
+        let want = RecordValue::Array(ArrayValue {
+            shape: vec![2, 3],
+            data,
+        });
+        assert_eq!(tsm.read_cell(&array_desc(DataType::Bool), 0).unwrap(), want);
+    }
+
+    /// A cell large enough to force more than one tile per row-spill boundary:
+    /// 1024 dcomplex = 16 KiB/cell -> 32 rows per 512 KiB tile; 65 rows
+    /// straddle three tiles. Exercises `tile_nr * bucket_size` offsets.
+    #[test]
+    fn read_spans_multiple_tiles() {
+        let dt = DataType::DComplex;
+        let data: Vec<ArrayData> = (0..65)
+            .map(|row| ArrayData::DComplex((0..1024).map(|k| (row as f64, k as f64)).collect()))
+            .collect();
+        let cells: Vec<Vec<u8>> = data
+            .iter()
+            .map(|d| tsm_encode_cell(false, dt, d).unwrap())
+            .collect();
+        // 1-D cell of 1024 dcomplex (CASA shape).
+        let (header, tile_data) = write_tsm_file(false, 0, "g", dt, &[1024], &cells).unwrap();
+        let header = parse_header(&header).unwrap();
+        let rows_per_tile = header.cubes[0].tile_shape[1];
+        assert_eq!(rows_per_tile, 32);
+        assert!(rows_per_tile * 2 < 65, "test must span tiles");
+        assert_eq!(header.cubes[0].cube_shape, vec![1024, 65]);
+
+        let tsm = TsmFile {
+            header,
+            tile_data,
+            big_endian: false,
+        };
+        let desc = array_desc(dt);
+        for (row, d) in data.iter().enumerate() {
+            let want = RecordValue::Array(ArrayValue {
+                shape: vec![1024],
+                data: d.clone(),
+            });
+            assert_eq!(tsm.read_cell(&desc, row as u64).unwrap(), want, "row {row}");
+        }
+    }
+
+    #[test]
+    fn rejects_row_out_of_range() {
+        let data = [sample_cell(DataType::Int, 0)];
+        let cells = vec![tsm_encode_cell(false, DataType::Int, &data[0]).unwrap()];
+        let (header, tile_data) =
+            write_tsm_file(false, 0, "g", DataType::Int, &[3, 2], &cells).unwrap();
+        let header = parse_header(&header).unwrap();
+        let tsm = TsmFile {
+            header,
+            tile_data,
+            big_endian: false,
+        };
+        assert!(matches!(
+            tsm.read_cell(&array_desc(DataType::Int), 1),
+            Err(TsmError::RowOutOfRange { row: 1, nrow: 1 })
+        ));
+    }
+
+    #[test]
+    fn rejects_unsupported_tiled_element_type() {
+        assert!(matches!(
+            tsm_elem_size(DataType::String),
+            Err(TsmError::UnsupportedType(DataType::String))
+        ));
+    }
+
+    #[test]
+    fn write_rejects_inconsistent_cell_sizes() {
+        // One 1-byte and one 2-byte (u16) cell: 4-element Int cells are 16 B.
+        let cells = vec![vec![0u8; 8], vec![0u8; 9]];
+        assert!(matches!(
+            write_tsm_file(false, 0, "g", DataType::Int, &[3, 2], &cells),
+            Err(TsmError::UnsupportedType(DataType::Int))
+        ));
+    }
+
+    #[test]
+    fn header_rejects_wrong_root_type() {
+        let cells = vec![vec![0u8; 4]];
+        let (header, _) = write_tsm_file(false, 0, "g", DataType::Int, &[1], &cells).unwrap();
+        // Corrupt the root type name "TiledColumnStMan" in place.
+        let mut bad = header;
+        bad[12] = b'X';
+        assert!(matches!(
+            parse_header(&bad),
+            Err(TsmError::UnexpectedType { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_tiles_smaller_than_cell() {
+        // cube_shape[0] != tile_shape[0]: non-data dims must match the tile.
+        let header = TsmHeader {
+            version: 2,
+            seq_nr: 0,
+            nrrow: 7,
+            data_types: vec![DataType::Int],
+            hypercolumn_name: "g".into(),
+            nrdim: 3,
+            files: Vec::new(),
+            cubes: vec![TsmCube {
+                extensible: true,
+                nrdim: 3,
+                cube_shape: vec![2, 3, 7],
+                tile_shape: vec![1, 3, 4],
+                file_seq_nr: 0,
+                file_offset: 0,
+            }],
+        };
+        let tsm = TsmFile {
+            header,
+            tile_data: vec![0u8; 1024],
+            big_endian: false,
+        };
+        assert!(matches!(
+            tsm.read_cell(&array_desc(DataType::Int), 0),
+            Err(TsmError::TileTooSmall { .. })
+        ));
+    }
 }

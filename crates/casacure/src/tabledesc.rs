@@ -422,7 +422,7 @@ pub fn data_type_id(dt: DataType) -> String {
         UShort => "uShort",
         Int => "Int",
         UInt => "uInt",
-        Int64 => "int64",
+        Int64 => "Int64",
         Float => "float",
         Double => "double",
         Complex => "Complex",
@@ -524,4 +524,325 @@ pub fn write_table_desc(w: &mut crate::aipsio::Writer, desc: &TableDesc) {
         write_column_desc(w, col);
     }
     w.put_object_end();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aipsio::Writer;
+    use crate::record::{ArrayData, ArrayValue, RecordValue};
+
+    fn empty_record() -> TableRecord {
+        TableRecord {
+            desc: Default::default(),
+            record_type: 0,
+            values: Vec::new(),
+        }
+    }
+
+    fn kw_record() -> TableRecord {
+        let mut r = empty_record();
+        r.set(
+            "Units",
+            RecordValue::Array(ArrayValue {
+                shape: vec![1],
+                data: ArrayData::String(vec!["Jy".into()]),
+            }),
+        );
+        // `set` records array fields with shape None, but the codec always
+        // serializes an IPosition, so a write/read round trip yields
+        // Some([]) for "no fixed shape". Normalize to the canonical form so
+        // the round-trip assertion below is an identity check.
+        for f in &mut r.desc.fields {
+            if f.data_type.is_array() && f.shape.is_none() {
+                f.shape = Some(Vec::new());
+            }
+        }
+        let mut nested = empty_record();
+        nested.set("scale", RecordValue::Double(1.0e-3));
+        r.set("Nested", RecordValue::Record(nested));
+        r
+    }
+
+    fn col(
+        name: &str,
+        dt: DataType,
+        kind: ColumnKind,
+        ndim: i32,
+        shape: Option<Vec<i64>>,
+        keywords: TableRecord,
+    ) -> ColumnDesc {
+        ColumnDesc {
+            name: name.into(),
+            comment: format!("comment on {name}"),
+            data_type: dt,
+            data_manager_type: "StandardStMan".into(),
+            data_manager_group: "StandardStMan".into(),
+            options: 2,
+            ndim,
+            shape,
+            max_length: 0,
+            keywords,
+            kind,
+        }
+    }
+
+    /// A scalar column default must survive the binary round trip.
+    fn scalar_col(name: &str, dt: DataType, default: RecordValue) -> ColumnDesc {
+        ColumnDesc {
+            name: name.into(),
+            comment: String::new(),
+            data_type: dt,
+            data_manager_type: "StandardStMan".into(),
+            data_manager_group: "StandardStMan".into(),
+            options: 0,
+            ndim: -1,
+            shape: None,
+            max_length: 0,
+            keywords: empty_record(),
+            kind: ColumnKind::Scalar(default),
+        }
+    }
+
+    #[test]
+    fn write_read_round_trips_all_column_kinds() {
+        let desc = TableDesc {
+            name: "T".into(),
+            version: "1.0".into(),
+            comment: "a table".into(),
+            keywords: {
+                let mut k = kw_record();
+                k.set("MS_VERSION", RecordValue::Double(2.0));
+                k
+            },
+            private_keywords: {
+                let mut k = empty_record();
+                k.set("_private", RecordValue::Int(7));
+                k
+            },
+            columns: vec![
+                scalar_col("COL_B", DataType::Bool, RecordValue::Bool(true)),
+                scalar_col("COL_D", DataType::Double, RecordValue::Double(1.25e300)),
+                scalar_col("COL_S", DataType::String, RecordValue::String("hi".into())),
+                ColumnDesc {
+                    name: "ARR".into(),
+                    comment: "fixed 2x3".into(),
+                    data_type: DataType::Complex,
+                    data_manager_type: "TiledColumnStMan".into(),
+                    data_manager_group: "TiledData_GROUP".into(),
+                    options: 0,
+                    ndim: 2,
+                    shape: Some(vec![3, 2]),
+                    max_length: 0,
+                    keywords: kw_record(),
+                    kind: ColumnKind::Array,
+                },
+                ColumnDesc {
+                    name: "REC".into(),
+                    comment: "a record column".into(),
+                    data_type: DataType::Record,
+                    data_manager_type: "StandardStMan".into(),
+                    data_manager_group: "StandardStMan".into(),
+                    options: 0,
+                    ndim: -1,
+                    shape: None,
+                    max_length: 0,
+                    keywords: empty_record(),
+                    kind: ColumnKind::Record,
+                },
+            ],
+        };
+
+        let mut w = Writer::new();
+        write_table_desc(&mut w, &desc);
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        let parsed = parse_table_desc(&mut r).unwrap();
+        assert_eq!(parsed, desc);
+    }
+
+    #[test]
+    fn data_type_ids_are_eight_char_padded() {
+        assert_eq!(data_type_id(DataType::Int), "Int     ");
+        assert_eq!(data_type_id(DataType::UChar), "uChar   ");
+        assert_eq!(data_type_id(DataType::DComplex), "DComplex");
+        assert_eq!(data_type_id(DataType::String), "String  ");
+        for dt in [
+            DataType::Bool,
+            DataType::UChar,
+            DataType::Short,
+            DataType::Int,
+            DataType::Double,
+            DataType::DComplex,
+        ] {
+            assert_eq!(data_type_id(dt).len(), 8, "{dt:?}");
+        }
+    }
+
+    /// The 8-char type suffix inside `ScalarColumnDesc<...>` /
+    /// `ArrayColumnDesc<...>` class names. casacore's ColumnDesc registry is
+    /// keyed by this exact string (ColumnDesc.cc `initRegisterMap`), so a
+    /// spelling mismatch makes casacore unable to open the table. The
+    /// canonical spellings are taken from casacore-written table.dat files
+    /// (casacore `dataTypeId`): `Int64` is capital-I (NOT `int64`).
+    #[test]
+    fn column_class_name_suffixes_match_casacore_spelling() {
+        for (dt, id) in [
+            (DataType::Bool, "Bool"),
+            (DataType::UChar, "uChar"),
+            (DataType::Short, "Short"),
+            (DataType::UShort, "uShort"),
+            (DataType::Int, "Int"),
+            (DataType::UInt, "uInt"),
+            (DataType::Int64, "Int64"),
+            (DataType::Float, "float"),
+            (DataType::Double, "double"),
+            (DataType::Complex, "Complex"),
+            (DataType::DComplex, "DComplex"),
+            (DataType::String, "String"),
+        ] {
+            let want = format!("{id:8}");
+            assert_eq!(data_type_id(dt), want, "type id for {dt:?}");
+        }
+    }
+
+    #[test]
+    fn from_desc_json_builds_scalar_array_and_record_columns() {
+        let json = r#"{
+          "INT": {"valueType":"int","comment":"an int","keywords":{}},
+          "ARR": {"valueType":"double","ndim":1,"shape":[3,2],"keywords":{"Units":["Jy"]}},
+          "REC": {"valueType":"record","keywords":{}}
+        }"#;
+        let desc = TableDesc::from_desc_json(json).unwrap();
+        assert_eq!(desc.columns.len(), 3);
+
+        let int = desc.column("INT").unwrap();
+        assert_eq!(int.name, "INT");
+        assert_eq!(int.data_type, DataType::Int);
+        assert_eq!(int.kind, ColumnKind::Scalar(RecordValue::Int(0)));
+        // Empty dataManagerType/group fall back to StandardStMan.
+        assert_eq!(int.data_manager_type, "StandardStMan");
+        assert_eq!(int.data_manager_group, "StandardStMan");
+
+        let arr = desc.column("ARR").unwrap();
+        assert_eq!(arr.data_type, DataType::Double);
+        assert_eq!(arr.kind, ColumnKind::Array);
+        assert_eq!(arr.ndim, 1);
+        // Logical [3,2] is stored in CASA (reversed) order.
+        assert_eq!(arr.shape, Some(vec![2, 3]));
+        assert_eq!(
+            arr.keywords.get("Units"),
+            Some(&RecordValue::Array(ArrayValue {
+                shape: vec![1],
+                data: ArrayData::String(vec!["Jy".into()]),
+            }))
+        );
+
+        let rec = desc.column("REC").unwrap();
+        assert_eq!(rec.data_type, DataType::Record);
+        assert_eq!(rec.kind, ColumnKind::Record);
+    }
+
+    #[test]
+    fn from_desc_json_captures_table_keywords() {
+        let json = r#"{
+          "A": {"valueType":"int","keywords":{}},
+          "_define_hypercolumn_":{},
+          "_keywords_":{"MS_VERSION":2.0,"NAME":"x"},
+          "_private_keywords_":{"P":1}
+        }"#;
+        let desc = TableDesc::from_desc_json(json).unwrap();
+        assert_eq!(desc.columns.len(), 1);
+        assert_eq!(
+            desc.keywords.get("MS_VERSION"),
+            Some(&RecordValue::Double(2.0))
+        );
+        assert_eq!(
+            desc.keywords.get("NAME"),
+            Some(&RecordValue::String("x".into()))
+        );
+        assert_eq!(desc.private_keywords.get("P"), Some(&RecordValue::Int(1)));
+    }
+
+    #[test]
+    fn column_desc_normalizes_unsupported_data_managers() {
+        // Empty type/group default to StandardStMan; unsupported tiled
+        // *shape* managers are downgraded; TiledColumnStMan is kept.
+        let base = |dmt: &str, dmg: &str| {
+            format!(
+                r#"{{"C":{{"valueType":"int","dataManagerType":"{dmt}","dataManagerGroup":"{dmg}","keywords":{{}}}}}}"#
+            )
+        };
+        for (dmt, dmg, want_type, want_group) in [
+            ("", "", "StandardStMan", "StandardStMan"),
+            ("", "MYGRP", "StandardStMan", "MYGRP"),
+            ("IncrementalStMan", "", "IncrementalStMan", "StandardStMan"),
+            ("TiledShapeStMan", "G", "StandardStMan", "G"),
+            ("TiledCellStMan", "G", "StandardStMan", "G"),
+            ("TiledColumnStMan", "G", "TiledColumnStMan", "G"),
+        ] {
+            let desc = TableDesc::from_desc_json(&base(dmt, dmg)).unwrap();
+            let c = desc.column("C").unwrap();
+            assert_eq!(c.data_manager_type, want_type, "{dmt}/{dmg}");
+            assert_eq!(c.data_manager_group, want_group, "{dmt}/{dmg}");
+        }
+    }
+
+    #[test]
+    fn from_desc_json_rejects_missing_value_type() {
+        let json = r#"{"C":{"comment":"no valueType","keywords":{}}}"#;
+        assert!(matches!(
+            TableDesc::from_desc_json(json),
+            Err(TableDescError::UnknownColumnClass(_))
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_unknown_column_class() {
+        // A framed TableDesc with a nonsense column class name.
+        let mut w = Writer::new();
+        w.put_object_start("TableDesc", 2);
+        w.put_string("T");
+        w.put_string("1");
+        w.put_string("");
+        crate::record::write_table_record(&mut w, &empty_record()).unwrap();
+        crate::record::write_table_record(&mut w, &empty_record()).unwrap();
+        w.put_u32(1);
+        w.put_u32(1); // class version
+        w.put_string("BogusColumnDesc<Int     ");
+        w.put_object_end();
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        assert!(matches!(
+            parse_table_desc(&mut r),
+            Err(TableDescError::UnknownColumnClass(_))
+        ));
+    }
+
+    #[test]
+    fn array_shape_round_trips_in_casa_order() {
+        // The descriptor stores the CASA (reversed logical) shape on disk
+        // unchanged: logical [3,2] -> Some([2,3]) -> read back as [2,3].
+        let desc = TableDesc {
+            name: String::new(),
+            version: String::new(),
+            comment: String::new(),
+            keywords: empty_record(),
+            private_keywords: empty_record(),
+            columns: vec![col(
+                "ARR",
+                DataType::Double,
+                ColumnKind::Array,
+                2,
+                Some(vec![2, 3]),
+                empty_record(),
+            )],
+        };
+        let mut w = Writer::new();
+        write_table_desc(&mut w, &desc);
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        let parsed = parse_table_desc(&mut r).unwrap();
+        assert_eq!(parsed, desc);
+    }
 }

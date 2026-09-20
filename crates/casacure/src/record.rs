@@ -1442,6 +1442,7 @@ pub fn np_kind_itemsize(kind: &str, itemsize: i64) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aipsio::Writer;
 
     fn put_object(buf: &mut Vec<u8>, type_name: &str, version: u32, payload: &[u8]) {
         let length = (4 + 4 + type_name.len() + 4 + payload.len()) as u32;
@@ -1580,5 +1581,122 @@ mod tests {
             DataType::from_i32(99),
             Err(RecordError::UnknownDataType(99))
         ));
+    }
+
+    /// A representative scalar value for every scalar `DataType`.
+    fn scalar_value(dt: DataType) -> RecordValue {
+        use RecordValue::*;
+        match dt {
+            DataType::Bool => Bool(true),
+            DataType::UChar => UChar(200),
+            DataType::Short => Short(-1_234),
+            DataType::UShort => UShort(60_000),
+            DataType::Int => Int(-1_234_567),
+            DataType::UInt => UInt(4_000_000_000),
+            DataType::Int64 => Int64(-9_000_000_000_000),
+            DataType::Float => Float(1.25),
+            DataType::Double => Double(1.25e300),
+            DataType::Complex => Complex(1.5, -2.5),
+            DataType::DComplex => DComplex(1.5e300, -2.5e300),
+            DataType::String => String("hello".into()),
+            other => panic!("{other:?} is not a scalar type"),
+        }
+    }
+
+    #[test]
+    fn scalar_write_read_round_trips_both_endians() {
+        for &le in &[false, true] {
+            for dt in [
+                DataType::Bool,
+                DataType::UChar,
+                DataType::Short,
+                DataType::UShort,
+                DataType::Int,
+                DataType::UInt,
+                DataType::Int64,
+                DataType::Float,
+                DataType::Double,
+                DataType::Complex,
+                DataType::DComplex,
+                DataType::String,
+            ] {
+                let value = scalar_value(dt);
+                let mut w = if le { Writer::new_le() } else { Writer::new() };
+                write_scalar_value(&mut w, dt, &value);
+                let bytes = w.into_bytes();
+                let mut r = if le {
+                    Reader::new_le(&bytes)
+                } else {
+                    Reader::new(&bytes)
+                };
+                let back = read_scalar_value(&mut r, dt).unwrap();
+                assert_eq!(back, value, "le={le} dt={dt:?}");
+            }
+        }
+    }
+
+    /// The codec writes an IPosition even for unfixed array fields, so `set`'s
+    /// shape None comes back as Some([]); normalize to the canonical on-disk
+    /// form so the round-trip assertion below is an identity check.
+    fn normalize_array_shapes(rec: &mut TableRecord) {
+        for (f, v) in rec.desc.fields.iter_mut().zip(rec.values.iter_mut()) {
+            if f.data_type.is_array() && f.shape.is_none() {
+                f.shape = Some(Vec::new());
+            }
+            if let RecordValue::Record(sub) = v {
+                normalize_array_shapes(sub);
+            }
+        }
+    }
+
+    /// Scalar, array, and nested-record fields, built via `set`. Array
+    /// fields are normalized to the canonical on-disk form (`Some([])` for
+    /// unfixed) *before* `.set` clones a record's desc into the parent's
+    /// sub_desc, so the round trip is an identity.
+    fn sample_record() -> TableRecord {
+        let mut r = TableRecord {
+            desc: Default::default(),
+            record_type: 0,
+            values: Vec::new(),
+        };
+        r.set("count", RecordValue::Int(42));
+        r.set("ratio", RecordValue::Double(1.5e300));
+        r.set("tag", RecordValue::String("x".into()));
+        let mut sub = TableRecord {
+            desc: Default::default(),
+            record_type: 0,
+            values: Vec::new(),
+        };
+        sub.set("inner", RecordValue::Bool(true));
+        sub.set(
+            "units",
+            RecordValue::Array(ArrayValue {
+                shape: vec![2],
+                data: ArrayData::String(vec!["m".into(), "s".into()]),
+            }),
+        );
+        normalize_array_shapes(&mut sub);
+        r.set("nested", RecordValue::Record(sub));
+        r.set(
+            "arr",
+            RecordValue::Array(ArrayValue {
+                shape: vec![3],
+                data: ArrayData::Int(vec![1, 2, 3]),
+            }),
+        );
+        normalize_array_shapes(&mut r);
+        r
+    }
+
+    #[test]
+    fn table_record_write_read_round_trip() {
+        let mut rec = sample_record();
+        normalize_array_shapes(&mut rec);
+        let mut w = Writer::new();
+        write_table_record(&mut w, &rec).unwrap();
+        let bytes = w.into_bytes();
+        let mut r = Reader::new(&bytes);
+        let back = TableRecord::read(&mut r).unwrap();
+        assert_eq!(back, rec);
     }
 }

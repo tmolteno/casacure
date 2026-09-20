@@ -51,6 +51,52 @@ Work areas follow `CASACORE_TO_CASA_RS.md` (tracked as GitHub issues).
 - [X] `GROUPBY` + `GROWID()`/`GAGGR()`/`GCOUNT()`
 - [X] `SELECT UNIQUE col`, scalar subqueries
 - [X] DDL: `CREATE TABLE ... LIMIT n` for test fixtures
+- [X] **Tier A — query-language completion** (portable on the current engine;
+      the full surface is assessed in ARE_WE_CURED "TaQL: the full casacore
+      surface vs the implemented subset"; inventory from
+      `casacore/tables/TaQL/TableGram.yy` + `TableParseFunc.cc`):
+  - [X] function library: numeric/trig, string, complex-parts, presence,
+        array-shape, date/time (MJD calendar, MVTime semantics), the plain
+        stats families (min/max/sum/product/sumsqr/mean/variance/stddev/
+        sample*/avdev/rms/median/fractile/any/all/ntrue/nfalse), their
+        plural element-wise variants (`sums`/`mins`/`means`/…), and the
+        running/boxed cumulative variants — the full casacore scalar-function
+        set is now covered (~120 names); plus `hms`/`dms`/`hdms`
+        (sexagesimal strings), and the `regex`/`pattern`/`sqlpattern`
+        pattern values used with the `~` / `!~` operator (a small internal
+        regex engine covers the common subset — no new dependency)
+  - [X] `LIKE` / `ILIKE` / `NOT LIKE` (SQL `%`/`_` patterns with `\` escape;
+        no regex/sqlpattern yet)
+  - [X] `IN` set operator (literal `(...)` and `[...]` sets; `NOT IN`)
+  - [X] `HAVING` clause on the GROUPBY pipeline; `OFFSET` in LIMIT/OFFSET;
+        the `COUNT` command; ORDERBY of grouped output
+  - [X] GROUPBY-specific `g*` aggregates (`gmin gmax gsum gsumsqr gproduct
+        gmean gavg gvariance gstddev grms gmedian gfractile gfirst glast gany
+        gall gntrue gnfalse`; GAGGR/GROWID/GCOUNT already present)
+  - [X] array-cell aggregate functions in SELECT projection
+        (`sum`/`mean`/`median`/`min`/`max`/… over per-row array cells)
+  - [X] `rowid`/`rownumber`/`rownr` aliases, `iif`, and presence tests
+        (`isnull`/`isdefined`/`iscolumn`/`iskeyword`/`isnan`/`isinf`/
+        `isfinite`)
+- [X] **Tier B — new statements** (in-place edits run through the same
+      materialise → mutate → `WritableTable` → `flush()` path the pyo3 layer
+      uses: the table is read into the cell store, changed, and regenerated
+      on disk; `removerows`/`renamecol` are cell-store operations, not
+      storage-file surgery):
+  - [X] `UPDATE ... SET col = expr WHERE ... [ORDERBY] [LIMIT] [OFFSET]`
+        (expression results coerced to the column type)
+  - [X] `DELETE FROM ... WHERE ...`
+  - [X] `INSERT INTO table [(col, ...)] SELECT ...`
+  - [X] `SELECT ... INTO table FROM ...` (column types inferred from the result)
+  - [X] `DROPTABLE table`
+  - [X] `ALTER TABLE` ADD / DROP / RENAME COLUMN, SET / REMOVE keyword
+  - [X] `SHOW TABLE`, `SHOW`/`HELP`, `CALC expr FROM table`
+  - [X] `create_table` deletes stale data files on in-place regeneration
+  - [X] All of the above run through the pyo3 `taql()` / `table.taql()`
+        surface (module `taql` was previously gated to SELECT/CREATE);
+        statement results return as result tables, and the pyo3 layer
+        refreshes cached writable state for every directory a mutating
+        statement touches so re-opens read the fresh tables
 
 ## 6. MS schema / descriptors
 
