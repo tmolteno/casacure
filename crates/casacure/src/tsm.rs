@@ -87,8 +87,8 @@ pub struct TsmHeader {
 pub struct TsmFile {
     pub header: TsmHeader,
     /// `table.f{seq}_TSM{fileSeqNr}` tile data, in the table's data-file
-    /// byte order.
-    tile_data: Vec<u8>,
+    /// byte order (memory-mapped so chunked reads only touch their pages).
+    tile_data: crate::datafile::Buffer,
     big_endian: bool,
 }
 
@@ -109,8 +109,9 @@ impl TsmFile {
         } else {
             dir.join(format!("table.f{seq_nr}_TSM0"))
         };
-        let tile_data = std::fs::read(&path)
+        let tile_file = std::fs::File::open(&path)
             .map_err(|_| TsmError::MissingTileFile(path.display().to_string()))?;
+        let tile_data = crate::datafile::Buffer::from_file(tile_file)?;
         Ok(TsmFile {
             header,
             tile_data,
@@ -602,7 +603,7 @@ mod tests {
 
         let tsm = TsmFile {
             header,
-            tile_data,
+            tile_data: crate::datafile::Buffer::from(tile_data),
             big_endian,
         };
         let desc = array_desc(dt);
@@ -654,7 +655,7 @@ mod tests {
         let header = parse_header(&header).unwrap();
         let tsm = TsmFile {
             header,
-            tile_data,
+            tile_data: crate::datafile::Buffer::from(tile_data),
             big_endian: false,
         };
         let want = RecordValue::Array(ArrayValue {
@@ -687,7 +688,7 @@ mod tests {
 
         let tsm = TsmFile {
             header,
-            tile_data,
+            tile_data: crate::datafile::Buffer::from(tile_data),
             big_endian: false,
         };
         let desc = array_desc(dt);
@@ -709,7 +710,7 @@ mod tests {
         let header = parse_header(&header).unwrap();
         let tsm = TsmFile {
             header,
-            tile_data,
+            tile_data: crate::datafile::Buffer::from(tile_data),
             big_endian: false,
         };
         assert!(matches!(
@@ -771,7 +772,7 @@ mod tests {
         };
         let tsm = TsmFile {
             header,
-            tile_data: vec![0u8; 1024],
+            tile_data: crate::datafile::Buffer::from(vec![0u8; 1024]),
             big_endian: false,
         };
         assert!(matches!(

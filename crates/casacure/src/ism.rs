@@ -110,7 +110,7 @@ impl IsmIndex {
 pub struct IsmFile {
     pub header: IsmHeader,
     pub index: IsmIndex,
-    data: Vec<u8>,
+    data: crate::datafile::Buffer,
 }
 
 /// Per-column per-bucket interval index.
@@ -123,18 +123,36 @@ struct ColumnIndex {
 }
 
 impl IsmFile {
-    /// Read `<table_dir>/table.f{seq}` and parse it.
+    /// Open `<table_dir>/table.f{seq}` (memory-mapped so chunked reads only
+    /// touch their pages) and parse it.
     pub fn open(
         table_dir: impl AsRef<std::path::Path>,
         seq_nr: u32,
         table_big_endian: bool,
     ) -> Result<IsmFile, IsmError> {
-        let data = std::fs::read(table_dir.as_ref().join(format!("table.f{seq_nr}")))?;
-        IsmFile::parse(&data, table_big_endian)
+        let file = std::fs::File::open(table_dir.as_ref().join(format!("table.f{seq_nr}")))?;
+        let data = crate::datafile::Buffer::from_file(file)?;
+        let (header, index) = Self::parse_meta(&data, table_big_endian)?;
+        Ok(IsmFile {
+            header,
+            index,
+            data,
+        })
     }
 
     /// Parse an IncrementalStMan data file.
     pub fn parse(data: &[u8], table_big_endian: bool) -> Result<IsmFile, IsmError> {
+        let (header, index) = Self::parse_meta(data, table_big_endian)?;
+        Ok(IsmFile {
+            header,
+            index,
+            data: crate::datafile::Buffer::from(data.to_vec()),
+        })
+    }
+
+    /// Parse the header and bucket index of an IncrementalStMan data file
+    /// (no data copy; the caller keeps the backing bytes).
+    fn parse_meta(data: &[u8], table_big_endian: bool) -> Result<(IsmHeader, IsmIndex), IsmError> {
         let mut r = reader(data, table_big_endian);
         let obj = r.read_object_start(true)?;
         if obj.type_name != "IncrementalStMan" {
@@ -161,13 +179,8 @@ impl IsmFile {
             n_free_bucket: r.read_u32()?,
             first_free_bucket: r.read_i32()?,
         };
-        let data = data.to_vec();
-        let index = read_index_bytes(&data, &header, table_big_endian)?;
-        Ok(IsmFile {
-            header,
-            index,
-            data,
-        })
+        let index = read_index_bytes(data, &header, table_big_endian)?;
+        Ok((header, index))
     }
 
     fn bucket_bytes(&self, bucket: u32) -> Result<&[u8], IsmError> {

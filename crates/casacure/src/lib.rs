@@ -5,6 +5,7 @@
 
 pub mod aipsio;
 pub mod columnset;
+pub mod datafile;
 pub mod ism;
 pub mod ms;
 pub mod ms_schema;

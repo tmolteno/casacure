@@ -52,6 +52,8 @@ pub enum SsmError {
         "string data stored in string buckets (bucket nr {bucket}, len {len}) is not supported yet"
     )]
     StringBucketUnsupported { bucket: i32, len: i32 },
+    #[error("array element region is truncated: {need} elements promised, {have} present")]
+    TruncatedArray { need: usize, have: usize },
     #[error("array columns are not supported yet (column {0})")]
     ArrayColumn(String),
     #[error("column {0} has no StandardStMan data (data-manager type {1})")]
@@ -142,77 +144,55 @@ impl SsmIndex {
 pub struct StandardStManFile {
     pub header: StandardStManHeader,
     pub indices: Vec<SsmIndex>,
-    data: Vec<u8>,
+    data: crate::datafile::Buffer,
     /// Optional `table.f*{seq}i` array index file (StandardStMan arrays).
-    f0i: Option<Vec<u8>>,
+    f0i: Option<crate::datafile::Buffer>,
 }
 
 impl StandardStManFile {
-    /// Read `<table_dir>/table.f{seq}` and parse it.
+    /// Open `<table_dir>/table.f{seq}` (memory-mapped so chunked reads only
+    /// touch their pages) and parse it.
     pub fn open(
         table_dir: impl AsRef<std::path::Path>,
         seq_nr: u32,
         table_big_endian: bool,
     ) -> Result<StandardStManFile, SsmError> {
         let dir = table_dir.as_ref();
-        let data = std::fs::read(dir.join(format!("table.f{seq_nr}")))?;
-        let mut file = StandardStManFile::parse(&data, table_big_endian)?;
+        let file = std::fs::File::open(dir.join(format!("table.f{seq_nr}")))?;
+        let data = crate::datafile::Buffer::from_file(file)?;
+        let (header, indices) = parse_meta(&data, table_big_endian)?;
+        let mut parsed = StandardStManFile {
+            header,
+            indices,
+            data,
+            f0i: None,
+        };
         // The array index file (`table.f{seq}i`) only exists for tables with
         // StandardStMan array columns.
         let f0i_path = dir.join(format!("table.f{seq_nr}i"));
         if f0i_path.is_file() {
-            file.f0i = Some(std::fs::read(f0i_path)?);
+            let f0i = std::fs::File::open(&f0i_path)?;
+            parsed.f0i = Some(crate::datafile::Buffer::from_file(f0i)?);
         }
-        Ok(file)
+        Ok(parsed)
     }
 
     /// Parse a StandardStMan data file. `table_big_endian` is the data-file
     /// endianness flag from the `table.dat` header; for header version >= 3
     /// the stored flag must match it.
     pub fn parse(data: &[u8], table_big_endian: bool) -> Result<StandardStManFile, SsmError> {
-        let mut r = reader(data, table_big_endian);
-        let obj = r.read_object_start(true)?;
-        if obj.type_name != "StandardStMan" {
-            return Err(SsmError::UnexpectedType {
-                expected: "StandardStMan".into(),
-                found: obj.type_name,
-            });
-        }
-        let version = obj.version;
-        let stored_endian = if version >= 3 { r.read_bool()? } else { true };
-        if version >= 3 && stored_endian != table_big_endian {
-            return Err(SsmError::EndianMismatch {
-                flag: stored_endian,
-                expected: table_big_endian,
-            });
-        }
-        let header = StandardStManHeader {
-            version,
-            big_endian: table_big_endian,
-            bucket_size: r.read_u32()?,
-            nr_buckets: r.read_u32()?,
-            pers_cache_size: r.read_u32()?,
-            n_free_bucket: r.read_u32()?,
-            first_free_bucket: r.read_i32()?,
-            nr_index_buckets: r.read_u32()?,
-            first_index_bucket: r.read_i32()?,
-            index_bucket_offset: r.read_i32()?,
-            last_string_bucket: r.read_i32()?,
-            index_length: r.read_u32()?,
-            nr_index: r.read_u32()?,
-        };
-        let indices = read_index(data, &header, table_big_endian)?;
+        let (header, indices) = parse_meta(data, table_big_endian)?;
         Ok(StandardStManFile {
             header,
             indices,
-            data: data.to_vec(),
+            data: crate::datafile::Buffer::from(data.to_vec()),
             f0i: None,
         })
     }
 
     /// The optional array index file (`table.f0i`) contents, if present.
     pub fn f0i(&self) -> Option<&[u8]> {
-        self.f0i.as_deref()
+        self.f0i.as_ref().map(crate::datafile::Buffer::as_slice)
     }
 
     /// Raw bytes of data bucket `number`.
@@ -391,6 +371,47 @@ impl StandardStManFile {
     }
 }
 
+/// Parse the header and bucket index of a StandardStMan data file (no data
+/// copy; the caller keeps the backing bytes).
+fn parse_meta(
+    data: &[u8],
+    table_big_endian: bool,
+) -> Result<(StandardStManHeader, Vec<SsmIndex>), SsmError> {
+    let mut r = reader(data, table_big_endian);
+    let obj = r.read_object_start(true)?;
+    if obj.type_name != "StandardStMan" {
+        return Err(SsmError::UnexpectedType {
+            expected: "StandardStMan".into(),
+            found: obj.type_name,
+        });
+    }
+    let version = obj.version;
+    let stored_endian = if version >= 3 { r.read_bool()? } else { true };
+    if version >= 3 && stored_endian != table_big_endian {
+        return Err(SsmError::EndianMismatch {
+            flag: stored_endian,
+            expected: table_big_endian,
+        });
+    }
+    let header = StandardStManHeader {
+        version,
+        big_endian: table_big_endian,
+        bucket_size: r.read_u32()?,
+        nr_buckets: r.read_u32()?,
+        pers_cache_size: r.read_u32()?,
+        n_free_bucket: r.read_u32()?,
+        first_free_bucket: r.read_i32()?,
+        nr_index_buckets: r.read_u32()?,
+        first_index_bucket: r.read_i32()?,
+        index_bucket_offset: r.read_i32()?,
+        last_string_bucket: r.read_i32()?,
+        index_length: r.read_u32()?,
+        nr_index: r.read_u32()?,
+    };
+    let indices = read_index(data, &header, table_big_endian)?;
+    Ok((header, indices))
+}
+
 /// Bytes per row of an array column's cell in the bucket: always an
 /// `Int64` reference into the array index file (`table.f0i`).
 pub const ARRAY_REF_SIZE: u32 = 8;
@@ -541,13 +562,37 @@ pub fn read_array_cell(
         });
     }
     let data = &f0i[data_start..data_end];
-    let mut r = reader(data, file.header.big_endian);
+    // Decode the fixed-size element region in one `chunks_exact` pass with
+    // direct from_{le,be}_bytes conversion — no per-element aipsio Reader
+    // overhead (the hot path for array-column getcol/getcolnp on an SSM).
+    macro_rules! decode_array {
+        ($ty:ty, $variant:ident, $n:literal) => {{
+            let it = data.chunks_exact($n);
+            let mut out = Vec::with_capacity(data.len() / $n);
+            if file.header.big_endian {
+                for b in it {
+                    out.push(<$ty>::from_be_bytes(b.try_into().unwrap()));
+                }
+            } else {
+                for b in it {
+                    out.push(<$ty>::from_le_bytes(b.try_into().unwrap()));
+                }
+            }
+            if out.len() != nelem {
+                return Err(SsmError::TruncatedArray {
+                    need: nelem,
+                    have: out.len(),
+                });
+            }
+            ArrayData::$variant(out)
+        }};
+    }
     let array_data = match elem {
         DataType::Bool => {
             let nbytes = nelem.div_ceil(8);
             let mut packed = Vec::with_capacity(nbytes);
-            for _ in 0..nbytes {
-                packed.push(r.read_u8()?);
+            for b in &data[..nbytes.min(data.len())] {
+                packed.push(*b);
             }
             ArrayData::Bool(
                 (0..nelem)
@@ -555,44 +600,64 @@ pub fn read_array_cell(
                     .collect(),
             )
         }
-        DataType::Char | DataType::UChar => {
-            ArrayData::UChar((0..nelem).map(|_| r.read_u8()).collect::<Result<_, _>>()?)
-        }
-        DataType::Short => {
-            ArrayData::Short((0..nelem).map(|_| r.read_i16()).collect::<Result<_, _>>()?)
-        }
-        DataType::UShort => {
-            ArrayData::UShort((0..nelem).map(|_| r.read_u16()).collect::<Result<_, _>>()?)
-        }
-        DataType::Int => {
-            ArrayData::Int((0..nelem).map(|_| r.read_i32()).collect::<Result<_, _>>()?)
-        }
-        DataType::UInt => {
-            ArrayData::UInt((0..nelem).map(|_| r.read_u32()).collect::<Result<_, _>>()?)
-        }
-        DataType::Int64 => {
-            ArrayData::Int64((0..nelem).map(|_| r.read_i64()).collect::<Result<_, _>>()?)
-        }
-        DataType::Float => {
-            ArrayData::Float((0..nelem).map(|_| r.read_f32()).collect::<Result<_, _>>()?)
-        }
-        DataType::Double => {
-            ArrayData::Double((0..nelem).map(|_| r.read_f64()).collect::<Result<_, _>>()?)
-        }
-        DataType::Complex => ArrayData::Complex({
+        DataType::Char | DataType::UChar => ArrayData::UChar(data.to_vec()),
+        DataType::Short => decode_array!(i16, Short, 2),
+        DataType::UShort => decode_array!(u16, UShort, 2),
+        DataType::Int => decode_array!(i32, Int, 4),
+        DataType::UInt => decode_array!(u32, UInt, 4),
+        DataType::Int64 => decode_array!(i64, Int64, 8),
+        DataType::Float => decode_array!(f32, Float, 4),
+        DataType::Double => decode_array!(f64, Double, 8),
+        DataType::Complex => {
+            let mut it = data.chunks_exact(8);
             let mut v = Vec::with_capacity(nelem);
-            for _ in 0..nelem {
-                v.push((r.read_f32()?, r.read_f32()?));
+            for pair in it.by_ref() {
+                let bits = if file.header.big_endian {
+                    (
+                        f32::from_be_bytes(pair[0..4].try_into().unwrap()),
+                        f32::from_be_bytes(pair[4..8].try_into().unwrap()),
+                    )
+                } else {
+                    (
+                        f32::from_le_bytes(pair[0..4].try_into().unwrap()),
+                        f32::from_le_bytes(pair[4..8].try_into().unwrap()),
+                    )
+                };
+                v.push(bits);
             }
-            v
-        }),
-        DataType::DComplex => ArrayData::DComplex({
+            if !it.remainder().is_empty() {
+                return Err(SsmError::TruncatedArray {
+                    need: nelem,
+                    have: v.len(),
+                });
+            }
+            ArrayData::Complex(v)
+        }
+        DataType::DComplex => {
+            let mut it = data.chunks_exact(16);
             let mut v = Vec::with_capacity(nelem);
-            for _ in 0..nelem {
-                v.push((r.read_f64()?, r.read_f64()?));
+            for pair in it.by_ref() {
+                let bits = if file.header.big_endian {
+                    (
+                        f64::from_be_bytes(pair[0..8].try_into().unwrap()),
+                        f64::from_be_bytes(pair[8..16].try_into().unwrap()),
+                    )
+                } else {
+                    (
+                        f64::from_le_bytes(pair[0..8].try_into().unwrap()),
+                        f64::from_le_bytes(pair[8..16].try_into().unwrap()),
+                    )
+                };
+                v.push(bits);
             }
-            v
-        }),
+            if !it.remainder().is_empty() {
+                return Err(SsmError::TruncatedArray {
+                    need: nelem,
+                    have: v.len(),
+                });
+            }
+            ArrayData::DComplex(v)
+        }
         dt => return Err(SsmError::UnsupportedArrayType(dt)),
     };
     Ok(RecordValue::Array(ArrayValue {

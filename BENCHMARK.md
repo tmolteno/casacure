@@ -30,6 +30,39 @@ measures both engines in the same process. The comparison table is only
 printed when real casacore is present; otherwise casacure-only times are
 shown with `n/a` ratios.
 
+## dask-ms chunked reads (memory footprint)
+
+`scripts/bench_daskms_chunking.py` builds an MS with a large
+`(nrow × nchan × ncorr) complex64` DATA column (~977 MiB, 250k rows ×
+[128,4]), then reads it through `dask-ms` (`xds_from_table` +
+`DATA.sum().compute()`) at several row-chunk sizes under a synchronous dask
+scheduler, each config in a fresh subprocess so `ru_maxrss` reflects only
+that read.
+
+| chunk (rows) | peak RSS (MiB) | read ms |
+|---|---|---|
+| all (250k) | 4178 | 3270 |
+| 125 000 | 2606 | 2134 |
+| 25 000 | 1412 | 1471 |
+| 5 000 | 1167 | 1451 |
+| 1 000 | 1121 | 1725 |
+
+Chunk size now **deliberately reduces memory**: a 1000-row chunk peaks at
+~1.1 GiB vs ~4.2 GiB for a whole-column read (3.7×), and a *bounded* read
+(2 000–10 000 rows of the 977 MiB column) peaks at the ~430 MiB
+Python/dask-ms stack baseline — the actual column data adds ~0 because the
+data files are memory-mapped and only the requested rows' pages are touched.
+
+Before the fix, every `xds_from_table` eagerly `fs::read` the whole data
+file per open, so peak RSS was ~the full column (~6 GiB observed) at every
+chunk size — chunking did not reduce memory at all. Data files
+(`table.f{seq}`, `table.f0i`, TSM tiles) are now `memmap2`-mapped.
+
+A profiling pass (`perf record` during chunked ranged `getcolnp`) found the
+per-element `aipsio::Reader` decode of SSM array cells at ~20 % of CPU;
+replacing it with a direct `chunks_exact` + `from_{le,be}_bytes` pass made a
+250-chunk scan 3.2× faster (2.4 s → 0.75 s) with no behavioural change.
+
 ## Workload
 
 `casacure-bench` builds a table with two double scalar columns

@@ -37,6 +37,25 @@ subtasks are moved here.
   Standard/IncrementalStMan with reopen persistence, TiledColumnStMan and
   fixed/variable-shape arrays, slices/varcol, string boundaries, table and
   column keywords, table lifecycle, and the documented error paths).
+- **dask-ms chunking is respected (memory-mapped data files).** A table open
+  eagerly `fs::read` every data file (`table.f{seq}`, `table.f0i`, TSM
+  tiles), so any read — even a dask-ms 1000-row chunk of a 1 GB column —
+  materialised the whole file (~6 GiB RSS at every chunk size). The SSM/ISM/
+  TSM data files are now `memmap2`-mapped (`datafile::Buffer`), so an open is
+  O(1) memory and a chunked read touches only the requested rows' pages.
+  Measured on the `scripts/bench_daskms_chunking.py` benchmark (1 GB MS via
+  `xds_from_table`): peak RSS now scales with chunk size (4.2 GiB whole
+  column → 1.1 GiB at 1000-row chunks, 3.7×), and a bounded read stays at
+  the ~430 MiB Python/dask-ms baseline; previously it was ~6 GiB at every
+  size.
+- **SSM array-cell decode is no longer per-element.** `read_array_cell`
+  decoded every element through the `aipsio::Reader` (bounds checks per
+  call, ~20 % of a chunked read's CPU). It now decodes the element region in
+  a single `chunks_exact` pass with direct `from_{le,be}_bytes`; a
+  250-chunk ranged scan of the 977 MiB column is 3.2× faster (2.4 s →
+  0.75 s). Data files are mapped read-only and a handle stays a stable
+  snapshot (a concurrent flush rewrites the file, so a stale handle sees its
+  own captured state).
 
 ## [3.8.1] - 2026-09-19
 
