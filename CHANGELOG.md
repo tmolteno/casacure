@@ -330,6 +330,25 @@ forward.
   `crates/casacure/src/quanta.rs` (shared, not duplicated); the full
   `casacore.measures` M* transforms remain out of scope.
 
+### Fixed
+
+- **Hot-path borrows: two avoidable copies removed** (profiled; no
+  behaviour change).
+  1. **`putcol` array write no longer boxes every element twice**:
+     `value_to_cells` built one heap `RecordValue` per array element and then
+     re-iterated that list to build the typed `ArrayData` (discarding the
+     per-element boxes). `ndarray_cells_typed` now builds each row's typed
+     `Vec<T>` directly from the (borrowed, read-only) numpy view in one
+     pass — no intermediate `RecordValue` per element.
+  2. **Read-only table handles hold the opened core table** instead of
+     re-opening (re-reading `table.dat` and every storage-manager file) on
+     every data call. Each `getcol`/`getcolnp`/`getcolslice`/`getcell` used
+     to re-read the *entire* table; a 325 MB table now reads a 100k-row
+     slice at the per-cell floor (~8 ms/call) instead of re-reading 325 MB
+     per call. The pyo3 `taql` wrapper borrows the held tables directly
+     (`Inner::Read(Arc<Table>)`). A read handle is now a snapshot: reopen
+     to see out-of-band `taql` mutations.
+
 ## [0.2.0] - 2026-09-19
 
 ### Changed

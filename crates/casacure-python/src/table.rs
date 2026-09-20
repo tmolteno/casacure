@@ -18,10 +18,9 @@ use crate::convert;
 /// The backing state of a bound table.
 #[allow(clippy::large_enum_variant)]
 enum Inner {
-    /// Read-only access to an existing table. Holds the table DIR; opened
-    /// (re-parsed) fresh on every read so long-lived handles see later
-    /// writes, like casacore's live data managers.
-    Read(std::path::PathBuf),
+    /// Read-only access to an existing table. Holds the opened core table so
+    /// repeated reads do not re-read and re-parse the whole table per call.
+    Read(std::sync::Arc<::casacure::Table>),
     /// Read + buffered writes backed by the process-shared record for the
     /// table's directory.
     Write {
@@ -259,7 +258,7 @@ impl Table {
             return Ok(Table {
                 path: path.to_string(),
                 writable: false,
-                inner: Mutex::new(Inner::Read(dir)),
+                inner: Mutex::new(Inner::Read(std::sync::Arc::new(read))),
             });
         }
         // Reuse a live shared backing for this directory so concurrent
@@ -318,10 +317,7 @@ impl Table {
     fn read_col(&self, col_idx: usize, startrow: u64, nrow: u64) -> PyResult<Vec<RecordValue>> {
         let inner = self.inner.lock().unwrap();
         match &*inner {
-            Inner::Read(dir) => {
-                let t = ::casacure::Table::open(dir, false).map_err(err)?;
-                column_cells(&t, col_idx, startrow, nrow)
-            }
+            Inner::Read(t) => column_cells(t, col_idx, startrow, nrow),
             Inner::Write { shared, .. } => {
                 let s = shared.lock().unwrap();
                 let mut out = Vec::with_capacity(nrow as usize);
@@ -343,25 +339,7 @@ impl Table {
     fn desc(&self) -> core::tabledesc::TableDesc {
         let inner = self.inner.lock().unwrap();
         match &*inner {
-            Inner::Read(dir) => match ::casacure::Table::open(dir, false) {
-                Ok(t) => t.dat.desc.clone(),
-                Err(_) => core::tabledesc::TableDesc {
-                    name: String::new(),
-                    version: String::new(),
-                    comment: String::new(),
-                    keywords: core::record::TableRecord {
-                        desc: Default::default(),
-                        record_type: 0,
-                        values: Vec::new(),
-                    },
-                    private_keywords: core::record::TableRecord {
-                        desc: Default::default(),
-                        record_type: 0,
-                        values: Vec::new(),
-                    },
-                    columns: Vec::new(),
-                },
-            },
+            Inner::Read(t) => t.dat.desc.clone(),
             Inner::Write { shared, .. } => {
                 let s = shared.lock().unwrap();
                 s.wt.desc().clone()
@@ -372,9 +350,7 @@ impl Table {
     fn row_count(&self) -> u64 {
         let inner = self.inner.lock().unwrap();
         match &*inner {
-            Inner::Read(dir) => ::casacure::Table::open(dir, false)
-                .map(|t| t.nrows())
-                .unwrap_or(0),
+            Inner::Read(t) => t.nrows(),
             Inner::Write { shared, .. } => {
                 let s = shared.lock().unwrap();
                 s.wt.col_len(0) as u64
@@ -496,13 +472,7 @@ impl Table {
         let rec = {
             let inner = self.inner.lock().unwrap();
             match &*inner {
-                Inner::Read(dir) => ::casacure::Table::open(dir, false)
-                    .map(|t| t.dat.desc.keywords.clone())
-                    .unwrap_or_else(|_| core::record::TableRecord {
-                        desc: Default::default(),
-                        record_type: 0,
-                        values: Vec::new(),
-                    }),
+                Inner::Read(t) => t.dat.desc.keywords.clone(),
                 Inner::Write { shared, .. } => shared.lock().unwrap().wt.desc().keywords.clone(),
             }
         };
@@ -520,13 +490,7 @@ impl Table {
     fn getkeywords(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.lock().unwrap();
         let rec = match &*inner {
-            Inner::Read(dir) => ::casacure::Table::open(dir, false)
-                .map(|t| t.dat.desc.keywords.clone())
-                .unwrap_or_else(|_| core::record::TableRecord {
-                    desc: Default::default(),
-                    record_type: 0,
-                    values: Vec::new(),
-                }),
+            Inner::Read(t) => t.dat.desc.keywords.clone(),
             Inner::Write { shared, .. } => shared.lock().unwrap().wt.desc().keywords.clone(),
         };
         let base = std::path::Path::new(&self.path)
@@ -560,9 +524,9 @@ impl Table {
     fn getdminfo(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.lock().unwrap();
         let info = match &*inner {
-            Inner::Read(dir) => {
-                let t = ::casacure::Table::open(dir, false).map_err(err)?;
-                core::get_dminfo(dir, &t.dat).map_err(err)?
+            Inner::Read(t) => {
+                let dir = std::path::PathBuf::from(t.name());
+                core::get_dminfo(&dir, &t.dat).map_err(err)?
             }
             Inner::Write { shared, .. } => {
                 let s = shared.lock().unwrap();
@@ -762,7 +726,7 @@ impl Table {
         // The table's own directory, made absolute, so the returned subtable
         // paths open from any working directory (like python-casacore).
         let name: String = match &*self.inner.lock().unwrap() {
-            Inner::Read(dir) => dir.to_string_lossy().into_owned(),
+            Inner::Read(t) => t.name().to_string(),
             _ => self.name()?,
         };
         let table_dir = std::fs::canonicalize(&name).unwrap_or_else(|_| name.clone().into());
@@ -1468,10 +1432,7 @@ impl Table {
     fn read_cell(&self, col_idx: usize, row: u64) -> PyResult<RecordValue> {
         let inner = self.inner.lock().unwrap();
         match &*inner {
-            Inner::Read(dir) => {
-                let t = ::casacure::Table::open(dir, false).map_err(err)?;
-                t.getcell(col_idx, row).map_err(err)
-            }
+            Inner::Read(t) => t.getcell(col_idx, row).map_err(err),
             Inner::Write { shared, .. } => {
                 let s = shared.lock().unwrap();
                 s.wt.cell(col_idx, row).cloned().ok_or_else(|| {
@@ -1490,10 +1451,7 @@ impl Table {
     ) -> PyResult<RecordValue> {
         let inner = self.inner.lock().unwrap();
         match &*inner {
-            Inner::Read(dir) => {
-                let t = ::casacure::Table::open(dir, false).map_err(err)?;
-                t.getcellslice(col_idx, row, blc, trc).map_err(err)
-            }
+            Inner::Read(t) => t.getcellslice(col_idx, row, blc, trc).map_err(err),
             Inner::Write { shared, .. } => {
                 let s = shared.lock().unwrap();
                 match s.wt.cell(col_idx, row) {
@@ -1514,11 +1472,9 @@ impl Table {
     ) -> PyResult<Vec<RecordValue>> {
         let inner = self.inner.lock().unwrap();
         match &*inner {
-            Inner::Read(dir) => {
-                let t = ::casacure::Table::open(dir, false).map_err(err)?;
-                t.getcolslice(col_idx, blc, trc, startrow, nrow)
-                    .map_err(err)
-            }
+            Inner::Read(t) => t
+                .getcolslice(col_idx, blc, trc, startrow, nrow)
+                .map_err(err),
             Inner::Write { shared, .. } => {
                 let s = shared.lock().unwrap();
                 let mut out = Vec::with_capacity(nrow as usize);
@@ -1647,14 +1603,14 @@ impl Table {
             // c64 (float32 complex), Complex64 = c128 (float64 complex).
             if let Ok(arr) = value.cast::<numpy::PyArrayDyn<numpy::Complex32>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, varcol, |e| {
-                    RecordValue::Complex(e.re, e.im)
+                return ndarray_cells_typed(&readonly, nrow, varcol, |v| {
+                    core::record::ArrayData::Complex(v.into_iter().map(|c| (c.re, c.im)).collect())
                 });
             }
             if let Ok(arr) = value.cast::<numpy::PyArrayDyn<numpy::Complex64>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, varcol, |e| {
-                    RecordValue::DComplex(e.re, e.im)
+                return ndarray_cells_typed(&readonly, nrow, varcol, |v| {
+                    core::record::ArrayData::DComplex(v.into_iter().map(|c| (c.re, c.im)).collect())
                 });
             }
             if let Ok(arr) = value.cast::<numpy::PyArrayDyn<Py<PyAny>>>() {
@@ -1683,50 +1639,80 @@ impl Table {
             // Numeric ndarray.
             if let Ok(arr) = value.cast::<numpy::PyArrayDyn<f64>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, varcol, RecordValue::Double);
+                return ndarray_cells_typed(
+                    &readonly,
+                    nrow,
+                    varcol,
+                    core::record::ArrayData::Double,
+                );
             }
             if let Ok(arr) = value.cast::<numpy::PyArrayDyn<f32>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, varcol, RecordValue::Float);
+                return ndarray_cells_typed(
+                    &readonly,
+                    nrow,
+                    varcol,
+                    core::record::ArrayData::Float,
+                );
             }
             if let Ok(arr) = value.cast::<numpy::PyArrayDyn<u8>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, varcol, RecordValue::UChar);
+                return ndarray_cells_typed(
+                    &readonly,
+                    nrow,
+                    varcol,
+                    core::record::ArrayData::UChar,
+                );
             }
             if let Ok(arr) = value.cast::<numpy::PyArrayDyn<i16>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, varcol, RecordValue::Short);
+                return ndarray_cells_typed(
+                    &readonly,
+                    nrow,
+                    varcol,
+                    core::record::ArrayData::Short,
+                );
             }
             if let Ok(arr) = value.cast::<numpy::PyArrayDyn<u32>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, varcol, RecordValue::UInt);
+                return ndarray_cells_typed(&readonly, nrow, varcol, core::record::ArrayData::UInt);
             }
             if let Ok(arr) = value.cast::<numpy::PyArrayDyn<u16>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, varcol, RecordValue::UShort);
+                return ndarray_cells_typed(
+                    &readonly,
+                    nrow,
+                    varcol,
+                    core::record::ArrayData::UShort,
+                );
             }
             if let Ok(arr) = value.cast::<numpy::PyArrayDyn<i64>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, varcol, RecordValue::Int64);
+                return ndarray_cells_typed(
+                    &readonly,
+                    nrow,
+                    varcol,
+                    core::record::ArrayData::Int64,
+                );
             }
             if let Ok(arr) = value.cast::<numpy::PyArrayDyn<i32>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, varcol, RecordValue::Int);
+                return ndarray_cells_typed(&readonly, nrow, varcol, core::record::ArrayData::Int);
             }
             if let Ok(arr) = value.cast::<numpy::PyArrayDyn<bool>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, varcol, RecordValue::Bool);
+                return ndarray_cells_typed(&readonly, nrow, varcol, core::record::ArrayData::Bool);
             }
             if let Ok(arr) = value.cast::<numpy::PyArrayDyn<Complex32>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, varcol, |e| {
-                    RecordValue::Complex(e.re, e.im)
+                return ndarray_cells_typed(&readonly, nrow, varcol, |v| {
+                    core::record::ArrayData::Complex(v.into_iter().map(|c| (c.re, c.im)).collect())
                 });
             }
             if let Ok(arr) = value.cast::<numpy::PyArrayDyn<Complex64>>() {
                 let readonly = arr.readonly();
-                return ndarray_cells(&readonly, nrow, varcol, |e| {
-                    RecordValue::DComplex(e.re, e.im)
+                return ndarray_cells_typed(&readonly, nrow, varcol, |v| {
+                    core::record::ArrayData::DComplex(v.into_iter().map(|c| (c.re, c.im)).collect())
                 });
             }
             return Err(PyTypeError::new_err(format!(
@@ -1830,11 +1816,11 @@ fn reshape_cell(shape: &[usize]) -> usize {
     shape.iter().skip(1).product::<usize>().max(1)
 }
 
-fn ndarray_cells<T: numpy::Element + Copy>(
+fn ndarray_cells_typed<T: numpy::Element + Copy>(
     arr: &numpy::PyReadonlyArrayDyn<'_, T>,
     nrow: u64,
     varcol: bool,
-    f: impl Fn(T) -> RecordValue,
+    build: impl Fn(Vec<T>) -> ArrayData,
 ) -> PyResult<Vec<RecordValue>> {
     let shape: Vec<usize> = arr.as_array().shape().to_vec();
     if shape.is_empty() {
@@ -1853,127 +1839,21 @@ fn ndarray_cells<T: numpy::Element + Copy>(
             break;
         }
         let stop = ((r + 1) * cell).min(flat.len());
-        let mut corder: Vec<RecordValue> = Vec::with_capacity(stop - start);
+        // Build each row's typed element buffer directly from the borrowed
+        // numpy view (one pass, no intermediate per-element `RecordValue`).
+        let mut elems: Vec<T> = Vec::with_capacity(stop - start);
         for e in flat.iter().skip(start).take(stop - start) {
-            corder.push(f(*e));
+            elems.push(*e);
         }
         // Array columns always store `RecordValue::Array` cells, even for a
         // 1-element cell (e.g. an ncorr=1 CORR_TYPE column in an MS): the
         // storage managers and readers expect an Array value there.
         out.push(RecordValue::Array(core::record::ArrayValue {
             shape: casa_shape.clone(),
-            data: array_data_of(&corder),
+            data: build(elems),
         }));
     }
     Ok(out)
-}
-
-fn array_data_of(elems: &[RecordValue]) -> core::record::ArrayData {
-    use core::record::ArrayData as AD;
-    match elems.first() {
-        Some(RecordValue::Double(_)) => AD::Double(
-            elems
-                .iter()
-                .map(|v| match v {
-                    RecordValue::Double(d) => *d,
-                    _ => 0.0,
-                })
-                .collect(),
-        ),
-        Some(RecordValue::Float(_)) => AD::Float(
-            elems
-                .iter()
-                .map(|v| match v {
-                    RecordValue::Float(d) => *d,
-                    _ => 0.0,
-                })
-                .collect(),
-        ),
-        Some(RecordValue::Int(_)) => AD::Int(
-            elems
-                .iter()
-                .map(|v| match v {
-                    RecordValue::Int(d) => *d,
-                    RecordValue::Int64(d) => *d as i32,
-                    _ => 0,
-                })
-                .collect(),
-        ),
-        Some(RecordValue::Int64(_)) => AD::Int64(
-            elems
-                .iter()
-                .map(|v| match v {
-                    RecordValue::Int64(d) => *d,
-                    RecordValue::Int(d) => i64::from(*d),
-                    _ => 0,
-                })
-                .collect(),
-        ),
-        Some(RecordValue::UInt(_)) => AD::UInt(
-            elems
-                .iter()
-                .map(|v| match v {
-                    RecordValue::UInt(d) => *d,
-                    _ => 0,
-                })
-                .collect(),
-        ),
-        Some(RecordValue::UChar(_)) => AD::UChar(
-            elems
-                .iter()
-                .map(|v| match v {
-                    RecordValue::UChar(d) => *d,
-                    _ => 0,
-                })
-                .collect(),
-        ),
-        Some(RecordValue::UShort(_)) => AD::UShort(
-            elems
-                .iter()
-                .map(|v| match v {
-                    RecordValue::UShort(d) => *d,
-                    _ => 0,
-                })
-                .collect(),
-        ),
-        Some(RecordValue::Short(_)) => AD::Short(
-            elems
-                .iter()
-                .map(|v| match v {
-                    RecordValue::Short(d) => *d,
-                    _ => 0,
-                })
-                .collect(),
-        ),
-        Some(RecordValue::Bool(_)) => AD::Bool(
-            elems
-                .iter()
-                .map(|v| match v {
-                    RecordValue::Bool(d) => *d,
-                    _ => false,
-                })
-                .collect(),
-        ),
-        Some(RecordValue::Complex(_, _)) => AD::Complex(
-            elems
-                .iter()
-                .map(|v| match v {
-                    RecordValue::Complex(re, im) => (*re, *im),
-                    _ => (0.0, 0.0),
-                })
-                .collect(),
-        ),
-        Some(RecordValue::DComplex(_, _)) => AD::DComplex(
-            elems
-                .iter()
-                .map(|v| match v {
-                    RecordValue::DComplex(re, im) => (*re, *im),
-                    _ => (0.0, 0.0),
-                })
-                .collect(),
-        ),
-        _ => AD::Double(Vec::new()),
-    }
 }
 
 /// Build the python-casacore `getcoldesc` dict for a column.
@@ -2106,7 +1986,6 @@ pub fn taql(
     let objects: Vec<PyRef<'_, Table>>;
     let locks: Vec<std::sync::MutexGuard<'_, Inner>>;
     let shared_guards: Vec<Option<std::sync::MutexGuard<'_, WriteData>>>;
-    let read_tables: Vec<::casacure::Table>;
     let core_refs: Vec<&::casacure::Table>;
     if let Some(ts) = tables {
         objects = ts
@@ -2117,14 +1996,6 @@ pub fn taql(
             })
             .collect::<PyResult<_>>()?;
         locks = objects.iter().map(|t| t.inner.lock().unwrap()).collect();
-        read_tables = locks
-            .iter()
-            .filter_map(|g| match &**g {
-                Inner::Read(dir) => Some(::casacure::Table::open(dir, false)),
-                _ => None,
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(err)?;
         shared_guards = locks
             .iter()
             .map(|g| match &**g {
@@ -2132,23 +2003,21 @@ pub fn taql(
                 _ => None,
             })
             .collect();
-        let mut read_it = read_tables.iter();
         core_refs = locks
             .iter()
             .zip(shared_guards.iter())
             .map(|(g, sg)| match &**g {
-                Inner::Read(_) => read_it.next().expect("read table iterator exhausted"),
+                Inner::Read(t) => t.as_ref(),
                 Inner::Write { .. } => &sg.as_ref().expect("write table has a shared guard").read,
             })
             .collect();
     } else {
         objects = Vec::new();
         locks = Vec::new();
-        read_tables = Vec::new();
         shared_guards = Vec::new();
         core_refs = Vec::new();
         // objects/locks/guards only exist to keep borrows alive.
-        let _ = (&objects, &locks, &read_tables, &shared_guards);
+        let _ = (&objects, &locks, &shared_guards);
     }
     let mut touched: Vec<std::path::PathBuf> = Vec::new();
     let result = core::taql::execute_into(query, &core_refs, &mut touched).map_err(err)?;
