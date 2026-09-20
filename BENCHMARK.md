@@ -30,38 +30,63 @@ measures both engines in the same process. The comparison table is only
 printed when real casacore is present; otherwise casacure-only times are
 shown with `n/a` ratios.
 
-## dask-ms chunked reads (memory footprint)
+## Memory footprint: casacore vs casacure for dask-ms chunked reads
 
 `scripts/bench_daskms_chunking.py` builds an MS with a large
 `(nrow × nchan × ncorr) complex64` DATA column (~977 MiB, 250k rows ×
 [128,4]), then reads it through `dask-ms` (`xds_from_table` +
 `DATA.sum().compute()`) at several row-chunk sizes under a synchronous dask
-scheduler, each config in a fresh subprocess so `ru_maxrss` reflects only
-that read.
+scheduler. Each config runs in a fresh subprocess so `ru_maxrss` reflects
+only that read; both engines get the identical MS and the identical dask-ms
+graph (the casacure backend vs real python-casacore).
 
-| chunk (rows) | peak RSS (MiB) | read ms |
+**Full pass** — `.sum().compute()` streams the whole 977 MiB column (every
+row is read), peak RSS:
+
+| chunk (rows) | casacure (MiB) | casacore (MiB) |
 |---|---|---|
-| all (250k) | 4178 | 3270 |
-| 125 000 | 2606 | 2134 |
-| 25 000 | 1412 | 1471 |
-| 5 000 | 1167 | 1451 |
-| 1 000 | 1121 | 1725 |
+| all (250k) | 4185 | 2202 |
+| 125 000 | 2643 | 1163 |
+| 25 000 | 1411 | 331 |
+| 5 000 | 1166 | 165 |
+| 1 000 | 1121 | 136 |
 
-Chunk size now **deliberately reduces memory**: a 1000-row chunk peaks at
-~1.1 GiB vs ~4.2 GiB for a whole-column read (3.7×), and a *bounded* read
-(2 000–10 000 rows of the 977 MiB column) peaks at the ~430 MiB
-Python/dask-ms stack baseline — the actual column data adds ~0 because the
-data files are memory-mapped and only the requested rows' pages are touched.
+**Bounded read** — a window of the column (10 000 rows = 39 MiB, then
+100 000 rows = 391 MiB) read at the same chunk sizes; peak RSS:
 
-Before the fix, every `xds_from_table` eagerly `fs::read` the whole data
-file per open, so peak RSS was ~the full column (~6 GiB observed) at every
-chunk size — chunking did not reduce memory at all. Data files
-(`table.f{seq}`, `table.f0i`, TSM tiles) are now `memmap2`-mapped.
+| rows read | casacure (MiB) | casacore (MiB) |
+|---|---|---|
+| 10 000 | 362 | 366 |
+| 100 000 | 429–529 | 366 |
 
-A profiling pass (`perf record` during chunked ranged `getcolnp`) found the
-per-element `aipsio::Reader` decode of SSM array cells at ~20 % of CPU;
-replacing it with a direct `chunks_exact` + `from_{le,be}_bytes` pass made a
-250-chunk scan 3.2× faster (2.4 s → 0.75 s) with no behavioural change.
+### What this says
+
+- **Both engines respect chunking for anything short of a full pass.**
+  Bounded reads scale with the rows actually read, not the column size, and
+  sit at the same ~350–430 MiB Python/dask-ms stack baseline in both
+  engines (casacure's mmap and casacore's storage-manager cache only touch
+  the requested pages).
+- **Full-column reads diverge in the floor.** casacore streams through a
+  bounded LRU storage-manager read cache: peak RSS stays at ~136–330 MiB
+  (cache + one chunk's working set) no matter how large the column.
+  casacure memory-maps the data files, so every page touched over the pass
+  stays resident: the floor is ~1× the column size (~1.1 GiB here), and the
+  whole-column single-read case adds the two materialisation buffers
+  (~4.2 GiB). At a 4-MiB chunk casacore's full-pass footprint is ~8× lower
+  than casacure's.
+- **Where casacure was before the mapping change:** an open eagerly
+  `fs::read` the whole data file, so *any* read — even a 1000-row chunk —
+  cost ~the full column (~6 GiB observed at every chunk size). The
+  `memmap2` change moved casacure from "file copied into RAM per open" to
+  "file resident once touched"; a bounded LRU read cache (or a
+  `madvise(DONTNEED)` page-drop policy on long sequential scans) is the
+  remaining step to reach casacore's streaming floor. That is a follow-up,
+  not done here.
+
+Timing is comparable in the chunked regime (a 250-chunk ranged scan is
+~0.75 s in both); a `perf` pass found casacure's per-element SSM array
+decode at ~20 % CPU, replaced with a single `chunks_exact` +
+`from_{le,be}_bytes` decode (3.2× faster scan).
 
 ## Workload
 
