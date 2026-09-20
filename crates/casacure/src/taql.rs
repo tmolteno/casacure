@@ -2167,7 +2167,7 @@ struct EvalCtx<'a> {
 }
 
 impl<'a> EvalCtx<'a> {
-    fn column(&self, name: &str) -> TResult<Vec<TqValue>> {
+    fn column(&self, name: &str) -> TResult<std::cell::Ref<'_, Vec<TqValue>>> {
         let idx = *self
             .colidx
             .get(name)
@@ -2175,13 +2175,16 @@ impl<'a> EvalCtx<'a> {
                 what: "table".to_string(),
                 field: name.to_string(),
             })?;
-        if let Some(cached) = self.columns.borrow().get(&idx) {
-            return Ok(cached.clone());
+        // Materialise the column once and keep it cached; return a borrow
+        // into the cache so a per-row `column_value(name, row)` does not
+        // clone the whole column on every row (that made a 20k-row WHERE an
+        // O(n^2) clone storm).
+        if !self.columns.borrow().contains_key(&idx) {
+            let cells = self.table.getcol(idx, 0, self.table.nrows())?;
+            let vals: Vec<TqValue> = cells.iter().map(cell_value).collect();
+            self.columns.borrow_mut().insert(idx, vals);
         }
-        let cells = self.table.getcol(idx, 0, self.table.nrows())?;
-        let vals: Vec<TqValue> = cells.iter().map(cell_value).collect();
-        self.columns.borrow_mut().insert(idx, vals.clone());
-        Ok(vals)
+        Ok(std::cell::Ref::map(self.columns.borrow(), |m| &m[&idx]))
     }
 
     fn column_value(&self, name: &str, row: i64) -> TResult<TqValue> {

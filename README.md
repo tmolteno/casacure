@@ -200,9 +200,12 @@ compiles for any Rust target; there is no unsafe system linkage.
 **Python bindings (`casacure` wheel).** Built from `crates/casacure-python`,
 which links the two standard Rust↔Python bridge crates — `pyo3` (CPython
 binding, 0.27) and `numpy` (0.27) — against the core crate. The *installed*
-Python package has **zero runtime dependencies** (`dependencies = []` in
-`pyproject.toml`): it is a self-contained extension module importable on its
-own.
+Python package has exactly one runtime dependency — `numpy` — declared in
+`pyproject.toml` (`dependencies = ["numpy"]`): `getcol`/`putcol`/`getvarcol`
+return and accept the same numpy-typed values as python-casacore (which also
+hard-depends on numpy), so `pip install casacure` pulls it automatically and
+the `casacure-test` / `casacure-bench` console scripts run out of the box.
+Everything else — including the C++ casacore library — is absent.
 
 **Explicitly not needed — the point of the project:**
 

@@ -118,6 +118,27 @@ forward.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`numpy` is now a declared runtime dependency** (`dependencies = ["numpy"]`
+  in `pyproject.toml`). The `getcol`/`putcol`/`getvarcol` surface returns and
+  accepts the same numpy-typed values as python-casacore (which also
+  hard-depends on numpy), and the `casacure-test` / `casacure-bench` scripts
+  build numpy vectors — but the package shipped with `dependencies = []`, so
+  a bare `pip install casacure` gave a package that panicked
+  (`PanicException`) on the first `getcol`, and `casacure-test` crashed with
+  `ModuleNotFoundError`, whenever numpy was not already installed. numpy is
+  now pulled automatically; the C++ casacore library remains absent.
+- **TaQL WHERE / GROUPBY evaluation is no longer O(n²)**: `EvalCtx::column`
+  cached a column as a `Vec<TqValue>` but returned a *full clone of the whole
+  column* on every cache hit, so a `WHERE` that read one column once per row
+  cloned the entire column per row. A `WHERE` scan over 20 000 rows that
+  read one column was a ~400M-element clone storm: `SELECT * WHERE TIME > …` measured 8.6 s, now
+  ~50 ms (~170×); with ORDERBY 13.8 s → ~56 ms (~245×); GROUPBY+`g*`
+  aggregates share the same accessor. `column()` now returns a `Ref` into the
+  cached column and the column is materialised once (the previous insert
+  cloned it a second time).
+
 ### Added
 
 - **`casacure-test` and `casacure-bench` console scripts** (wheel entry

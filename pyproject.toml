@@ -40,7 +40,7 @@ classifiers = [
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Astronomy",
 ]
-dependencies = []
+dependencies = ["numpy"]
 dynamic = ["version"]
 
 [project.scripts]
