@@ -68,9 +68,19 @@ Which packages that depend on casacore can run on casacure.
 - **`images`**: casacore's CASA-image / FITS-image module. Not implemented —
   DDFacet's image I/O is astropy-backed (`fits.PrimaryHDU`/`writeto`), so no
   consumer here needs it.
-- **`measures` / `quanta`**: astronomical measure/quantity conversion,
-  used only in DDFacet's montblanc / utility paths (`GiveDate`, `ModRotate`).
-  Tracked in `TODO.md` as optional future work.
+- **`quanta` (the quantity/unit core)**: **shipped** — `casacure.quanta` is a
+  drop-in for `casacore.quanta` (`Quantity`, unit parsing/conversion, SI
+  canonical form, arithmetic, `near`/`nearabs`, the physical-constant and
+  unit/prefix tables, and the MJD/time/angle value classes). Verified
+  byte-for-byte against python-casacore 3.8.1 (see `tests/test_quanta.py`).
+  This covers the `pyrap.quanta` uses the surveys found (jiveplot unit
+  conversions, CubiCal's degridder machines, DDFacet `GiveDate`).
+- **`measures` (the M* transforms)**: astronomical measure conversion
+  (`direction`/`epoch`/`uvw`/`doppler` and the parallactic-angle machinery,
+  which needs the ephemeris-backed `measures` engine). Not implemented —
+  used only in DDFacet's montblanc / utility paths (`GiveDate`, `ModRotate`,
+  CubiCal's parallactic_machine); tracked in `TODO.md` as optional future
+  work.
 - **`msfits` / `lofar`-style helpers** and other casacore subsystems: not
   implemented.
 

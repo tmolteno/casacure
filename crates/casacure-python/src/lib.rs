@@ -4,6 +4,7 @@
 
 mod convert;
 mod helpers;
+mod quanta;
 mod selftest;
 mod table;
 
@@ -182,6 +183,7 @@ fn casacure(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(selftest::run_tests, m)?)?;
     m.add_function(wrap_pyfunction!(selftest::run_benchmark, m)?)?;
     tables_submodule(m)?;
+    quanta::quanta_submodule(m)?;
     Ok(())
 }
 

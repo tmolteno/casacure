@@ -311,6 +311,25 @@ forward.
   table-reference parser (`#test_taql_*` / `#test_table_taql_*` regression
   suite in `tests/test_casacore_helpers.py` pins all of the above).
 
+### Added
+
+- **`casacure.quanta` — the casacore units/quantity subsystem ported**:
+  `Quantity` (value + unit), the `Unit` parser (SI base dimensions, the
+  radio-astronomy unit set — Jy/deg/arcsec/pc/Hz and friends — SI prefixes,
+  product/quotient/exponent unit strings), SI conversion and the canonical
+  form, the arithmetic operators (`+ - * / pow root sqrt` with casacore's
+  display strings `"1500 km.m"`/`"0.006 km/(m)"`/`"9 (km)2"`), `get_value`
+  conversion, in-place `convert`, `to_unix_time`, `near`/`nearabs`,
+  `constants`/`units`/`prefixes` metadata tables, and the time/angle value
+  classes (MJD ↔ Gregorian calendar, `HH:MM:SS` and `+DDD.MM.SS`
+  sexagesimal display). The `%g` number formatter and str/repr split match
+  python-casacore exactly; the whole surface is **verified byte-for-byte
+  against real `casacore.quanta` 3.8.1** (live parity test in
+  `tests/test_quanta.py`, 11 tests). The calendar/sexagesimal primitives
+  were extracted from the TaQL date/`hms`* functions into
+  `crates/casacure/src/quanta.rs` (shared, not duplicated); the full
+  `casacore.measures` M* transforms remain out of scope.
+
 ## [0.2.0] - 2026-09-19
 
 ### Changed

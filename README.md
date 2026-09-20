@@ -116,6 +116,26 @@ Also available: `taql` `CREATE TABLE`, `getcell`/`putcell`, `getvarcol`/
 `addcols`, `addrows`, `required_ms_desc`/`complete_ms_desc`,
 `default_ms_subtable`, `tablefromascii`.
 
+### Units and quantities
+
+`casacure.quanta` mirrors `casacore.quanta` — the unit system and `Quantity`
+(a value with a unit), with SI conversion, arithmetic, the time/angle value
+classes, and the physical-constant / unit / prefix tables:
+
+```python
+import casacure.quanta as qa        # drop-in for `import casacore.quanta`
+
+q = qa.quantity(1.5, "Jy")          # Quantity
+q.get_value("mJy")                  # 1500.0
+q.canonical()                       # '1.5e-26 kg.s-2'
+qa.quantity(3, "km") + qa.quantity(500, "m")   # 3.5 km
+qa.quantity(45, "deg").formatted()  # '+045.00.00'
+qa.quantity(51544, "d").to_unix_time()  # 946684800.0 (2000-01-01T00:00Z)
+```
+
+The full `casacore.measures` engine (direction/epoch/uvw transforms, backed
+by the casacore ephemeris data) is not implemented.
+
 ### Driving dask-ms on casacure
 
 dask-ms imports `casacore.tables`; point it at casacure in one of two ways:

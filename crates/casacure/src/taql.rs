@@ -3067,76 +3067,9 @@ const MONTH_ABBREV: [&str; 12] = [
 ];
 const DAY_ABBREV: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
-fn mjd_floor(mjd: f64) -> i64 {
-    mjd.floor() as i64
-}
-
-/// casacore `MVTime::ymd` (Gregorian calendar): (year, month, day) of an
-/// MJD (days since 1858-11-17). Verbatim translation of `MVTime.cc`.
-fn mjd_ymd(mjd: f64) -> (i64, i64, i64) {
-    let z = mjd_floor(mjd) + 2_400_001;
-    let mut dd = z;
-    if z >= 2_299_161 {
-        let al = (((z as f64 - 1_867_216.25) / 36_524.25).floor()) as i64;
-        dd = z + 1 + al - al / 4;
-    }
-    dd += 1524;
-    let yyyy = ((dd as f64 - 122.1) / 365.25).floor() as i64;
-    let d0 = (365.25 * yyyy as f64).floor() as i64;
-    let tmp = ((dd as f64 - d0 as f64) / 30.6001).floor() as i64;
-    let day = dd - d0 - (30.6001 * tmp as f64).floor() as i64;
-    let mm = if tmp < 14 { tmp - 1 } else { tmp - 13 };
-    let yyyy = if mm > 2 { yyyy - 4715 - 1 } else { yyyy - 4715 };
-    (yyyy, mm, day)
-}
-
-/// casacore `MVTime::weekday`: 1=Monday .. 7=Sunday.
-fn mjd_weekday(mjd: f64) -> i64 {
-    (((mjd_floor(mjd) + 2) % 7 + 7) % 7) + 1
-}
-
-/// casacore `MVTime::yearday` (1..366).
-fn mjd_yearday(mjd: f64) -> i64 {
-    let (y, m, d) = mjd_ymd(mjd);
-    let c = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
-        (m + 9) / 12
-    } else {
-        2 * ((m + 9) / 12)
-    };
-    (275 * m) / 9 - c + d - 30
-}
-
-/// casacore `MVTime::yearweek` (ISO-style week of year; can be 0).
-fn mjd_yearweek(mjd: f64) -> i64 {
-    let mut yd = mjd_yearday(mjd) - 4;
-    let yw = (yd + 7) / 7;
-    yd %= 7;
-    if yd >= 0 {
-        if yd >= mjd_weekday(mjd) {
-            yw + 1
-        } else {
-            yw
-        }
-    } else if yd + 7 >= mjd_weekday(mjd) {
-        yw + 1
-    } else {
-        yw
-    }
-}
-
-/// Days since 1970-01-01 of a (proleptic Gregorian) calendar date.
-fn civil_days(year: i64, month: i64, day: i64) -> i64 {
-    let mut y = year;
-    if month <= 2 {
-        y -= 1;
-    }
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
+// Calendar / sexagesimal primitives live in `crate::quanta` (shared with
+// the `casacure.quanta` surface).
+use crate::quanta::{civil_days, mjd_hms, mjd_weekday, mjd_yearweek, mjd_ymd, sexa_str};
 
 /// Parse an ISO `"YYYY-MM-DD[ HH:MM:SS[.fff]]"` (or `"/"` separators) string
 /// to an MJD.
@@ -3195,15 +3128,6 @@ fn date_arg(v: &TqValue) -> TResult<f64> {
     }
 }
 
-/// (hours, minutes, seconds) of the fractional day.
-fn mjd_hms(mjd: f64) -> (i64, i64, f64) {
-    let total = mjd.fract().rem_euclid(1.0) * 86_400.0;
-    let h = total.div_euclid(3600.0) as i64;
-    let mi = ((total - h as f64 * 3600.0) / 60.0).floor() as i64;
-    let sec = total - h as f64 * 3600.0 - mi as f64 * 60.0;
-    (h, mi, sec)
-}
-
 /// `hms(radians)`: time-of-day angle as `HHhMMmSS.sss` (casacore stringHMS).
 fn hms_str(rad: f64) -> String {
     let hours = (rad / std::f64::consts::TAU - (rad / std::f64::consts::TAU).floor()) * 24.0;
@@ -3214,18 +3138,6 @@ fn hms_str(rad: f64) -> String {
 fn dms_str(rad: f64) -> String {
     let deg = rad * 180.0 / std::f64::consts::PI;
     sexa_str(deg.abs(), "d", "m", 3, 2, true, deg < 0.0)
-}
-
-fn sexa_str(v: f64, s1: &str, s2: &str, w1: usize, w2: usize, signed: bool, neg: bool) -> String {
-    let d = v.floor() as i64;
-    let m = ((v - d as f64) * 60.0).floor() as i64;
-    let sec = (v - d as f64) * 3600.0 - m as f64 * 60.0;
-    if signed {
-        let sign = if neg { "-" } else { "+" };
-        format!("{sign}{d:0w1$}{s1}{m:0w2$}{s2}{sec:06.3}")
-    } else {
-        format!("{d:0w1$}{s1}{m:0w2$}{s2}{sec:06.3}")
-    }
 }
 
 /// The `running*`/`boxed*` cumulative statistic families: the stem aggregate
