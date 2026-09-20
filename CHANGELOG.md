@@ -7,12 +7,16 @@ subtasks are moved here.
 
 ### Versioning policy (from 0.2.x)
 
-casacure now versions against the casacore / python-casacore interface it
-mirrors: the casacure release number is the casacore version whose table
-surface it implements (3.8.1 == the casacore 3.8.x / python-casacore 3.8.1
-interface). `casacure.__version__` therefore reports the same value
-python-casacore would, so version-gated consumers behave identically.
-PEP 440 floors like `casacure>=0.2.3` keep resolving (3.8.1 > 0.2.3).
+casacure versions against the casacore / python-casacore interface it mirrors.
+The release number is **`<casacore-major>.<casacore-minor>.<casacore-patch>.<n>`**
+(e.g. **3.8.1.1**): the first three numbers are the casacore version whose
+table surface it implements (3.8.1 == the casacore 3.8.x / python-casacore
+3.8.1 interface), and the fourth counts casacure **fix / feature releases**
+on top of that interface (3.8.1.1, 3.8.1.2, …). `casacure.__version__`
+reports the full wheel number. The crates.io `casacure` crate stays the
+three-part semver `3.8.1` — Cargo forbids four-part versions — so the
+fourth number is a Python-wheel / release-cadence marker only.
+PEP 440 floors like `casacure>=0.2.3` keep resolving (3.8.1.1 > 0.2.3).
 
 All history from the 0.2.2 / 0.2.3 releases (helper surface, Path support,
 array-column dtype fidelity, `getsubtables`/`copy`/`removecols`,
@@ -116,7 +120,7 @@ forward.
   run outside pytest), and the scalar-column dtype-coercion fix they surfaced
   (see the Unreleased section).
 
-## [Unreleased]
+## [3.8.1.1] - 2026-09-20
 
 ### Fixed
 
@@ -158,8 +162,6 @@ forward.
   non-column-dtype) numpy arrays into *scalar* columns silently wrote zeros —
   dtype coercion now applies to scalar columns too (it already covered array
   columns). Verified int32/int64/int16 all round-trip.
-
-## [Unreleased]
 
 ### Added
 
@@ -308,8 +310,6 @@ forward.
   unquoted (relative or absolute) paths — by routing through the shared
   table-reference parser (`#test_taql_*` / `#test_table_taql_*` regression
   suite in `tests/test_casacore_helpers.py` pins all of the above).
-
-## [Unreleased]
 
 ## [0.2.0] - 2026-09-19
 

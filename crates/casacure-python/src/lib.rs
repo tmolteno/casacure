@@ -172,7 +172,11 @@ fn tables_submodule(parent: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[pymodule]
 fn casacure(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    // Keep in sync with `[project] version` in pyproject.toml (the wheel
+    // version is 3.8.1.<n>; Cargo's crate version is semver 3.8.1 and cannot
+    // carry a fourth part).
+    const PACKAGE_VERSION: &str = "3.8.1.1";
+    m.add("__version__", PACKAGE_VERSION)?;
     m.add_function(wrap_pyfunction!(numpy_dtype, m)?)?;
     m.add_function(wrap_pyfunction!(casa_type, m)?)?;
     m.add_function(wrap_pyfunction!(selftest::run_tests, m)?)?;
