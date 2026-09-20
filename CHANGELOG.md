@@ -5,18 +5,26 @@ subtasks are moved here.
 
 ## [3.8.1] - 2026-09-19
 
-### Versioning policy (from 0.2.x)
+### Versioning policy (from 3.8.2)
 
 casacure versions against the casacore / python-casacore interface it mirrors.
-The release number is **`<casacore-major>.<casacore-minor>.<casacore-patch>.<n>`**
-(e.g. **3.8.1.1**): the first three numbers are the casacore version whose
-table surface it implements (3.8.1 == the casacore 3.8.x / python-casacore
-3.8.1 interface), and the fourth counts casacure **fix / feature releases**
-on top of that interface (3.8.1.1, 3.8.1.2, …). `casacure.__version__`
-reports the full wheel number. The crates.io `casacure` crate stays the
-three-part semver `3.8.1` — Cargo forbids four-part versions — so the
-fourth number is a Python-wheel / release-cadence marker only.
-PEP 440 floors like `casacure>=0.2.3` keep resolving (3.8.1.1 > 0.2.3).
+The release number is **`<casacore-major>.<casacore-minor>.<casacure-patch>`**
+(e.g. **3.8.2**): the first two digits are the casacore *interface* level
+casacure implements (3.8 == the casacore 3.8.x / python-casacore 3.8.x table
+surface), and the last digit is casacure's own patch counter — incremented by
+one on every casacure fix / feature release and reset to 1 when the mirrored
+interface moves (3.8 → 3.9 …). `casacure.__version__` reports the same
+number. The crates.io `casacure` crate and the PyPI wheel share this one
+three-part version, so every release publishes both together
+(semver-valid `A.B.P` for Cargo and pip).
+
+**Transition.** The four-part `3.8.1.<n>` scheme (first three digits ==
+casacore's own number, fourth == casacure counter, crate pinned at `3.8.1`)
+is retired after the `3.8.1.1` release. The casacure patch counter continues
+into the last digit: the next release is **3.8.2**, then 3.8.3, …
+(`3.8.2 > 3.8.1.1` under PEP 440, and it does not collide with the published
+`3.8.1`). Historical changelog entries keep their real, published numbers.
+PEP 440 floors like `casacure>=0.2.3` keep resolving (3.8.2 > 0.2.3).
 
 All history from the 0.2.2 / 0.2.3 releases (helper surface, Path support,
 array-column dtype fidelity, `getsubtables`/`copy`/`removecols`,

@@ -8,8 +8,8 @@ the same machine and in the same process.
 
 | | |
 |---|---|
-| casacure wheel | **3.8.1.1** (pyproject) / crate `casacure` `3.8.1` |
-| source | `9cce6cc` (hot-path borrows) + deferred-flush write buffering + `casacure-bench` close-before-delete fix |
+| casacure wheel / crate | **3.8.2** (A.B.P policy: 3.8 = casacore interface, P = casacure patch) |
+| source | `9cce6cc` (hot-path borrows) + deferred-flush write buffering + `casacure-bench` close-before-delete fix — the code measured here was released as 3.8.1.1 and renumbered 3.8.2 |
 | build profile | **release** (`maturin develop --release`) |
 | Python | 3.14.7 (CPython) |
 | numpy | 2.4.6 |

@@ -201,15 +201,16 @@ pip install .                # maturin builds the cdylib for your interpreter
 ```
 
 The Rust core is published to crates.io as the `casacure` crate; add
-`casacure = "3"` to `Cargo.toml` (the crate tracks the casacore interface:
-3.x == casacore 3.x) if you want the table engine in Rust directly.
+`casacure = "3.8"` to `Cargo.toml` (the crate tracks the casacore interface:
+3.8 == casacore 3.8.x) if you want the table engine in Rust directly.
 
-**Python versions are `<casacore-major>.<casacore-minor>.<casacore-patch>.<n>`
-(e.g. `3.8.1.1`):** the first three numbers follow the casacore interface the
-package implements (3.8.1 == casacore 3.8.1), and the fourth counts casacure
-fix / feature releases on top of that interface. The crates.io crate stays a
-three-part semver `3.8.1` (Cargo forbids four-part versions); the wheel's
-`3.8.1.<n>` number is what pip and `casacure.__version__` report.
+**Versions are `<casacore-major>.<casacore-minor>.<casacure-patch>`
+(e.g. `3.8.2`):** the first two digits are the casacore *interface* level the
+package implements (3.8 == casacore 3.8.x), and the last digit is casacure's
+own patch counter — incremented on every fix/feature release and reset to 1
+when the mirrored interface moves (3.8 → 3.9 …). The crates.io `casacure`
+crate and the PyPI wheel share the same three-part version, so a release
+publishes both together. `casacure.__version__` reports the same number.
 
 `pip install casacure` on Python 3.9–3.14 installs a self-contained package —
 no `casacore` C++ library, no `wcs/measures` harness — which is the point: MS

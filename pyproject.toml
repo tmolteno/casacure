@@ -41,12 +41,13 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Astronomy",
 ]
 dependencies = ["numpy"]
-# Wheel version <major>.<minor>.<patch>.<n>: the first three numbers follow
-# the casacore interface version (3.8.1 == casacore 3.8.1); the fourth
-# counts casacure fix/feature releases on top of that interface.
-# Kept static because Cargo/semver forbids four-part versions: the crates.io
-# `casacure` crate stays `3.8.1` (see Cargo.toml [workspace.package]).
-version = "3.8.1.1"
+# Version A.B.P: A.B is the casacore interface version casacure mirrors
+# (currently 3.8, i.e. any casacore 3.8.x) and P is casacure's own patch
+# level (incremented on every fix/feature release, reset to 1 when the
+# interface changes). The crates.io crate and this wheel share the same
+# three-part A.B.P, so both are published together per release
+# (see Cargo.toml [workspace.package]).
+version = "3.8.2"
 
 [project.scripts]
 casacure-test = "casacure:run_tests"
