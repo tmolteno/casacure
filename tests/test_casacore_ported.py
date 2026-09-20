@@ -161,10 +161,8 @@ def test_check_putdata(tdir):
     t = table(pathlib.Path(tdir) / "tab1", maketabdesc(_base_descs()), ack=False)
     t.addrows(2)
     assert t.nrows() == 2
-    # casacure deliberately raises on unset cells (python-casacore reads the
-    # type default 0 here); the put/get roundtrips are the portable part.
-    with pytest.raises(ValueError):
-        t.getcol("coli")
+    # Unset cells read back as the column default (python-casacore parity).
+    np.testing.assert_array_equal(t.getcol("coli"), np.array([0, 0]))
     t.putcol("coli", (1, 2))
     np.testing.assert_array_equal(t.getcol("coli"), np.array([1, 2]))
     t.putcol("cold", t.getcol("coli") + 3)

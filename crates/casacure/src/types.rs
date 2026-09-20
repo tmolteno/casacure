@@ -23,6 +23,10 @@ pub enum ValueType {
     Int,
     /// `UINT` / `UINTEGER` — numpy `uint32`
     UInt,
+    /// `INT64` — numpy `int64` (unadvertised in python-casacore's
+    /// `makescacoldesc` docs, but a real casacore type that the storage
+    /// managers round-trip)
+    Int64,
     /// `FLOAT` — numpy `float32`
     Float,
     /// `DOUBLE` — numpy `float64`
@@ -44,13 +48,14 @@ pub struct UnknownValueType(pub String);
 
 impl ValueType {
     /// All value types, in declaration order.
-    pub const ALL: [ValueType; 12] = [
+    pub const ALL: [ValueType; 13] = [
         ValueType::Bool,
         ValueType::Byte,
         ValueType::Short,
         ValueType::UShort,
         ValueType::Int,
         ValueType::UInt,
+        ValueType::Int64,
         ValueType::Float,
         ValueType::Double,
         ValueType::Complex,
@@ -68,6 +73,7 @@ impl ValueType {
             ValueType::UShort => "USHORT",
             ValueType::Int => "INT",
             ValueType::UInt => "UINT",
+            ValueType::Int64 => "INT64",
             ValueType::Float => "FLOAT",
             ValueType::Double => "DOUBLE",
             ValueType::Complex => "COMPLEX",
@@ -88,6 +94,7 @@ impl ValueType {
             ValueType::UShort => "uShort",
             ValueType::Int => "Int",
             ValueType::UInt => "uInt",
+            ValueType::Int64 => "Int64",
             ValueType::Float => "float",
             ValueType::Double => "double",
             ValueType::Complex => "Complex",
@@ -107,6 +114,7 @@ impl ValueType {
             "USHORT" | "USMALLINT" => ValueType::UShort,
             "INT" | "INTEGER" => ValueType::Int,
             "UINT" | "UINTEGER" => ValueType::UInt,
+            "INT64" => ValueType::Int64,
             "FLOAT" => ValueType::Float,
             "DOUBLE" => ValueType::Double,
             "FCOMPLEX" | "COMPLEX" => ValueType::Complex,
@@ -126,6 +134,7 @@ impl ValueType {
             ValueType::UShort => "uint16",
             ValueType::Int => "int32",
             ValueType::UInt => "uint32",
+            ValueType::Int64 => "int64",
             ValueType::Float => "float32",
             ValueType::Double => "float64",
             ValueType::Complex => "complex64",
@@ -144,6 +153,7 @@ impl ValueType {
             ValueType::UShort => Some(2),
             ValueType::Int => Some(4),
             ValueType::UInt => Some(4),
+            ValueType::Int64 => Some(8),
             ValueType::Float => Some(4),
             ValueType::Double => Some(8),
             ValueType::Complex => Some(8),

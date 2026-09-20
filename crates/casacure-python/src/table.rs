@@ -202,6 +202,75 @@ fn cell_shape_of(cells: &[RecordValue]) -> Vec<usize> {
         .unwrap_or_default()
 }
 
+/// A short human name for a `RecordValue` variant (for error messages).
+fn value_name(v: &RecordValue) -> &'static str {
+    match v {
+        RecordValue::Bool(_) => "boolean",
+        RecordValue::UChar(_) => "uchar",
+        RecordValue::Short(_) => "short",
+        RecordValue::UShort(_) => "ushort",
+        RecordValue::Int(_) => "int",
+        RecordValue::UInt(_) => "uint",
+        RecordValue::Int64(_) => "int64",
+        RecordValue::Float(_) => "float",
+        RecordValue::Double(_) => "double",
+        RecordValue::Complex(_, _) => "complex",
+        RecordValue::DComplex(_, _) => "dcomplex",
+        RecordValue::String(_) | RecordValue::Table(_) => "string",
+        RecordValue::Record(_) => "record",
+        RecordValue::Array(_) => "array",
+    }
+}
+
+/// Whether an `ArrayData` buffer matches a column's element type exactly.
+fn array_data_matches(dt: DataType, d: &ArrayData) -> bool {
+    use ArrayData as A;
+    matches!(
+        (dt, d),
+        (DataType::Bool, A::Bool(_))
+            | (DataType::UChar, A::UChar(_))
+            | (DataType::Short, A::Short(_))
+            | (DataType::UShort, A::UShort(_))
+            | (DataType::Int, A::Int(_))
+            | (DataType::UInt, A::UInt(_))
+            | (DataType::Int64, A::Int64(_))
+            | (DataType::Float, A::Float(_))
+            | (DataType::Double, A::Double(_))
+            | (DataType::Complex, A::Complex(_))
+            | (DataType::DComplex, A::DComplex(_))
+            | (DataType::String, A::String(_))
+    )
+}
+
+/// Whether a `RecordValue` may be stored in `col`: the element type must
+/// match exactly (the putcol coercion already produced the column's type),
+/// and array columns must hold `Array` cells.
+fn record_fits_column(col: &core::tabledesc::ColumnDesc, v: &RecordValue) -> bool {
+    let scalar_ok = matches!(
+        (col.data_type, v),
+        (DataType::Bool, RecordValue::Bool(_))
+            | (DataType::UChar, RecordValue::UChar(_))
+            | (DataType::Short, RecordValue::Short(_))
+            | (DataType::UShort, RecordValue::UShort(_))
+            | (DataType::Int, RecordValue::Int(_))
+            | (DataType::UInt, RecordValue::UInt(_))
+            | (DataType::Int64, RecordValue::Int64(_))
+            | (DataType::Float, RecordValue::Float(_))
+            | (DataType::Double, RecordValue::Double(_))
+            | (DataType::Complex, RecordValue::Complex(_, _))
+            | (DataType::DComplex, RecordValue::DComplex(_, _))
+            | (DataType::String, RecordValue::String(_))
+    );
+    match &col.kind {
+        core::tabledesc::ColumnKind::Array => match v {
+            RecordValue::Array(a) => array_data_matches(col.data_type, &a.data),
+            _ => false,
+        },
+        core::tabledesc::ColumnKind::Record => matches!(v, RecordValue::Record(_)),
+        _ => scalar_ok,
+    }
+}
+
 impl Table {
     /// Open or create a table; `desc_json` is the python-casacore table-desc
     /// dict (creates when given) and `nrow` its initial row count.
@@ -1517,6 +1586,37 @@ impl Table {
         match &mut *inner {
             Inner::Write { shared, .. } => {
                 let mut s = shared.lock().unwrap();
+                // Validate before writing: the putcol coercion has already
+                // produced the column's exact type, so a mismatch here is an
+                // incompatible write (e.g. a string into a double column)
+                // that casacore rejects rather than silently storing — and a
+                // fixed-shape array column must receive exactly its declared
+                // cell shape. The desc is borrowed inside the shared lock (no
+                // per-cell clone on the hot putcol path).
+                if let Some(col) = s.wt.desc().columns.get(col_idx) {
+                    if !record_fits_column(col, &value) {
+                        return Err(PyTypeError::new_err(format!(
+                            "putcol/putcell: {} cannot be stored in column {} (valueType {})",
+                            value_name(&value),
+                            col.name,
+                            ::casacure::casa_value_type(col.data_type)
+                        )));
+                    }
+                    if let Some(fixed) = &col.shape {
+                        if !fixed.is_empty() {
+                            if let RecordValue::Array(a) = &value {
+                                let logical: Vec<u32> =
+                                    fixed.iter().rev().map(|&d| d.max(0) as u32).collect();
+                                if a.shape != logical {
+                                    return Err(PyValueError::new_err(format!(
+                                        "putcol: cell shape {:?} does not match column {} fixed shape {:?}",
+                                        a.shape, col.name, logical
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
                 s.wt.putcell(col_idx, row, value).map_err(err)?;
                 s.dirty = true;
                 Ok(())
@@ -1791,6 +1891,8 @@ impl Table {
         scalar_num!(f32, |e: &f32| RecordValue::Float(*e));
         scalar_num!(i64, |e: &i64| RecordValue::Int64(*e));
         scalar_num!(i32, |e: &i32| RecordValue::Int(*e));
+        scalar_num!(i16, |e: &i16| RecordValue::Short(*e));
+        scalar_num!(u32, |e: &u32| RecordValue::UInt(*e));
         scalar_num!(u8, |e: &u8| RecordValue::UChar(*e));
         scalar_num!(u16, |e: &u16| RecordValue::UShort(*e));
         scalar_num!(bool, |e: &bool| RecordValue::Bool(*e));

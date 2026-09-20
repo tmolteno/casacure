@@ -3,6 +3,41 @@
 All notable changes to this project are documented here. Completed `TODO.md`
 subtasks are moved here.
 
+## [3.8.3] - unreleased
+
+### Fixed (found by the extensive core-tables test suite)
+
+- **Int64 (`int64`) scalar columns can now be created.** The Python
+  column-desc parser's `ValueType` table had no `Int64` entry, so a
+  `valueType: 'int64'` desc was rejected (`bad valueType int64`) and int64
+  columns were impossible through the `casacore.tables` surface even though
+  the storage engine round-tripped them. `ValueType::Int64` is wired through
+  case-insensitive `INT64` parsing, the table.dat name, the numpy/int64
+  mapping, and the desc→`DataType` conversion; extreme ±2⁶³ values round-trip
+  and persist across reopen.
+- **`putcol` of `short`/`uint` numpy arrays silently wrote only the first
+  row.** The scalar-coercion path was missing the `int16` and `uint32` arms,
+  so those arrays fell through to a one-value fallback and rows 1+ stayed
+  unset. The missing coercion arms are added (`int16`→short, `uint32`→uint).
+- **`putcol` accepted wrong-typed and wrong-shaped writes.** A string (or
+  other incompatible value) written into a double column was stored verbatim,
+  and a fixed-shape array column accepted cells whose shape didn't match its
+  declared shape — both silently corrupting column contents. `putcell` now
+  validates the value's type against the column's element type and a
+  fixed-shape array column against its declared cell shape before storing,
+  raising `TypeError`/`ValueError` like python-casacore.
+- **Unset cells now read as the column default.** New rows are given their
+  column's default (casacore behaviour) instead of `None`, so a `putcol`
+  shorter than the row count fills the given rows and the remainder read
+  back as the default rather than erroring ("has not been set").
+- **New coverage:** 4 core table unit tests (full dtype/boundary matrix with
+  bit-exact NaN/−0.0/±inf and ±2⁶³, string length boundaries incl. UTF-8,
+  empty/single-row tables, flush-then-reopen persistence) and a new
+  `tests/test_core_tables_e2e.py` (59 end-to-end tests: every dtype through
+  Standard/IncrementalStMan with reopen persistence, TiledColumnStMan and
+  fixed/variable-shape arrays, slices/varcol, string boundaries, table and
+  column keywords, table lifecycle, and the documented error paths).
+
 ## [3.8.1] - 2026-09-19
 
 ### Versioning policy (from 3.8.2)

@@ -163,6 +163,7 @@ pub(crate) fn column_from_desc_dict(
                 ValueType::UShort => DataType::UShort,
                 ValueType::Int => DataType::Int,
                 ValueType::UInt => DataType::UInt,
+                ValueType::Int64 => DataType::Int64,
                 ValueType::Float => DataType::Float,
                 ValueType::Double => DataType::Double,
                 ValueType::Complex => DataType::Complex,

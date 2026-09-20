@@ -80,6 +80,7 @@ fn expected_getcol_dtype(vt: ValueType) -> &'static str {
         ValueType::UShort => "<u2",
         ValueType::Int => "<i4",
         ValueType::UInt => "<u4",
+        ValueType::Int64 => "<i8",
         ValueType::Float => "<f4",
         ValueType::Double => "<f8",
         ValueType::Complex => "<c8",
