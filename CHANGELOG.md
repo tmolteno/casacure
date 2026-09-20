@@ -142,6 +142,24 @@ forward.
   aggregates share the same accessor. `column()` now returns a `Ref` into the
   cached column and the column is materialised once (the previous insert
   cloned it a second time).
+- **`casacure-bench` no longer aborts when real python-casacore is installed
+  alongside**: the casacore comparison leg deleted its table directory while
+  the table object was still open. On drop, python-casacore's `PlainTable`
+  destructor releases the table lock, whose callback re-opens
+  `table.dat_tmp`; with the directory gone that threw `AipsError` from a
+  destructor → `std::terminate` (SIGABRT). Each leg now closes its table
+  before removing the directory, so the benchmark runs to completion and
+  prints the casacure/casacore ratio instead of core-dumping.
+- **Write ops are buffered instead of rewriting the whole table per call**:
+  `putcol`, `putcell`, `putvarcol`, `putcolslice`, `addrows`, `removecols`
+  and the keyword setters now mark the shared in-memory cell store dirty and
+  return; the physical rewrite (`table.dat` + every data file) happens only
+  when the on-disk state is actually needed — explicit `flush()`/`close()`/
+  context exit, a mutating taql statement, `query()`/`sort()`, or
+  `getdminfo()`. Matches python-casacore's buffered storage-manager
+  behaviour. Measured on the 20 000-row benchmark: `casacure-bench` putcol
+  4.33 → 1.65 ms (7.2× → 2.3× vs real casacore), ~145 → ~60 ns/cell in the
+  scaling micro-benchmark; repeated `flush()` on a clean store is a no-op.
 
 ### Added
 

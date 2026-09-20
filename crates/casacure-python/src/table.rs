@@ -25,7 +25,6 @@ enum Inner {
     /// table's directory.
     Write {
         shared: std::sync::Arc<std::sync::Mutex<WriteData>>,
-        dirty: bool,
     },
 }
 
@@ -35,6 +34,9 @@ enum Inner {
 struct WriteData {
     read: ::casacure::Table,
     wt: core::WritableTable,
+    /// Pending in-store writes not yet physically written to disk; write ops
+    /// set it, `flush()`/`close()`/mutating taql clear it.
+    dirty: bool,
 }
 
 /// Live writable backing per table directory (weak: closed tables may be
@@ -156,7 +158,24 @@ fn refresh_write(
     let mut s = shared.lock().unwrap();
     s.read = read;
     s.wt = wt;
+    s.dirty = false;
     true
+}
+
+/// Physically write a shared cell store to disk when it has pending
+/// (`dirty`) writes, and refresh its read snapshot from the freshly written
+/// files. Write ops buffer into the store and only mark it dirty; the actual
+/// table rewrite happens here (explicit `flush()`, on `close()`/context exit,
+/// or before a mutating taql statement reads the snapshot). A no-op when the
+/// store is clean, so repeated writes do not rewrite the whole table per call.
+fn flush_if_dirty(shared: &std::sync::Arc<std::sync::Mutex<WriteData>>) -> PyResult<()> {
+    let mut s = shared.lock().unwrap();
+    if s.dirty {
+        let dir = s.wt.flush().map_err(err)?;
+        s.read = ::casacure::Table::open(&dir, false).map_err(err)?;
+        s.dirty = false;
+    }
+    Ok(())
 }
 
 /// Read a sub-range of a column as `Vec<RecordValue>` (CASA order).
@@ -242,25 +261,38 @@ impl Table {
             }
             let _ = wt.flush().map_err(err)?;
             let read = ::casacure::Table::open(&dir, false).map_err(err)?;
-            let shared = std::sync::Arc::new(std::sync::Mutex::new(WriteData { read, wt }));
+            let shared = std::sync::Arc::new(std::sync::Mutex::new(WriteData {
+                read,
+                wt,
+                dirty: false,
+            }));
             register_write(&dir, &shared);
             return Ok(Table {
                 path: path.to_string(),
                 writable,
-                inner: Mutex::new(Inner::Write {
-                    shared,
-                    dirty: false,
-                }),
+                inner: Mutex::new(Inner::Write { shared }),
             });
         }
-        let read = ::casacure::Table::open(&dir, false).map_err(err)?;
         if !writable {
+            // A read-only open must see pending (unflushed) writes of any
+            // live writable backing for this directory: write ops are
+            // buffered, but a fresh handle (and python-casacore, whose SM
+            // writes are file-visible) reads the files. Flush a dirty
+            // backing before opening the files so this is not a stale
+            // snapshot.
+            if let Some(shared) = find_write(&dir) {
+                if shared.lock().unwrap().dirty {
+                    flush_if_dirty(&shared)?;
+                }
+            }
+            let read = ::casacure::Table::open(&dir, false).map_err(err)?;
             return Ok(Table {
                 path: path.to_string(),
                 writable: false,
                 inner: Mutex::new(Inner::Read(std::sync::Arc::new(read))),
             });
         }
+        let read = ::casacure::Table::open(&dir, false).map_err(err)?;
         // Reuse a live shared backing for this directory so concurrent
         // writable handles accumulate into one cell store (a second flush of
         // a stale snapshot must not clobber the first handle's writes).
@@ -268,10 +300,7 @@ impl Table {
             return Ok(Table {
                 path: path.to_string(),
                 writable: true,
-                inner: Mutex::new(Inner::Write {
-                    shared,
-                    dirty: false,
-                }),
+                inner: Mutex::new(Inner::Write { shared }),
             });
         }
         // Materialise the current cells into a writable backing.
@@ -286,15 +315,16 @@ impl Table {
                 wt.putcell(j, r as u64, v.clone()).map_err(err)?;
             }
         }
-        let shared = std::sync::Arc::new(std::sync::Mutex::new(WriteData { read, wt }));
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(WriteData {
+            read,
+            wt,
+            dirty: false,
+        }));
         register_write(&dir, &shared);
         Ok(Table {
             path: path.to_string(),
             writable: true,
-            inner: Mutex::new(Inner::Write {
-                shared,
-                dirty: false,
-            }),
+            inner: Mutex::new(Inner::Write { shared }),
         })
     }
 
@@ -310,6 +340,11 @@ impl Table {
     /// A fresh read-only core table for running TaQL against the current
     /// on-disk state.
     fn core_running(&self) -> PyResult<::casacure::Table> {
+        // The on-disk state must include this handle's pending (unflushed)
+        // writes; `query()`/`sort()`/`select_run()` run against the files.
+        if let Inner::Write { shared, .. } = &*self.inner.lock().unwrap() {
+            flush_if_dirty(shared)?;
+        }
         ::casacure::Table::open(self.dir_of(), false).map_err(err)
     }
 
@@ -529,6 +564,10 @@ impl Table {
                 core::get_dminfo(&dir, &t.dat).map_err(err)?
             }
             Inner::Write { shared, .. } => {
+                // Descriptors may carry unflushed structural changes
+                // (addcols/removecols/keywords), so persist before reading
+                // the on-disk metadata snapshot.
+                flush_if_dirty(shared)?;
                 let s = shared.lock().unwrap();
                 let dir = PathBuf::from(s.read.name());
                 core::get_dminfo(&dir, &s.read.dat).map_err(err)?
@@ -560,7 +599,7 @@ impl Table {
         {
             let mut inner = self.inner.lock().unwrap();
             match &mut *inner {
-                Inner::Write { shared, dirty, .. } => {
+                Inner::Write { shared, .. } => {
                     // Pull the desc's columns out (they live in a dict of
                     // {colname: coldesc}).
                     let json = {
@@ -573,12 +612,11 @@ impl Table {
                     for cd in parsed.columns {
                         s.wt.addcol(cd);
                     }
-                    *dirty = true;
+                    s.dirty = true;
                 }
                 _ => return Err(PyValueError::new_err("table is not writable")),
             }
         }
-        self.flush()?;
         Ok(())
     }
 
@@ -610,17 +648,16 @@ impl Table {
         {
             let mut inner = self.inner.lock().unwrap();
             match &mut *inner {
-                Inner::Write { shared, dirty, .. } => {
+                Inner::Write { shared, .. } => {
                     let mut s = shared.lock().unwrap();
                     for idx in indices.iter().rev() {
                         s.wt.removecol(*idx);
                     }
-                    *dirty = true;
+                    s.dirty = true;
                 }
                 _ => return Err(PyValueError::new_err("table is not writable")),
             }
         }
-        self.flush()?;
         Ok(())
     }
 
@@ -635,15 +672,14 @@ impl Table {
         {
             let mut inner = self.inner.lock().unwrap();
             match &mut *inner {
-                Inner::Write { shared, dirty, .. } => {
+                Inner::Write { shared, .. } => {
                     let mut s = shared.lock().unwrap();
                     s.wt.addrows(n);
-                    *dirty = true;
+                    s.dirty = true;
                 }
                 _ => return Err(PyValueError::new_err("table is not writable")),
             }
         }
-        self.flush()?;
         Ok(())
     }
 
@@ -660,11 +696,8 @@ impl Table {
 
     fn flush(&self) -> PyResult<()> {
         let mut inner = self.inner.lock().unwrap();
-        if let Inner::Write { shared, dirty } = &mut *inner {
-            let mut s = shared.lock().unwrap();
-            let dir = s.wt.flush().map_err(err)?;
-            s.read = ::casacure::Table::open(&dir, false).map_err(err)?;
-            *dirty = false;
+        if let Inner::Write { shared } = &mut *inner {
+            flush_if_dirty(shared)?;
         }
         Ok(())
     }
@@ -1029,7 +1062,6 @@ impl Table {
         let col_idx = self.col_index(column)?;
         let rec = keyword_value(py, value)?;
         self.put_cell(col_idx, row, rec)?;
-        self.flush()?;
         Ok(())
     }
 
@@ -1078,7 +1110,6 @@ impl Table {
                 });
                 self.put_cell(col_idx, startrow + r as u64, rec)?;
             }
-            self.flush()?;
             return Ok(());
         }
         // Dict form: `{"rN": value, ...}` — per-row scalar/array writes
@@ -1107,7 +1138,6 @@ impl Table {
                 self.put_cell(col_idx, row, rec)?;
                 let _ = i;
             }
-            self.flush()?;
             return Ok(());
         }
         let nrow = if nrow <= 0 {
@@ -1124,7 +1154,6 @@ impl Table {
         for (i, v) in values.into_iter().enumerate() {
             self.put_cell(col_idx, startrow + i as u64, v)?;
         }
-        self.flush()?;
         Ok(())
     }
 
@@ -1176,7 +1205,6 @@ impl Table {
             let rec = cells.pop().unwrap_or(RecordValue::Int(0));
             self.put_cell(col_idx, row, rec)?;
         }
-        self.flush()?;
         Ok(())
     }
 
@@ -1281,7 +1309,6 @@ impl Table {
             let stored = convert::cell_from_logical(grid, &cshape);
             self.put_cell(col_idx, row, stored)?;
         }
-        self.flush()?;
         Ok(())
     }
 
@@ -1291,15 +1318,14 @@ impl Table {
         {
             let mut inner = self.inner.lock().unwrap();
             match &mut *inner {
-                Inner::Write { shared, dirty, .. } => {
+                Inner::Write { shared, .. } => {
                     let mut s = shared.lock().unwrap();
                     s.wt.putkeyword(name, rec);
-                    *dirty = true;
+                    s.dirty = true;
                 }
                 _ => return Err(PyValueError::new_err("table is not writable")),
             }
         }
-        self.flush()?;
         Ok(())
     }
 
@@ -1317,15 +1343,14 @@ impl Table {
         {
             let mut inner = self.inner.lock().unwrap();
             match &mut *inner {
-                Inner::Write { shared, dirty, .. } => {
+                Inner::Write { shared, .. } => {
                     let mut s = shared.lock().unwrap();
                     s.wt.removekeyword(name);
-                    *dirty = true;
+                    s.dirty = true;
                 }
                 _ => return Err(PyValueError::new_err("table is not writable")),
             }
         }
-        self.flush()?;
         Ok(())
     }
 
@@ -1342,15 +1367,14 @@ impl Table {
         {
             let mut inner = self.inner.lock().unwrap();
             match &mut *inner {
-                Inner::Write { shared, dirty, .. } => {
+                Inner::Write { shared, .. } => {
                     let mut s = shared.lock().unwrap();
                     s.wt.putcolkeyword(col_idx, name, rec).map_err(err)?;
-                    *dirty = true;
+                    s.dirty = true;
                 }
                 _ => return Err(PyValueError::new_err("table is not writable")),
             }
         }
-        self.flush()?;
         Ok(())
     }
 
@@ -1374,15 +1398,14 @@ impl Table {
         {
             let mut inner = self.inner.lock().unwrap();
             match &mut *inner {
-                Inner::Write { shared, dirty, .. } => {
+                Inner::Write { shared, .. } => {
                     let mut s = shared.lock().unwrap();
                     s.wt.removecolkeyword(col_idx, name).map_err(err)?;
-                    *dirty = true;
+                    s.dirty = true;
                 }
                 _ => return Err(PyValueError::new_err("table is not writable")),
             }
         }
-        self.flush()?;
         Ok(())
     }
 
@@ -1492,10 +1515,10 @@ impl Table {
     fn put_cell(&self, col_idx: usize, row: u64, value: RecordValue) -> PyResult<()> {
         let mut inner = self.inner.lock().unwrap();
         match &mut *inner {
-            Inner::Write { shared, dirty, .. } => {
+            Inner::Write { shared, .. } => {
                 let mut s = shared.lock().unwrap();
                 s.wt.putcell(col_idx, row, value).map_err(err)?;
-                *dirty = true;
+                s.dirty = true;
                 Ok(())
             }
             _ => Err(PyValueError::new_err("table is not writable")),
@@ -1988,6 +2011,18 @@ pub fn taql(
     let shared_guards: Vec<Option<std::sync::MutexGuard<'_, WriteData>>>;
     let core_refs: Vec<&::casacure::Table>;
     if let Some(ts) = tables {
+        // Persist any pending (unflushed) writes so the core snapshots below
+        // (and any statement) run against the current cell state; write ops
+        // buffer into the shared store and only flush on request.
+        for item in ts.iter() {
+            let obj = item
+                .extract::<PyRef<'_, Table>>()
+                .map_err(|_| PyValueError::new_err("taql: expected table objects"))?;
+            let inner = obj.inner.lock().unwrap();
+            if let Inner::Write { shared, .. } = &*inner {
+                flush_if_dirty(shared)?;
+            }
+        }
         objects = ts
             .iter()
             .map(|item| {
@@ -2146,15 +2181,16 @@ fn taql_result_to_table(_py: Python<'_>, out: core::taql::TaqlTable) -> PyResult
     }
     let _ = wt.flush().map_err(err)?;
     let read = ::casacure::Table::open(&dir, false).map_err(err)?;
-    let shared = std::sync::Arc::new(std::sync::Mutex::new(WriteData { read, wt }));
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(WriteData {
+        read,
+        wt,
+        dirty: false,
+    }));
     register_write(&dir, &shared);
     Ok(Table {
         path: dir.display().to_string(),
         writable: true,
-        inner: Mutex::new(Inner::Write {
-            shared,
-            dirty: false,
-        }),
+        inner: Mutex::new(Inner::Write { shared }),
     })
 }
 

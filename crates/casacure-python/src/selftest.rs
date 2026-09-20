@@ -423,6 +423,11 @@ pub fn run_benchmark<'py>(py: Python<'py>) -> PyResult<()> {
         f(&t, &np, &ck, n)?;
         rows.push((name.to_string(), t0.elapsed().as_secs_f64() * 1e3, None));
     }
+    // Close the table before deleting its directory: a later drop of the
+    // object (here or real python-casacore) releases the table lock, whose
+    // callback re-touches table.dat_tmp; if the directory is already gone
+    // that throws from a destructor and aborts the process (SIGABRT).
+    t.call_method0("close")?;
     let _ = std::fs::remove_dir_all(&path);
 
     if distinct {
@@ -435,6 +440,7 @@ pub fn run_benchmark<'py>(py: Python<'py>) -> PyResult<()> {
                 e.2 = Some(t0.elapsed().as_secs_f64() * 1e3);
             }
         }
+        t.call_method0("close")?;
         let _ = std::fs::remove_dir_all(&path);
     }
 
