@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. Completed `TODO.md`
 subtasks are moved here.
 
-## [3.8.3] - unreleased
+## [3.8.3] - 2026-09-21
 
 ### Fixed (found by the extensive core-tables test suite)
 

@@ -176,7 +176,7 @@ fn casacure(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Keep in sync with `[project] version` in pyproject.toml; the crate and
     // the wheel share the same A.B.P version (casacore-interface + casacure
     // patch), so `casacure.__version__` matches Cargo's [workspace.package].
-    const PACKAGE_VERSION: &str = "3.8.2";
+    const PACKAGE_VERSION: &str = "3.8.3";
     m.add("__version__", PACKAGE_VERSION)?;
     m.add_function(wrap_pyfunction!(numpy_dtype, m)?)?;
     m.add_function(wrap_pyfunction!(casa_type, m)?)?;
