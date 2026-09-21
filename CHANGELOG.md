@@ -29,6 +29,12 @@ subtasks are moved here.
     casacore-written shape-stman tables, and casacore reads
     casacure-written ones bit-exactly (7x79x2 dcomplex round trip, plus
     the same via dask-ms `xds_from_ms` on a real MeerKAT MS).
+  - SSM Bool columns are bit-packed too (one bit per row; casacore's
+    FLAG_ROW on a real MS stores 429k rows in two 8 KiB buckets): the
+    reader addresses cells in bits, the writer packs Bool scalar columns
+    LSB-first, and the bucket layout keeps casacore's minimum bucket headroom
+    so the index chain always fits. FLAG_ROW reads identical to casacore
+    over 100k rows of the real MS.
   - Real-world details the fixtures had not covered: TSM Bool tiles are
     bit-packed (LSB-first, `Conversion::bitToBool`) — reads, writes and the
     reported bucket sizes follow that; a column whose storage-manager

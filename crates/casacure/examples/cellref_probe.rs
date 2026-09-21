@@ -18,12 +18,12 @@ fn main() {
         let offset = spec.column_offset[s_idx];
         let cell = file.cell_bytes(index_nr, offset, row, 12).unwrap();
         // 3 big-endian ints: bucket, offset, len
-        let b = i32::from_be_bytes(cell[0..4].try_into().unwrap());
-        let o = i32::from_be_bytes(cell[4..8].try_into().unwrap());
-        let l = i32::from_be_bytes(cell[8..12].try_into().unwrap());
+        let b = i32::from_be_bytes(cell.0[0..4].try_into().unwrap());
+        let o = i32::from_be_bytes(cell.0[4..8].try_into().unwrap());
+        let l = i32::from_be_bytes(cell.0[8..12].try_into().unwrap());
         println!(
             "S row {row} ref: bucket={b} offset={o} len={l} cell={:?}",
-            cell.iter()
+            cell.0.iter()
                 .map(|x| format!("{x:02x}"))
                 .collect::<Vec<_>>()
                 .join(" ")

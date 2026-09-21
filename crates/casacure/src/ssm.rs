@@ -232,7 +232,7 @@ impl StandardStManFile {
         column_offset: u32,
         row: u64,
         cell_size: u32,
-    ) -> Result<&[u8], SsmError> {
+    ) -> Result<(&[u8], usize), SsmError> {
         let index = self.indices.get(index_nr).ok_or(SsmError::IndexMissing {
             index: index_nr,
             count: self.indices.len(),
@@ -247,31 +247,42 @@ impl StandardStManFile {
         row: u64,
         cell_size: u32,
         bucket: IndexedBucket,
-    ) -> Result<&[u8], SsmError> {
-        let offset = u64::from(column_offset) + (row - bucket.start_row) * u64::from(cell_size);
+    ) -> Result<(&[u8], usize), SsmError> {
+        // Bool cells are one BIT per row (bit-packed, LSB-first within the
+        // column's bucket region, casacore `Conversion::bitToBool`); the
+        // returned slice carries the cell's bits starting at `skip`.
+        let is_bit_cell = cell_size == 0;
+        let cell_bits: u64 = if is_bit_cell { 1 } else { u64::from(cell_size) * 8 };
+        let bit_offset =
+            u64::from(column_offset) * 8 + (row - bucket.start_row) * cell_bits;
         let base =
             (DATA_START as u64) + u64::from(bucket.number) * u64::from(self.header.bucket_size);
-        let start = base + offset;
-        let len = u64::from(cell_size);
-        let start_us = usize::try_from(start).map_err(|_| SsmError::CellOutOfRange {
+        let byte_off = base + bit_offset / 8;
+        let skip = (bit_offset % 8) as usize;
+        let nbytes = if is_bit_cell {
+            (skip + 1).div_ceil(8)
+        } else {
+            cell_size as usize
+        };
+        let nbytes64 = nbytes as u64;
+        let start_us = usize::try_from(byte_off).map_err(|_| SsmError::CellOutOfRange {
             bucket: bucket.number,
-            offset,
-            len,
+            offset: bit_offset / 8,
+            len: nbytes64,
         })?;
         let end = start_us
-            .checked_add(len as usize)
+            .checked_add(nbytes)
             .ok_or(SsmError::CellOutOfRange {
                 bucket: bucket.number,
-                offset,
-                len,
+                offset: bit_offset / 8,
+                len: nbytes64,
             })?;
-        self.data
-            .get(start_us..end)
-            .ok_or(SsmError::CellOutOfRange {
-                bucket: bucket.number,
-                offset,
-                len,
-            })
+        let slice = self.data.get(start_us..end).ok_or(SsmError::CellOutOfRange {
+            bucket: bucket.number,
+            offset: bit_offset / 8,
+            len: nbytes64,
+        })?;
+        Ok((slice, skip))
     }
 
     /// Decode one scalar cell for `column` (table column index `col_idx`)
@@ -307,7 +318,12 @@ impl StandardStManFile {
                 index: col_idx,
                 count: spec.column_offset.len(),
             })?;
-        let cell = self.cell_bytes(index_nr, *column_offset, row, scalar_cell_size(desc))?;
+        let (cell, skip) = self.cell_bytes(index_nr, *column_offset, row, scalar_cell_size(desc))?;
+        if desc.data_type == DataType::Bool {
+            // One bit per row, LSB-first within the column's bit region.
+            let bit = (cell[0] >> skip) & 1 != 0;
+            return Ok(RecordValue::Bool(bit));
+        }
         if desc.data_type == DataType::String && desc.max_length <= 0 {
             // Variable-length string: the cell is a 3-Int reference; strings
             // longer than 8 chars live in the string buckets.
@@ -410,7 +426,8 @@ impl StandardStManFile {
                 index: col_idx,
                 count: spec.column_offset.len(),
             })?;
-        self.cell_bytes(index_nr, *column_offset, row, scalar_cell_size(desc))
+        let (cell, _) = self.cell_bytes(index_nr, *column_offset, row, scalar_cell_size(desc))?;
+        Ok(cell)
     }
 
     pub fn array_cell_region<'a>(
@@ -435,7 +452,7 @@ impl StandardStManFile {
                 index: col_idx,
                 count: spec.column_offset.len(),
             })?;
-        let cell = self.cell_bytes(index_nr, *column_offset, row, ARRAY_REF_SIZE)?;
+        let (cell, _) = self.cell_bytes(index_nr, *column_offset, row, ARRAY_REF_SIZE)?;
         let offset = if self.header.big_endian {
             i64::from_be_bytes(cell[0..8].try_into().unwrap())
         } else {
@@ -577,7 +594,7 @@ pub fn read_array_cell(
             count: spec.column_offset.len(),
         })?;
     // The reference cell is an Int64 in the data-file byte order.
-    let cell = file.cell_bytes(index_nr, *column_offset, row, ARRAY_REF_SIZE)?;
+    let (cell, _) = file.cell_bytes(index_nr, *column_offset, row, ARRAY_REF_SIZE)?;
     let offset = if file.header.big_endian {
         i64::from_be_bytes(cell[0..8].try_into().unwrap())
     } else {
@@ -594,7 +611,7 @@ pub fn read_array_cell(
     // a 12-byte (bucket, offset, len) reference to the bucket content
     // `[ndim][CASA dims][filled flag][len-prefixed strings]`.
     if desc.data_type == DataType::String {
-        let cell = file.cell_bytes(index_nr, *column_offset, row, 12)?;
+        let (cell, _) = file.cell_bytes(index_nr, *column_offset, row, 12)?;
         let (bucket, off, len) = if file.header.big_endian {
             (
                 i32::from_be_bytes(cell[0..4].try_into().unwrap()),
@@ -786,7 +803,7 @@ pub fn scalar_cell_size(desc: &ColumnDesc) -> u32 {
                 12
             }
         }
-        DataType::Bool => 1, // bit-packed per element; a scalar is one bit in a byte
+        DataType::Bool => 0, // one bit per row (bit-packed; 0 signals a bit cell)
         DataType::UChar | DataType::Char => 1,
         DataType::Short | DataType::UShort => 2,
         DataType::Int | DataType::UInt | DataType::Float => 4,
@@ -1036,9 +1053,14 @@ pub fn layout(rows_per_bucket: u32, cell_bits: &[u32]) -> StandardStManLayout {
         let region = (u64::from(rows_per_bucket) * u64::from(bits)).div_ceil(8);
         offset += region as u32;
     }
+    // casacore keeps buckets comfortably larger than the per-bucket tile
+    // (leftover space is the bucket's free space); the index chain also
+    // stores its payload in data-sized buckets minus an 8-byte link header,
+    // so keep a floor that leaves room for both.
+    let bucket_size = offset.max(64);
     StandardStManLayout {
         rows_per_bucket,
-        bucket_size: offset.max(1),
+        bucket_size,
         column_offset,
     }
 }
@@ -1170,8 +1192,19 @@ pub fn write_standard_stman_file(
         let end_row = (start_row + n_bucket_rows).min(n_rows);
         for (c, col) in cols.iter().enumerate() {
             let cell_size = col.cell_size as usize;
-            let region_start = (start_row * cell_size as u64) as usize;
-            let region_end = (end_row * cell_size as u64) as usize;
+            let (region_start, region_end) = if col.cell_bits > 0 && col.cell_bits < 8 {
+                // Bit-packed column: the packed stream is byte-addressed.
+                let bits = col.cell_bits as usize;
+                (
+                    start_row as usize * bits / 8,
+                    (end_row as usize * bits).div_ceil(8),
+                )
+            } else {
+                (
+                    (start_row * cell_size as u64) as usize,
+                    (end_row * cell_size as u64) as usize,
+                )
+            };
             if region_end > col.bytes.len() {
                 panic!(
                     "bucket column region {region_start}..{region_end} > col.bytes {} (cell_size {cell_size}, rows {n_rows}, this col {:?})",
@@ -1255,11 +1288,11 @@ pub fn encode_scalar_cell(
     let mut w = wr(big_endian);
     match desc.data_type {
         DataType::Bool => {
+            // One value bit per row; the bucket assembly collapses these
+            // per-row bytes into the bit-packed region (LSB-first).
             let b = matches!(value, RecordValue::Bool(true))
                 || matches!(value, RecordValue::UChar(u) if *u != 0);
-            let mut cell = vec![0u8; scalar_cell_size(desc) as usize];
-            cell[0] = b as u8 & 1;
-            Ok(cell)
+            Ok(vec![b as u8])
         }
         DataType::String if desc.max_length > 0 => {
             let maxlen = desc.max_length as usize;

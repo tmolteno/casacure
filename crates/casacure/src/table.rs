@@ -439,13 +439,14 @@ fn build_ssm_data(
         let (size, bits) = match cd.kind {
             crate::tabledesc::ColumnKind::Scalar(_) => {
                 let size = crate::ssm::scalar_cell_size(cd);
-                // One byte per row including Bool scalars: casacore's SSM
-                // stores scalar Bool cells as a byte (verified against a
-                // 100-row casacore table), unlike the bit-packed array
-                // index. The Bucket layout must reserve the same space the
-                // writer fills.
-                let bits = 8 * size;
-                (size, bits)
+                if cd.data_type == crate::record::DataType::Bool {
+                    // Bool scalars are one BIT per row (casacore
+                    // SSMColumn: externalSizeBits = nrElem); the column's
+                    // region is rows/8 bytes and cells are bit-packed.
+                    (1, 1)
+                } else {
+                    (size, 8 * size)
+                }
             }
             crate::tabledesc::ColumnKind::Array => {
                 if cd.data_type == crate::record::DataType::String {
@@ -607,12 +608,39 @@ fn build_ssm_data(
         encoded.push(bytes);
     }
 
+    // Bit-packed Bool scalar columns: their per-row encoded bytes carry one
+    // value bit each; collapse them into the LSB-first bitstream the bucket
+    // layout stores.
+    let cell_bits_per_col: Vec<u32> = dm_cols
+        .iter()
+        .enumerate()
+        .map(|(i, &col)| {
+            let cd = &desc.columns[col];
+            if cd.data_type == crate::record::DataType::Bool
+                && matches!(cd.kind, crate::tabledesc::ColumnKind::Scalar(_))
+            {
+                let bytes = &mut encoded[i];
+                let mut packed = vec![0u8; bytes.len().div_ceil(8)];
+                for (r, b) in bytes.iter().enumerate() {
+                    if *b != 0 {
+                        packed[r / 8] |= 1 << (r % 8);
+                    }
+                }
+                *bytes = packed;
+                1
+            } else {
+                0
+            }
+        })
+        .collect();
+
     let cols: Vec<WriteColumn<'_>> = encoded
         .iter()
         .zip(cell_bytes.iter())
-        .map(|(bytes, size)| WriteColumn {
+        .zip(cell_bits_per_col.iter())
+        .map(|((bytes, size), bits)| WriteColumn {
             cell_size: *size,
-            cell_bits: 0,
+            cell_bits: *bits,
             bytes,
         })
         .collect();
@@ -1186,8 +1214,10 @@ impl Table {
         };
         if matches!(
             desc.data_type,
-            DT::String | DT::Table | DT::Record | DT::Char
+            DT::String | DT::Table | DT::Record | DT::Char | DT::Bool
         ) {
+            // Bool cells are one bit per row in the storage managers, not
+            // one byte like the numpy bool buffer this path fills.
             return false;
         }
         if matches!(desc.kind, crate::tabledesc::ColumnKind::Array) {
