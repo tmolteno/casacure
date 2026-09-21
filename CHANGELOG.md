@@ -29,6 +29,13 @@ subtasks are moved here.
     casacore-written shape-stman tables, and casacore reads
     casacure-written ones bit-exactly (7x79x2 dcomplex round trip, plus
     the same via dask-ms `xds_from_ms` on a real MeerKAT MS).
+  - Real-world details the fixtures had not covered: TSM Bool tiles are
+    bit-packed (LSB-first, `Conversion::bitToBool`) — reads, writes and the
+    reported bucket sizes follow that; a column whose storage-manager
+    binding disagrees with its description (casacore MSs bind
+    IncrementalStMan columns whose description says StandardStMan) resolves
+    through the ColumnSet binding; and a column with no data cube at all
+    (FLAG_CATEGORY in a fresh MS) opens without its tile file.
   - Column descriptions: TiledShapeStMan is now kept for fixed-shape
     array columns (a shape-less declaration, as skarabina's flag versions
     use, still stores via StandardStMan); `getdminfo()` reports the

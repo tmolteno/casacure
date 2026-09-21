@@ -1051,6 +1051,22 @@ impl Table {
     /// The data-manager sequence number and the column's index within that
     /// manager for `col_idx` (the per-manager column order follows table
     /// order).
+    /// The storage-manager type actually binding this column: the
+    /// ColumnSet's data-manager entry for the bound sequence number. A
+    /// column description's own `dataManagerType` can disagree with it
+    /// (real casacore MSs bind ISM columns whose description says
+    /// StandardStMan).
+    fn column_storage_type(&self, col_idx: usize) -> String {
+        let desc = &self.dat.desc.columns[col_idx];
+        let (seq, _) = self.column_manager(col_idx);
+        self.dat
+            .column_set
+            .data_managers
+            .iter()
+            .find(|dm| dm.sequence_nr == seq)
+            .map(|dm| dm.type_name.clone())
+            .unwrap_or_else(|| desc.data_manager_type.clone())
+    }
     pub fn column_manager(&self, col_idx: usize) -> (u32, usize) {
         let seq = self.dat.column_set.columns[col_idx].data_manager_seq;
         let within = self.dat.column_set.columns[..col_idx]
@@ -1084,7 +1100,10 @@ impl Table {
     pub fn getcell(&self, col_idx: usize, row: u64) -> Result<RecordValue, TableReadError> {
         let desc = &self.dat.desc.columns[col_idx];
         let (seq, within) = self.column_manager(col_idx);
-        match desc.data_manager_type.as_str() {
+        // The ColumnSet binding is authoritative: a real MS can bind a
+        // column to IncrementalStMan while its description still declares
+        // StandardStMan.
+        match self.column_storage_type(col_idx).as_str() {
             "StandardStMan" => {
                 let file = self.ssm_file(seq).ok_or_else(|| {
                     TableReadError::UnsupportedColumn(desc.name.clone(), "StandardStMan".into())

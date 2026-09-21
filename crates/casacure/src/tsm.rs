@@ -118,21 +118,27 @@ impl TsmFile {
         let data = std::fs::read(dir.join(format!("table.f{seq_nr}")))?;
         let header = parse_header(&data)?;
         // The first cube holding data names the tile file (a shape-stman
-        // placeholder cube for not-yet-set cells carries -1).
+        // placeholder cube for not-yet-set cells carries -1); a column with
+        // no cubes at all (every cell unset) still has a tile-file entry.
+        // The first cube holding data names the tile file (a shape-stman
+        // placeholder cube for not-yet-set cells carries -1). A column with
+        // no cube holding data (every cell unset — casacore skips writing
+        // the tile file entirely) opens with an empty buffer; every read
+        // resolves to the column default.
         let file_seq = header
             .cubes
             .iter()
             .map(|c| c.file_seq_nr)
-            .find(|&f| f >= 0)
-            .unwrap_or(-1);
-        let path = if file_seq >= 0 {
-            dir.join(format!("table.f{seq_nr}_TSM{file_seq}"))
-        } else {
-            dir.join(format!("table.f{seq_nr}_TSM0"))
+            .find(|&f| f >= 0);
+        let tile_data = match file_seq {
+            Some(file_seq) => {
+                let path = dir.join(format!("table.f{seq_nr}_TSM{file_seq}"));
+                let tile_file = std::fs::File::open(&path)
+                    .map_err(|_| TsmError::MissingTileFile(path.display().to_string()))?;
+                crate::datafile::Buffer::from_file(tile_file)?
+            }
+            None => crate::datafile::Buffer::from(Vec::new()),
         };
-        let tile_file = std::fs::File::open(&path)
-            .map_err(|_| TsmError::MissingTileFile(path.display().to_string()))?;
-        let tile_data = crate::datafile::Buffer::from_file(tile_file)?;
         Ok(TsmFile {
             header,
             tile_data,
@@ -245,28 +251,43 @@ impl TsmFile {
         }
         let tile_nr = row_in_cube / row_tiles as u64;
         let row_in_tile = (row_in_cube % row_tiles as u64) as i64;
-        let elem = elem_size(desc.data_type)?;
         let tile_size: i64 = cube.tile_shape.iter().product();
-        let bucket_size = tile_size as usize * elem;
         let cell_elems = cell_size as usize;
-        let in_tile_elems = row_in_tile as usize * cell_elems;
-        let offset =
-            cube.file_offset as usize + tile_nr as usize * bucket_size + in_tile_elems * elem;
-        let end = offset + cell_elems * elem;
+        // Bool elements are bit-packed in the tile (LSB-first, casacore's
+        // `Conversion::bitToBool`); every other element type is byte-based.
+        let is_bool = desc.data_type == DataType::Bool;
+        let elem_bits: i64 = if is_bool { 1 } else { elem_size(desc.data_type)? as i64 * 8 };
+        let cell_bits = if is_bool {
+            // from the cube: the desc's shape may be absent (variable-shape)
+            cell_elems
+        } else {
+            cell_elems * elem_size(desc.data_type)? * 8
+        };
+        let tile_bits = tile_size * elem_bits;
+        let _bucket_size = (tile_bits as usize).div_ceil(8);
+        let bit_off = tile_nr as i64 * tile_bits + row_in_tile * cell_bits as i64;
+        let byte_off = cube.file_offset as usize + (bit_off / 8) as usize;
+        let skip = (bit_off % 8) as usize;
+        let nbytes = (skip + cell_bits).div_ceil(8);
+        let end = byte_off + nbytes;
         if end > self.tile_data.len() {
             return Err(TsmError::RowOutOfRange {
                 row,
                 nrow: self.header.nrrow,
             });
         }
-        let slice = &self.tile_data[offset..end];
+        let slice = &self.tile_data[byte_off..end];
         // Logical shape = reverse of the on-disk (CASA) cell shape.
         let logical: Vec<u32> = cube.cube_shape[..nrdim - 1]
             .iter()
             .rev()
             .map(|&d| d as u32)
             .collect();
-        let data = decode_tile_data(slice, desc.data_type, cell_elems, self.big_endian)?;
+        let data = if is_bool {
+            decode_bits(slice, skip, cell_elems)?
+        } else {
+            decode_tile_data(slice, desc.data_type, cell_elems, self.big_endian)?
+        };
         Ok(RecordValue::Array(ArrayValue {
             shape: logical,
             data,
@@ -284,7 +305,12 @@ impl TsmFile {
                 nrow: self.header.nrrow,
             })?;
         let cell_elems: usize = casa_shape.iter().product::<i64>().max(0) as usize;
-        let zeros = vec![0u8; cell_elems * elem_size(desc.data_type)?];
+        let nbytes = if desc.data_type == DataType::Bool {
+            cell_elems.div_ceil(8)
+        } else {
+            cell_elems * elem_size(desc.data_type)?
+        };
+        let zeros = vec![0u8; nbytes];
         let logical: Vec<u32> = casa_shape.iter().rev().map(|&d| d as u32).collect();
         Ok(RecordValue::Array(ArrayValue {
             shape: logical,
@@ -295,6 +321,29 @@ impl TsmFile {
 
 /// Row -> entry index into the header's row/cube/pos maps (-1 = unset
 /// cell); empty when the header has no maps (TiledColumnStMan).
+/// Decode `nbits` bits starting at bit `skip` of `bytes` (LSB-first within
+/// each byte, casacore `Conversion::bitToBool`).
+fn decode_bits(bytes: &[u8], skip: usize, nbits: usize) -> Result<ArrayData, TsmError> {
+    let mut v = Vec::with_capacity(nbits);
+    for i in 0..nbits {
+        let bit = (skip + i) % 8;
+        let byte = bytes[(skip + i) / 8];
+        v.push(byte & (1 << bit) != 0);
+    }
+    Ok(ArrayData::Bool(v))
+}
+
+/// Pack bools into bytes, LSB-first (the inverse of [`decode_bits`]).
+fn encode_bits(values: &[bool]) -> Vec<u8> {
+    let mut out = vec![0u8; values.len().div_ceil(8)];
+    for (i, b) in values.iter().enumerate() {
+        if *b {
+            out[i / 8] |= 1 << (i % 8);
+        }
+    }
+    out
+}
+
 /// Bytes of one tiled element in the tile file.
 pub fn elem_size(dt: DataType) -> Result<usize, TsmError> {
     match dt {
@@ -320,13 +369,8 @@ fn decode_tile_data(
         Reader::new_le(slice)
     };
     Ok(match dt {
-        DataType::Bool => {
-            let mut v = Vec::with_capacity(nelem);
-            for _ in 0..nelem {
-                v.push(r.read_bool()?);
-            }
-            ArrayData::Bool(v)
-        }
+        // Tile Bools are bit-packed (LSB-first); `slice` is byte-aligned.
+        DataType::Bool => decode_bits(slice, 0, nelem)?,
         DataType::Char | DataType::UChar => {
             ArrayData::UChar((0..nelem).map(|_| r.read_u8()).collect::<Result<_, _>>()?)
         }
@@ -555,8 +599,13 @@ pub fn write_tsm_file(
         });
     }
     let elem_size = elem_size(data_type)?;
+    let is_bool = data_type == DataType::Bool;
     let cell_elems: i64 = cell_shape.iter().product::<i64>();
-    let cell_bytes = cell_elems as usize * elem_size;
+    let cell_bytes = if is_bool {
+        (cell_elems as usize).div_ceil(8)
+    } else {
+        cell_elems as usize * elem_size
+    };
     if cells.iter().any(|c| c.len() != cell_bytes) {
         return Err(TsmError::UnsupportedType(data_type));
     }
@@ -564,15 +613,37 @@ pub fn write_tsm_file(
     let rows_per_tile = (DEFAULT_TILE_BYTES / cell_bytes.max(1)).max(1) as u64;
     let n_tiles = nrow.div_ceil(rows_per_tile).max(1);
     let tile_elems = cell_elems * rows_per_tile as i64;
-    let bucket_size = tile_elems as usize * elem_size;
+    let bucket_size = if is_bool {
+        (tile_elems as usize).div_ceil(8)
+    } else {
+        tile_elems as usize * elem_size
+    };
 
-    // Tile data file (data-file endianness; rows fill the tile grid).
+    // Tile data file (data-file endianness; rows fill the tile grid). Bool
+    // cells are bit-packed (LSB-first), so a row's bits start at an
+    // arbitrary bit of the bucket: write through a bit cursor.
     let mut tile_file = vec![0u8; bucket_size * n_tiles as usize];
     for (row, cell) in cells.iter().enumerate() {
         let tile = row as u64 / rows_per_tile;
         let in_tile = row as u64 % rows_per_tile;
-        let off = tile as usize * bucket_size + in_tile as usize * cell_bytes;
-        tile_file[off..off + cell_bytes].copy_from_slice(cell);
+        let bucket = tile as usize * bucket_size;
+        if is_bool {
+            // `cell` is the row's bit-packed elements; copy its bits to the
+            // row's bit position in the bucket (LSB-first, unaligned).
+            let bit = in_tile as usize * cell_elems as usize;
+            for (i, b) in cell.iter().enumerate() {
+                let mut byte = *b;
+                while byte != 0 {
+                    let j = byte.trailing_zeros() as usize;
+                    byte &= byte - 1;
+                    let g = bit + i * 8 + j;
+                    tile_file[bucket + g / 8] |= 1 << (g % 8);
+                }
+            }
+        } else {
+            let off = bucket + in_tile as usize * cell_bytes;
+            tile_file[off..off + cell_bytes].copy_from_slice(cell);
+        }
     }
 
     let mut cube_shape = cell_shape.to_vec();
@@ -700,11 +771,7 @@ pub fn tsm_encode_cell(
         let ArrayData::Bool(v) = data else {
             return Err(TsmError::UnsupportedType(data_type));
         };
-        let mut out = Vec::with_capacity(v.len());
-        for b in v {
-            out.push(u8::from(*b));
-        }
-        return Ok(out);
+        return Ok(encode_bits(v));
     }
     crate::ssm::encode_array_data(big_endian, data)
         .map_err(|_| TsmError::UnsupportedType(data_type))
@@ -849,13 +916,13 @@ mod tests {
 
     /// Bool tiles must store one byte per element (not SSM's bit-packing).
     #[test]
-    fn bool_tiles_store_one_byte_per_element() {
+    fn bool_tiles_are_bit_packed() {
         let data = ArrayData::Bool(vec![true, false, true, true, false, false]);
         let cells = vec![tsm_encode_cell(false, DataType::Bool, &data).unwrap()];
         let (header, tile_data) =
             write_tsm_file("TiledColumnStMan", false, 0, "g", DataType::Bool, &[3, 2], &cells).unwrap();
-        // First cell starts at tile offset 0: the six raw bool bytes.
-        assert_eq!(&tile_data[..6], &[1, 0, 1, 1, 0, 0]);
+        // The six elements pack into one byte, LSB-first: bits 0, 2, 3 set.
+        assert_eq!(&tile_data[..1], &[0b1101]);
         // And it still decodes to the original cell.
         let header = parse_header(&header).unwrap();
         let tsm = TsmFile::from_header(header, tile_data, false);
@@ -864,6 +931,46 @@ mod tests {
             data,
         });
         assert_eq!(tsm.read_cell(&array_desc(DataType::Bool), 0).unwrap(), want);
+    }
+
+    /// Bit-packed Bool rows straddle byte boundaries: row 1 of a 3-element
+    /// cell starts at bit 3, so its bits come from two bytes.
+    #[test]
+    fn bool_rows_straddle_byte_boundaries() {
+        let mut rows = Vec::new();
+        for r in 0..4u8 {
+            rows.push(tsm_encode_cell(
+                false,
+                DataType::Bool,
+                &ArrayData::Bool(vec![r & 1 != 0, r & 2 != 0, r & 4 != 0]),
+            )
+            .unwrap());
+        }
+        let (header, tile_data) = write_tsm_file(
+            "TiledShapeStMan",
+            false,
+            0,
+            "g",
+            DataType::Bool,
+            &[3],
+            &rows,
+        )
+        .unwrap();
+        let header = parse_header(&header).unwrap();
+        let tsm = TsmFile::from_header(header, tile_data, false);
+        let mut desc = array_desc(DataType::Bool);
+        desc.shape = Some(vec![3]);
+        desc.ndim = 1;
+        for r in 0..4u8 {
+            assert_eq!(
+                tsm.read_cell(&desc, r as u64).unwrap(),
+                RecordValue::Array(ArrayValue {
+                    shape: vec![3],
+                    data: ArrayData::Bool(vec![r & 1 != 0, r & 2 != 0, r & 4 != 0]),
+                }),
+                "row {r}"
+            );
+        }
     }
 
     /// A cell large enough to force more than one tile per row-spill boundary:
