@@ -45,11 +45,11 @@ row is read), peak RSS:
 
 | chunk (rows) | casacure (MiB) | casacore (MiB) |
 |---|---|---|
-| all (250k) | 4185 | 2202 |
-| 125 000 | 2643 | 1163 |
-| 25 000 | 1411 | 331 |
-| 5 000 | 1166 | 165 |
-| 1 000 | 1121 | 136 |
+| all (250k) | 3197 | 2202 |
+| 125 000 | 1658 | 1163 |
+| 25 000 | 425 | 331 |
+| 5 000 | 180 | 165 |
+| 1 000 | 164 | 136 |
 
 **Bounded read** — a window of the column (10 000 rows = 39 MiB, then
 100 000 rows = 391 MiB) read at the same chunk sizes; peak RSS:
@@ -64,24 +64,20 @@ row is read), peak RSS:
 - **Both engines respect chunking for anything short of a full pass.**
   Bounded reads scale with the rows actually read, not the column size, and
   sit at the same ~350–430 MiB Python/dask-ms stack baseline in both
-  engines (casacure's mmap and casacore's storage-manager cache only touch
-  the requested pages).
-- **Full-column reads diverge in the floor.** casacore streams through a
-  bounded LRU storage-manager read cache: peak RSS stays at ~136–330 MiB
-  (cache + one chunk's working set) no matter how large the column.
-  casacure memory-maps the data files, so every page touched over the pass
-  stays resident: the floor is ~1× the column size (~1.1 GiB here), and the
-  whole-column single-read case adds the two materialisation buffers
-  (~4.2 GiB). At a 4-MiB chunk casacore's full-pass footprint is ~8× lower
-  than casacure's.
-- **Where casacure was before the mapping change:** an open eagerly
-  `fs::read` the whole data file, so *any* read — even a 1000-row chunk —
-  cost ~the full column (~6 GiB observed at every chunk size). The
-  `memmap2` change moved casacure from "file copied into RAM per open" to
-  "file resident once touched"; a bounded LRU read cache (or a
-  `madvise(DONTNEED)` page-drop policy on long sequential scans) is the
-  remaining step to reach casacore's streaming floor. That is a follow-up,
-  not done here.
+  engines.
+- **A full-column pass is now at casacore parity** for chunked reads
+  (164 vs 136 MiB at a 1000-row chunk). casacure memory-maps the data files
+  and drops the mapped pages (`madvise(MADV_DONTNEED)`) after each bulk
+  ranged read once the cells are copied out — the analogue of casacore's
+  bounded LRU storage-manager cache. The only remaining gap is the
+  **single whole-column read** (`chunk = all`: 3.2 vs 2.2 GiB), where the
+  full result is materialised inside one call; a deeper typed-buffer
+  `getcolnp` would close it. See `MEMORY.md` for the mechanism and
+  trade-offs.
+- **Where casacure was before the mapping + page-drop changes:** an open
+  eagerly `fs::read` the whole data file (~6 GiB RSS at every chunk size),
+  then memory-map-only left a full pass resident at ~1× the column (~1.1 GiB
+  floor); both stages are superseded by the current streaming behaviour.
 
 Timing is comparable in the chunked regime (a 250-chunk ranged scan is
 ~0.75 s in both); a `perf` pass found casacure's per-element SSM array

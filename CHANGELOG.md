@@ -47,12 +47,20 @@ subtasks are moved here.
   `xds_from_table`): peak RSS now scales with chunk size (4.2 GiB whole
   column → 1.1 GiB at 1000-row chunks, 3.7×), and a bounded read stays at
   the ~430 MiB Python/dask-ms baseline; previously it was ~6 GiB at every
-  size. The casacore-vs-casacure memory footprint is compared in
-  `BENCHMARK.md` (`scripts/bench_daskms_chunking.py`): both engines are
-  bounded for chunked/windowed reads, but a full-column pass leaves the
-  mmap'd file resident in casacure (~1× column) while casacore streams
-  through its bounded LRU storage-manager cache (~0.14×) — a bounded read
-  cache is the remaining follow-up.
+  size. The casacore-vs-casacure memory footprint is compared in `MEMORY.md`
+  and `BENCHMARK.md` (`scripts/bench_daskms_chunking.py`): both engines are
+  bounded for chunked/windowed reads, and a full-column pass is now at
+  casacore parity too (below).
+- **Bounded streaming reads (full-pass memory floor removed).** A memory
+  map alone left a full-column scan resident at ~1× the file (casacore
+  streams through its bounded LRU storage-manager cache instead, ~0.14×).
+  `Table::getcol` now drops the mapped data-file pages
+  (`madvise(MADV_DONTNEED)`) for bulk reads (≥ 512 rows) once the cells are
+  copied out, so a chunked full-column pass is resident at ~the working set:
+  on the 977 MiB benchmark MS, peak RSS fell from ~1.1 GiB to **164 MiB**
+  at a 1000-row chunk (casacore: 136 MiB) and to 425 MiB at 25 000 rows.
+  Small/random reads (< 512 rows) keep the page cache. Mechanism and
+  trade-offs are documented in `MEMORY.md`.
 - **SSM array-cell decode is no longer per-element.** `read_array_cell`
   decoded every element through the `aipsio::Reader` (bounds checks per
   call, ~20 % of a chunked read's CPU). It now decodes the element region in

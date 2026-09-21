@@ -195,6 +195,15 @@ impl StandardStManFile {
         self.f0i.as_ref().map(crate::datafile::Buffer::as_slice)
     }
 
+    /// Drop this file's mapped data pages (used after a bulk read has copied
+    /// the cells out, to keep streaming scans resident at ~the working set).
+    pub fn drop_data_pages(&self) {
+        self.data.drop_pages();
+        if let Some(f0i) = &self.f0i {
+            f0i.drop_pages();
+        }
+    }
+
     /// Raw bytes of data bucket `number`.
     pub fn bucket_bytes(&self, number: u32) -> Result<&[u8], SsmError> {
         let size = self.header.bucket_size as usize;

@@ -1111,6 +1111,28 @@ impl Table {
         }
     }
 
+    /// Drop the data files' mapped pages (`MADV_DONTNEED`) after a bulk read
+    /// has copied the cell data out, so a long streaming scan (dask-ms
+    /// chunked full-column reads) stays resident at ~the current chunk
+    /// instead of the whole file — the analogue of casacore's bounded LRU
+    /// storage-manager cache. Pages re-read later simply fault back in.
+    pub fn drop_data_file_pages(&self) {
+        for (_, f) in &self.ssm_files {
+            f.drop_data_pages();
+        }
+        for (_, f) in &self.ism_files {
+            f.drop_data_pages();
+        }
+        for (_, f) in &self.tsm_files {
+            f.drop_data_pages();
+        }
+    }
+
+    /// A ranged `getcol` this large drops its data-file pages afterwards
+    /// (see [`Table::drop_data_file_pages`]); smaller reads keep the page
+    /// cache for random access.
+    const STREAMING_DROP_ROWS: u64 = 512;
+
     /// Read `nrow` cells starting at `startrow` (`table.getcol` /
     /// `getcolnp`).
     pub fn getcol(
@@ -1129,6 +1151,9 @@ impl Table {
                 },
                 other => other,
             })?);
+        }
+        if nrow >= Self::STREAMING_DROP_ROWS {
+            self.drop_data_file_pages();
         }
         Ok(out)
     }

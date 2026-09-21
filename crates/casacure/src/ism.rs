@@ -183,6 +183,12 @@ impl IsmFile {
         Ok((header, index))
     }
 
+    /// Drop this file's mapped data pages (used after a bulk read has copied
+    /// the cells out, to keep streaming scans resident at ~the working set).
+    pub fn drop_data_pages(&self) {
+        self.data.drop_pages();
+    }
+
     fn bucket_bytes(&self, bucket: u32) -> Result<&[u8], IsmError> {
         let size = self.header.bucket_size as usize;
         let start = DATA_START + bucket as usize * size;

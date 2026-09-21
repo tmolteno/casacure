@@ -119,6 +119,12 @@ impl TsmFile {
         })
     }
 
+    /// Drop this file's mapped tile pages (used after a bulk read has copied
+    /// the cells out, to keep streaming scans resident at ~the working set).
+    pub fn drop_data_pages(&self) {
+        self.tile_data.drop_pages();
+    }
+
     /// Read the fixed-shape array cell of `desc` (an array column of the
     /// hypercolumn) at `row`, returning the logical shape and values.
     pub fn read_cell(&self, desc: &ColumnDesc, row: u64) -> Result<RecordValue, TsmError> {
