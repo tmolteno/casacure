@@ -760,13 +760,30 @@ pub struct Table {
     pub tsm_files: Vec<(u32, crate::tsm::TsmFile)>,
 }
 
+/// The table directory as an absolute path (lexically normalised, no symlink
+/// resolution, so `name()` stays the path the caller gave modulo `.`/`..`).
+/// Every open/create funnels through this: subtable links are stored relative
+/// to the table's parent and resolved against it, which only round-trips when
+/// the directory is absolute — a relative `dir.parent()` (`""` for a bare
+/// name) once produced links like `.//home/...` that no reader could resolve.
+pub fn absolute_dir(p: &std::path::Path) -> std::path::PathBuf {
+    if p.is_absolute() {
+        return crate::record::lexical_normalize(p);
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => crate::record::lexical_normalize(&cwd.join(p)),
+        Err(_) => p.to_path_buf(),
+    }
+}
+
 impl Table {
     /// Open a table directory (`<dir>/table.dat` + data files).
     pub fn open(
         dir: impl Into<std::path::PathBuf>,
         readonly: bool,
     ) -> Result<Table, TableDatError> {
-        let path = dir.into();
+        let dir: std::path::PathBuf = dir.into();
+        let path = absolute_dir(&dir);
         let buf = std::fs::read(path.join("table.dat"))?;
         let dat = parse_table_dat(&buf)?;
         let big = dat.header.big_endian;
@@ -1448,9 +1465,10 @@ impl WritableTable {
         dir: impl Into<std::path::PathBuf>,
         desc: crate::tabledesc::TableDesc,
     ) -> WritableTable {
+        let dir: std::path::PathBuf = dir.into();
         let cells = vec![Vec::new(); desc.columns.len()];
         WritableTable {
-            dir: dir.into(),
+            dir: absolute_dir(&dir),
             desc,
             cells,
         }

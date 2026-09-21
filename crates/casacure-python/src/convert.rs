@@ -686,6 +686,15 @@ pub(crate) fn table_record_to_dict_ctx<'py>(
 fn resolve_subtable_py(name: &str, base: Option<&std::path::Path>) -> String {
     match base {
         Some(b) => {
+            // A legacy `.//absolute` stored link keeps its absolute tail.
+            if let Some(rest) = name.strip_prefix("./") {
+                if rest.starts_with('/') {
+                    return format!(
+                        "Table: {}",
+                        casacure::record::lexical_normalize(std::path::Path::new(rest)).display()
+                    );
+                }
+            }
             let path = std::path::Path::new(name);
             let joined = if path.is_absolute() {
                 path.to_path_buf()

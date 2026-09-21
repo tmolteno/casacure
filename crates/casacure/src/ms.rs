@@ -103,6 +103,11 @@ fn merge_extra_columns(desc: &mut TableDesc, extra: &str) -> Result<(), MsError>
 /// subtable tree (each subtable in `<path>/<NAME>`), linked from the main
 /// table by `TpTable` keywords.
 pub fn default_ms(path: &Path, extra_desc: Option<&str>) -> Result<(), MsError> {
+    // Subtable links are stored relative to the MS's parent directory (or
+    // absolute when outside it), which only round-trips when the MS path is
+    // absolute — a relative `ms.ms/ANTENNA` joined at read time against the
+    // table directory instead of its parent doubles the path.
+    let path = crate::table::absolute_dir(path);
     let mut desc = required_ms_desc(None)?;
     if let Some(extra) = extra_desc {
         merge_extra_columns(&mut desc, extra)?;

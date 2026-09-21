@@ -584,3 +584,41 @@ def test_taql_statement_result_does_not_go_stale_after_reopen(tmp_path):
     finally:
         reader.close()  # must not regenerate from stale state
     assert _read_ids(p) == [5, 20, 9]
+
+
+def test_relative_path_ms_links_resolve_from_any_cwd(tmp_path, monkeypatch):
+    """An MS created (and later reopened writable) with a relative path stores
+    subtable links that resolve — and getsubtables() paths that open — from
+    any working directory.
+
+    Regression: a relative default_ms path stored bare parent-relative links
+    (`ms/ANTENNA`) that getsubtables() doubled onto the table directory, and
+    an absolute `Table:` putkeyword on a relatively-opened table was stored
+    as `.//abs/path`, which no reader could resolve.
+    """
+    from casacore.tables import default_ms
+
+    monkeypatch.chdir(tmp_path)
+    default_ms("t.ms")
+
+    ms_abs = tmp_path / "t.ms"
+    t = table("t.ms", readonly=False, ack=False)
+    assert str(ms_abs / "ANTENNA") in t.getsubtables()
+    assert t.getkeyword("ANTENNA") == f"Table: {ms_abs / 'ANTENNA'}"
+
+    # An absolute Table: link written through a relative writable open.
+    target = tmp_path / "elsewhere.tab"
+    table(str(target), maketabdesc(makescacoldesc("x", 1)), nrow=0, ack=False).close()
+    t.putkeyword("MYLINK", f"Table: {target}")
+    t.flush()
+    t.close()
+
+    monkeypatch.chdir("/")
+    t2 = table(str(ms_abs), readonly=True, ack=False)
+    assert t2.getkeyword("MYLINK") == f"Table: {target}"
+    subs = t2.getsubtables()
+    assert str(target) in subs
+    # every returned path opens
+    for s in subs:
+        table(s, readonly=True, ack=False).close()
+    t2.close()

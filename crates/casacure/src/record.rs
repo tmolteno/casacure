@@ -947,6 +947,14 @@ impl RecordValue {
 /// parent table, lexically (no filesystem access, matching casacore's
 /// dynamic resolution).
 fn resolve_subtable(name: &str, base: &std::path::Path) -> String {
+    // A writer that relativised against a relative table directory could
+    // store `./` in front of an absolute path (`.//home/...`); the absolute
+    // tail wins over the base.
+    if let Some(rest) = name.strip_prefix("./") {
+        if rest.starts_with('/') {
+            return lexical_normalize(std::path::Path::new(rest)).display().to_string();
+        }
+    }
     let path = std::path::Path::new(name);
     let joined = if path.is_absolute() {
         path.to_path_buf()

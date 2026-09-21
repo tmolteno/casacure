@@ -15,6 +15,46 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::convert;
 
+/// Resolve a stored subtable reference to an absolute path that opens from
+/// any working directory, given the parent table's directory (`table_dir`)
+/// and its parent (`base`).
+///
+/// Recognised stored forms:
+/// - absolute — kept;
+/// - `./SUB` — relative to the parent table's directory (casacore's form,
+///   written by `relativize_subtables`);
+/// - `./` in front of an absolute path (`.//home/...`) — a legacy writer
+///   relativised against a relative table directory; the absolute tail wins;
+/// - bare `MSNAME/SUB` whose first component is the table directory's own
+///   basename — a legacy `default_ms` stored the link relative to the parent
+///   without the `./`; resolving it against the table directory would double
+///   the path;
+/// - any other bare name — relative to the table directory.
+fn resolve_stored_subtable(s: &str, table_dir: &std::path::Path, base: &std::path::Path) -> String {
+    let norm = |p: std::path::PathBuf| {
+        core::record::lexical_normalize(&p).to_string_lossy().into_owned()
+    };
+    if let Some(rest) = s.strip_prefix("./") {
+        if rest.starts_with('/') {
+            return norm(std::path::PathBuf::from(rest));
+        }
+        return norm(base.join(rest));
+    }
+    let p = std::path::Path::new(s);
+    if p.is_absolute() {
+        return s.to_string();
+    }
+    let parent_relative = p
+        .components()
+        .next()
+        .is_some_and(|c| c.as_os_str() == table_dir.file_name().unwrap_or_default());
+    if parent_relative {
+        norm(base.join(p))
+    } else {
+        norm(table_dir.join(p))
+    }
+}
+
 /// The backing state of a bound table.
 #[allow(clippy::large_enum_variant)]
 enum Inner {
@@ -428,12 +468,26 @@ impl Table {
         nrow: u64,
         writable: bool,
     ) -> PyResult<Self> {
+        // Table paths are handled absolute (mirrors casacore, whose table
+        // names are absolute): subtable links are stored relative to the
+        // table's parent and resolved against it, which only round-trips
+        // from an absolute directory.
+        let abs = if let Some((base, sub)) = path.split_once("::") {
+            format!(
+                "{base}::{sub}",
+                base = core::table::absolute_dir(std::path::Path::new(base)).display(),
+            )
+        } else {
+            core::table::absolute_dir(std::path::Path::new(path))
+                .display()
+                .to_string()
+        };
         // casacore `ms::SUBTABLE` path syntax: the subtable lives in a
         // directory of the same name under the main table directory.
-        let dir = if let Some((base, sub)) = path.split_once("::") {
+        let dir = if let Some((base, sub)) = abs.split_once("::") {
             PathBuf::from(base).join(sub)
         } else {
-            PathBuf::from(path)
+            PathBuf::from(&abs)
         };
         if let Some(desc_string) = desc_json {
             let desc = core::tabledesc::TableDesc::from_desc_json(desc_string).map_err(err)?;
@@ -484,7 +538,7 @@ impl Table {
             }));
             register_write(&dir, &shared);
             return Ok(Table {
-                path: path.to_string(),
+                path: abs.clone(),
                 writable,
                 inner: Mutex::new(Inner::Write { shared }),
             });
@@ -503,7 +557,7 @@ impl Table {
             }
             let read = ::casacure::Table::open(&dir, false).map_err(err)?;
             return Ok(Table {
-                path: path.to_string(),
+                path: abs.clone(),
                 writable: false,
                 inner: Mutex::new(Inner::Read(std::sync::Arc::new(read))),
             });
@@ -514,7 +568,7 @@ impl Table {
         // a stale snapshot must not clobber the first handle's writes).
         if let Some(shared) = find_write(&dir) {
             return Ok(Table {
-                path: path.to_string(),
+                path: abs.clone(),
                 writable: true,
                 inner: Mutex::new(Inner::Write { shared }),
             });
@@ -538,7 +592,7 @@ impl Table {
         }));
         register_write(&dir, &shared);
         Ok(Table {
-            path: path.to_string(),
+            path: abs.clone(),
             writable: true,
             inner: Mutex::new(Inner::Write { shared }),
         })
@@ -1002,23 +1056,11 @@ impl Table {
         for v in &desc.private_keywords.values {
             walk(v, &mut out);
         }
-        // Resolve each reference to an absolute path. Our own subtables are
-        // stored relative to the table's parent ("./ms/ANTENNA"); bare names
-        // are relative to the table directory.
+        // Resolve each reference to an absolute path that opens from any
+        // working directory (like python-casacore).
         let resolved: Vec<String> = out
             .into_iter()
-            .map(|s| {
-                let p = std::path::Path::new(&s);
-                if p.is_absolute() {
-                    return s;
-                }
-                let joined = if let Some(rest) = s.strip_prefix("./") {
-                    base.join(rest)
-                } else {
-                    table_dir.join(&s)
-                };
-                joined.to_string_lossy().into_owned()
-            })
+            .map(|s| resolve_stored_subtable(&s, &table_dir, base))
             .collect();
         Ok(resolved)
     }
@@ -2496,4 +2538,58 @@ pub(crate) fn desc_to_pydict<'py>(
     let empty = PyDict::new(py);
     d.set_item("_define_hypercolumn_", empty)?;
     Ok(d)
+}
+
+#[cfg(test)]
+mod subtable_resolve_tests {
+    use super::resolve_stored_subtable;
+
+    const TABLE_DIR: &str = "/data/ms_cure.ms";
+    const BASE: &str = "/data";
+
+    #[test]
+    fn casacore_dot_form_resolves_against_parent() {
+        assert_eq!(
+            resolve_stored_subtable("./ANTENNA", TABLE_DIR.as_ref(), BASE.as_ref()),
+            "/data/ANTENNA"
+        );
+    }
+
+    #[test]
+    fn absolute_stored_path_is_kept() {
+        assert_eq!(
+            resolve_stored_subtable("/other/ms/SOURCE", TABLE_DIR.as_ref(), BASE.as_ref()),
+            "/other/ms/SOURCE"
+        );
+    }
+
+    #[test]
+    fn legacy_dot_absolute_form_uses_absolute_tail() {
+        // Written by a relativisation against a relative table directory.
+        assert_eq!(
+            resolve_stored_subtable(
+                ".//data/ms_cure.ms/SOURCE",
+                TABLE_DIR.as_ref(),
+                BASE.as_ref()
+            ),
+            "/data/ms_cure.ms/SOURCE"
+        );
+    }
+
+    #[test]
+    fn legacy_bare_parent_relative_form_does_not_double() {
+        // Written by a default_ms given a relative MS path.
+        assert_eq!(
+            resolve_stored_subtable("ms_cure.ms/ANTENNA", TABLE_DIR.as_ref(), BASE.as_ref()),
+            "/data/ms_cure.ms/ANTENNA"
+        );
+    }
+
+    #[test]
+    fn other_bare_names_are_table_dir_relative() {
+        assert_eq!(
+            resolve_stored_subtable("SUB", TABLE_DIR.as_ref(), BASE.as_ref()),
+            "/data/ms_cure.ms/SUB"
+        );
+    }
 }
