@@ -639,22 +639,22 @@ pub fn read_array_cell(
     // overhead (the hot path for array-column getcol/getcolnp on an SSM).
     macro_rules! decode_array {
         ($ty:ty, $variant:ident, $n:literal) => {{
-            let it = data.chunks_exact($n);
-            let mut out = Vec::with_capacity(data.len() / $n);
-            if file.header.big_endian {
-                for b in it {
-                    out.push(<$ty>::from_be_bytes(b.try_into().unwrap()));
-                }
-            } else {
-                for b in it {
-                    out.push(<$ty>::from_le_bytes(b.try_into().unwrap()));
-                }
-            }
-            if out.len() != nelem {
+            let (chunks, rest) = data.as_chunks::<$n>();
+            if !rest.is_empty() {
                 return Err(SsmError::TruncatedArray {
                     need: nelem,
-                    have: out.len(),
+                    have: chunks.len(),
                 });
+            }
+            let mut out = Vec::with_capacity(chunks.len());
+            if file.header.big_endian {
+                for b in chunks {
+                    out.push(<$ty>::from_be_bytes(*b));
+                }
+            } else {
+                for b in chunks {
+                    out.push(<$ty>::from_le_bytes(*b));
+                }
             }
             ArrayData::$variant(out)
         }};
@@ -681,9 +681,15 @@ pub fn read_array_cell(
         DataType::Float => decode_array!(f32, Float, 4),
         DataType::Double => decode_array!(f64, Double, 8),
         DataType::Complex => {
-            let mut it = data.chunks_exact(8);
+            let (pairs, rest) = data.as_chunks::<8>();
+            if !rest.is_empty() {
+                return Err(SsmError::TruncatedArray {
+                    need: nelem,
+                    have: pairs.len(),
+                });
+            }
             let mut v = Vec::with_capacity(nelem);
-            for pair in it.by_ref() {
+            for pair in pairs {
                 let bits = if file.header.big_endian {
                     (
                         f32::from_be_bytes(pair[0..4].try_into().unwrap()),
@@ -697,18 +703,18 @@ pub fn read_array_cell(
                 };
                 v.push(bits);
             }
-            if !it.remainder().is_empty() {
-                return Err(SsmError::TruncatedArray {
-                    need: nelem,
-                    have: v.len(),
-                });
-            }
             ArrayData::Complex(v)
         }
         DataType::DComplex => {
-            let mut it = data.chunks_exact(16);
+            let (pairs, rest) = data.as_chunks::<16>();
+            if !rest.is_empty() {
+                return Err(SsmError::TruncatedArray {
+                    need: nelem,
+                    have: pairs.len(),
+                });
+            }
             let mut v = Vec::with_capacity(nelem);
-            for pair in it.by_ref() {
+            for pair in pairs {
                 let bits = if file.header.big_endian {
                     (
                         f64::from_be_bytes(pair[0..8].try_into().unwrap()),
@@ -721,12 +727,6 @@ pub fn read_array_cell(
                     )
                 };
                 v.push(bits);
-            }
-            if !it.remainder().is_empty() {
-                return Err(SsmError::TruncatedArray {
-                    need: nelem,
-                    have: v.len(),
-                });
             }
             ArrayData::DComplex(v)
         }
