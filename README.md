@@ -291,5 +291,16 @@ cargo fmt
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+The toolchain is pinned to the current stable channel in `rust-toolchain.toml`
+(so local lints always match CI's latest stable); keep it current with
+`rustup update stable`. A **pre-push hook** (`.githooks/pre-push`) runs the
+full gate — rustfmt, clippy with `-D warnings`, `cargo test --release`, and
+the pytest suite against a freshly built extension — before anything reaches
+the remote. Enable it once per clone (git hooks are not tracked):
+
+```sh
+git config core.hooksPath .githooks
+```
+
 `clippy` is run with `-D warnings` (warnings are errors); `cargo fmt` keeps
 the formatting canonical. Everything merged must pass both.

@@ -1,0 +1,10 @@
+# casacure pins the Rust toolchain to the current stable channel so local
+# builds and CI (dtolnay/rust-toolchain@stable, clippy with `-D warnings`)
+# see the same compiler and the same (possibly newly-added) lints. This
+# prevents toolchain-drift CI failures like a new clippy lint surfacing on
+# CI but not on the developer machine.
+#
+# If `cargo`/`clippy` report a stale stable, run `rustup update stable`.
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]

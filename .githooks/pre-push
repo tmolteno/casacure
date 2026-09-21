@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+#
+# Pre-push gate: mirror the CI gate before anything reaches the remote.
+#
+# Reruns the checks CI enforces (`cargo fmt --check`, `cargo clippy ...
+# -- -D warnings`, `cargo test --release`, and the pytest suite) on the *same
+# stable toolchain CI uses, so a failure like a newly-added clippy lint on a
+# newer stable can never land again unseen. The hook aborts the push on any
+# failure.
+#
+# Install once (the path is per-clone, so it is not committed):
+#   git config core.hooksPath .githooks
+#
+# The toolchain channel is pinned in rust-toolchain.toml; keep it current
+# with `rustup update stable` occasionally.
+#
+# Pre-push hook arguments ([remote] [url]) are ignored; success/failure is
+# the push gate.
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+echo "== pre-push: cargo fmt --check =="
+cargo fmt --check
+
+echo "== pre-push: cargo clippy --all-targets -- -D warnings =="
+cargo clippy --all-targets -- -D warnings
+
+echo "== pre-push: cargo test --release =="
+cargo test --release
+
+# Python suite against the current source, via the casacure shim. The
+# release extension is rebuilt first so pytest exercises this source, not a
+# stale install. Skipped when the venv is absent.
+if [ -x .venv/bin/maturin ] && [ -x .venv/bin/python ]; then
+    echo "== pre-push: maturin develop --release =="
+    .venv/bin/maturin develop --release >/dev/null
+    echo "== pre-push: pytest tests/ =="
+    PYTHONPATH=tests/shim .venv/bin/python -m pytest tests/ -q
+fi
+
+echo "== pre-push: OK =="
