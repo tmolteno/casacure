@@ -359,9 +359,9 @@ pub fn create_table(
                 });
                 data_files.push((dm as u32, file));
             }
-            "TiledColumnStMan" => {
+            "TiledColumnStMan" | "TiledShapeStMan" => {
                 let (header, tile) =
-                    build_tsm_data(big_endian, dm as u32, dm_name, desc, values, &dm_cols)?;
+                    build_tsm_data(type_name, big_endian, dm as u32, dm_name, desc, values, &dm_cols)?;
                 dms.push(DmBlob {
                     type_name: type_name.clone(),
                     sequence_nr: dm as u32,
@@ -691,6 +691,7 @@ fn build_ism_data(
 /// Build the TiledColumnStMan header + tile data for one TSM data manager
 /// (a single fixed-shape array column).
 fn build_tsm_data(
+    stman_type: &str,
     big_endian: bool,
     seq_nr: u32,
     dm_name: &str,
@@ -701,7 +702,7 @@ fn build_tsm_data(
     use crate::record::RecordValue;
     if dm_cols.len() != 1 {
         return Err(TableCreateError::Io(std::io::Error::other(format!(
-            "TiledColumnStMan with {} columns is not supported (one array column per group)",
+            "{stman_type} with {} columns is not supported (one array column per group)",
             dm_cols.len()
         ))));
     }
@@ -709,7 +710,7 @@ fn build_tsm_data(
     let cd = &desc.columns[col];
     let cradle = cd.shape.clone().ok_or_else(|| {
         TableCreateError::NotScalar(format!(
-            "{}.{}: TiledColumnStMan needs a fixed-shape array column",
+            "{}.{}: {stman_type} needs a fixed-shape array column",
             desc.name, cd.name
         ))
     })?;
@@ -730,7 +731,8 @@ fn build_tsm_data(
             })?,
         );
     }
-    crate::tsm::write_tsm_file(big_endian, seq_nr, dm_name, cd.data_type, &cradle, &cells).map_err(
+    crate::tsm::write_tsm_file(stman_type, big_endian, seq_nr, dm_name, cd.data_type, &cradle, &cells)
+        .map_err(
         |e| {
             TableCreateError::Io(std::io::Error::other(format!(
                 "encode {}.{}: {e}",
@@ -802,11 +804,13 @@ impl Table {
                     crate::ism::IsmFile::open(&path, dm.sequence_nr, big)
                         .map_err(|e| TableDatError::Storage(e.to_string()))?,
                 )),
-                "TiledColumnStMan" => tsm_files.push((
-                    dm.sequence_nr,
-                    crate::tsm::TsmFile::open(&path, dm.sequence_nr, big)
-                        .map_err(|e| TableDatError::Storage(e.to_string()))?,
-                )),
+                "TiledColumnStMan" | "TiledShapeStMan" => {
+                    tsm_files.push((
+                        dm.sequence_nr,
+                        crate::tsm::TsmFile::open(&path, dm.sequence_nr, big)
+                            .map_err(|e| TableDatError::Storage(e.to_string()))?,
+                    ))
+                }
                 other => {
                     return Err(TableDatError::Storage(format!(
                         "unsupported data-manager type {other}"
@@ -1109,7 +1113,7 @@ impl Table {
                     })?;
                 file.read_scalar_cell(within, desc, row).map_err(Into::into)
             }
-            "TiledColumnStMan" => {
+            "TiledColumnStMan" | "TiledShapeStMan" => {
                 let file = self
                     .tsm_files
                     .iter()
@@ -1118,7 +1122,7 @@ impl Table {
                     .ok_or_else(|| {
                         TableReadError::UnsupportedColumn(
                             desc.name.clone(),
-                            "TiledColumnStMan".into(),
+                            "tiled storage manager".into(),
                         )
                     })?;
                 file.read_cell(desc, row).map_err(Into::into)
@@ -1790,7 +1794,21 @@ pub enum DmSpec {
         bucket_sizes: Vec<u64>,
         seqnr: u32,
     },
+    TiledShapeStMan {
+        default_tile_shape: Vec<i64>,
+        seqnr: u32,
+        hypercubes: Vec<TsmHypercube>,
+    },
     Unsupported(String),
+}
+
+/// One hypercube of a `TiledShapeStMan` (`SPEC.HYPERCUBES["*N"]`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TsmHypercube {
+    pub cube_shape: Vec<i64>,
+    pub tile_shape: Vec<i64>,
+    pub cell_shape: Vec<i64>,
+    pub bucket_size: u64,
 }
 
 /// Build the `getdminfo()` dictionary (`{"*1": ..., "*2": ...}`) for a
@@ -1843,6 +1861,34 @@ pub fn get_dminfo(
                     pers_cache_size: file.header.pers_cache_size,
                 }
             }
+            "TiledShapeStMan" => {
+                let file =
+                    crate::tsm::TsmFile::open(table_dir, dm.sequence_nr, dat.header.big_endian)
+                        .map_err(|e| TableDatError::Storage(e.to_string()))?;
+                let header = &file.header;
+                tsm_hypercolumn = Some(header.hypercolumn_name.clone());
+                let elem = crate::tsm::elem_size(header.data_types[0])
+                    .map_err(|e| TableDatError::Storage(e.to_string()))?;
+                let hypercubes = header
+                    .cubes
+                    .iter()
+                    .map(|c| TsmHypercube {
+                        cell_shape: {
+                            let mut s = c.cube_shape.clone();
+                            s.pop();
+                            s
+                        },
+                        bucket_size: c.tile_shape.iter().product::<i64>() as u64 * elem as u64,
+                        cube_shape: c.cube_shape.clone(),
+                        tile_shape: c.tile_shape.clone(),
+                    })
+                    .collect();
+                DmSpec::TiledShapeStMan {
+                    default_tile_shape: header.subclass_shape.clone(),
+                    seqnr: header.seq_nr,
+                    hypercubes,
+                }
+            }
             "TiledColumnStMan" => {
                 let file =
                     crate::tsm::TsmFile::open(table_dir, dm.sequence_nr, dat.header.big_endian)
@@ -1881,7 +1927,7 @@ pub fn get_dminfo(
         let name = match &dm.blob {
             crate::columnset::DataManagerBlob::StandardStMan(s) => s.data_manager_name.clone(),
             crate::columnset::DataManagerBlob::Unsupported(_) => {
-                if dm.type_name == "TiledColumnStMan" {
+                if dm.type_name == "TiledColumnStMan" || dm.type_name == "TiledShapeStMan" {
                     tsm_hypercolumn
                         .clone()
                         .unwrap_or_else(|| dm.type_name.clone())
@@ -2013,6 +2059,44 @@ impl DmSpec {
                 s.push('}');
                 s.push(',');
                 s.push_str(&format!("\"SEQNR\":{}", seqnr));
+                s.push('}');
+                s
+            }
+            DmSpec::TiledShapeStMan {
+                default_tile_shape,
+                seqnr,
+                hypercubes,
+            } => {
+                let mut cubes = String::new();
+                for (i, c) in hypercubes.iter().enumerate() {
+                    if i > 0 {
+                        cubes.push(',');
+                    }
+                    cubes.push_str(&format!(
+                        "\"*{}\":{{\"CubeShape\":{},\"TileShape\":{},\"CellShape\":{},\"BucketSize\":{},\"ID\":{{}}}}",
+                        i + 1,
+                        json_ilist(&c.cube_shape),
+                        json_ilist(&c.tile_shape),
+                        json_ilist(&c.cell_shape),
+                        c.bucket_size,
+                    ));
+                }
+                let mut s = String::new();
+                s.push('{');
+                s.push_str("\"MaxCacheSize\":0");
+                s.push(',');
+                s.push_str("\"DEFAULTTILESHAPE\":");
+                s.push_str(&json_ilist(default_tile_shape));
+                s.push(',');
+                s.push_str("\"MAXIMUMCACHESIZE\":0");
+                s.push(',');
+                s.push_str("\"HYPERCUBES\":{");
+                s.push_str(&cubes);
+                s.push('}');
+                s.push(',');
+                s.push_str(&format!("\"SEQNR\":{}", seqnr));
+                s.push(',');
+                s.push_str(&format!("\"IndexSize\":{}", hypercubes.len()));
                 s.push('}');
                 s
             }

@@ -189,39 +189,6 @@ pub(crate) fn column_from_desc_dict(
         Some(RecordValue::String(s)) if !s.is_empty() => s.clone(),
         _ => "StandardStMan".to_string(),
     };
-    // TiledShapeStMan / TiledCellStMan (variable-shape tiled managers) are not
-    // implemented by casacure's storage engine; create them with StandardStMan
-    // instead (same values round-trip; only the on-disk layout differs).
-    // TiledColumnStMan IS supported and is left alone.
-    let data_manager_type = match data_manager_type.as_str() {
-        "TiledShapeStMan" | "TiledCellStMan" | "TSMBoundedStMan" | "TSMExpStMan" => {
-            "StandardStMan".to_string()
-        }
-        other => other.to_string(),
-    };
-    let data_manager_group = match get("dataManagerGroup") {
-        Some(RecordValue::String(s)) if !s.is_empty() => s.clone(),
-        _ => "StandardStMan".to_string(),
-    };
-    let options = match get("option") {
-        Some(RecordValue::Int(i)) => *i,
-        Some(RecordValue::Int64(i)) => *i as i32,
-        _ => 0,
-    };
-    let max_length = match get("maxlen") {
-        Some(RecordValue::Int(i)) => *i,
-        Some(RecordValue::Int64(i)) => *i as i32,
-        _ => 0,
-    };
-    // `ndim` present at all (any value, incl. -1) means an ARRAY column in
-    // casacore: -1 = unconstrained variable-shape, >= 0 = declared dims
-    // (variable unless `shape` is fixed). Absent means a scalar column.
-    let ndim_present = get("ndim").is_some();
-    let ndim = match get("ndim") {
-        Some(RecordValue::Int(i)) => *i,
-        Some(RecordValue::Int64(i)) => *i as i32,
-        _ => -1,
-    };
     // The dict `shape` is the logical (row-major) shape; the descriptor
     // stores it in CASA order (reversed), like `getcoldesc` reports back.
     // JSON represents array values as `{"shape":[..],"array":[..]}` records,
@@ -252,7 +219,43 @@ pub(crate) fn column_from_desc_dict(
         }),
         _ => None,
     };
+    // TiledCellStMan & friends (variable-shape tiled managers) are not
+    // implemented by casacure's storage engine; create them with StandardStMan
+    // instead (same values round-trip; only the on-disk layout differs).
+    // TiledColumnStMan is always kept; TiledShapeStMan needs a fixed cell
+    // shape to tile, so a shape-less declaration (skarabina's flag versions)
+    // also stores via StandardStMan.
+    let fixed_shape_declared = shape_elems.is_some();
+    let data_manager_type = match data_manager_type.as_str() {
+        "TiledShapeStMan" if !fixed_shape_declared => "StandardStMan".to_string(),
+        "TiledCellStMan" | "TSMBoundedStMan" | "TSMExpStMan" => "StandardStMan".to_string(),
+        other => other.to_string(),
+    };
+    let data_manager_group = match get("dataManagerGroup") {
+        Some(RecordValue::String(s)) if !s.is_empty() => s.clone(),
+        _ => "StandardStMan".to_string(),
+    };
+    let options = match get("option") {
+        Some(RecordValue::Int(i)) => *i,
+        Some(RecordValue::Int64(i)) => *i as i32,
+        _ => 0,
+    };
+    let max_length = match get("maxlen") {
+        Some(RecordValue::Int(i)) => *i,
+        Some(RecordValue::Int64(i)) => *i as i32,
+        _ => 0,
+    };
+    // `ndim` present at all (any value, incl. -1) means an ARRAY column in
+    // casacore: -1 = unconstrained variable-shape, >= 0 = declared dims
+    // (variable unless `shape` is fixed). Absent means a scalar column.
+    let ndim_present = get("ndim").is_some();
+    let ndim = match get("ndim") {
+        Some(RecordValue::Int(i)) => *i,
+        Some(RecordValue::Int64(i)) => *i as i32,
+        _ => -1,
+    };
     let shape = shape_elems.map(|dims| dims.into_iter().rev().collect());
+
     let keywords = match get("keywords") {
         Some(RecordValue::Record(r)) => r.clone(),
         _ => crate::record::TableRecord {
@@ -768,7 +771,8 @@ mod tests {
     #[test]
     fn column_desc_normalizes_unsupported_data_managers() {
         // Empty type/group default to StandardStMan; unsupported tiled
-        // *shape* managers are downgraded; TiledColumnStMan is kept.
+        // Variable-shape managers and shape-less TiledShapeStMan are
+        // downgraded; TiledColumnStMan is kept.
         let base = |dmt: &str, dmg: &str| {
             format!(
                 r#"{{"C":{{"valueType":"int","dataManagerType":"{dmt}","dataManagerGroup":"{dmg}","keywords":{{}}}}}}"#
@@ -845,5 +849,22 @@ mod tests {
         let mut r = Reader::new(&bytes);
         let parsed = parse_table_desc(&mut r).unwrap();
         assert_eq!(parsed, desc);
+    }
+}
+
+#[cfg(test)]
+mod tsm_shape_tests {
+    use super::TableDesc;
+
+    #[test]
+    fn tiled_shape_stman_with_fixed_shape_is_kept() {
+        let desc = TableDesc::from_desc_json(
+            r#"{"DATA":{"valueType":"dcomplex","dataManagerType":"TiledShapeStMan","dataManagerGroup":"TiledData","ndim":2,"shape":[4,2],"_c_order":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            desc.column("DATA").unwrap().data_manager_type,
+            "TiledShapeStMan"
+        );
     }
 }

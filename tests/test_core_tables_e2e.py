@@ -476,3 +476,23 @@ def test_partial_putcol_leaves_defaults(tmp_path):
     t2 = table(p)
     assert np.asarray(t2.getcol("C")).tolist() == [1.0, 2.0, 0.0]
     t2.close()
+
+
+def test_tiled_shape_stman_round_trip(tmp_path):
+    """A TiledShapeStMan array column writes real shape-stman blocks and
+    reads back (the manager real casacore MSs use for DATA/FLAG)."""
+    desc = maketabdesc([
+        makearrcoldesc("DATA", 0.0 + 0.0j, shape=[4, 2],
+                       valuetype="dcomplex", datamanagertype="TiledShapeStMan"),
+    ])
+    t = table(str(tmp_path / "t.tab"), desc, nrow=3, ack=False)
+    data = np.arange(3 * 4 * 2, dtype=np.float64).reshape(3, 4, 2)
+    data = data * (1.0 + 1.0j)
+    t.putcol("DATA", data)
+    t.flush()
+    t.close()
+
+    t = table(str(tmp_path / "t.tab"), readonly=True, ack=False)
+    assert t.getdminfo()["*1"]["TYPE"] == "TiledShapeStMan"
+    np.testing.assert_array_equal(t.getcol("DATA"), data)
+    t.close()

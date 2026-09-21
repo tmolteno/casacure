@@ -3,6 +3,37 @@
 All notable changes to this project are documented here. Completed `TODO.md`
 subtasks are moved here.
 
+## [Unreleased]
+
+### Added
+
+- **TiledShapeStMan: read and write** — the storage manager real casacore
+  MSs use for DATA/FLAG/WEIGHT_SPECTRUM (tiling hypercubes across many
+  rows; bpcal_mergA_tim_fast_ave.ms tiles 829 rows per bucket). casacure
+  previously rejected it at open, so skarabina could not run its
+  meerkat_imaging workload on the casacure backend at all.
+  - The TSM header layout is shared with TiledColumnStMan up to the
+    subclass payload: a shape-stman root carries no IPosition; after the
+    cubes it closes with the default tile shape and the three row-interval
+    maps (`Block`s of rowMap/cubeMap/posMap, where rowMap gives the LAST
+    row of an interval and posMap its last cell position, cube 0 being
+    casacore's placeholder for unset rows). `getcol`/`getcell` resolve rows
+    through those maps, with interval-based position arithmetic, and rows
+    outside every interval read as the column default (zeros), like
+    casacore.
+  - Writes emit the same layout: two interval entries covering all rows of
+    a single real cube (casacore's `singleHypercube()` indexes a
+    placeholder at `cubeSet[1]`, so a one-entry map over a one-cube file
+    makes it read out of bounds — the segfault this fixes).
+  - Byte-level interop verified in both directions: casacure reads
+    casacore-written shape-stman tables, and casacore reads
+    casacure-written ones bit-exactly (7x79x2 dcomplex round trip, plus
+    the same via dask-ms `xds_from_ms` on a real MeerKAT MS).
+  - Column descriptions: TiledShapeStMan is now kept for fixed-shape
+    array columns (a shape-less declaration, as skarabina's flag versions
+    use, still stores via StandardStMan); `getdminfo()` reports the
+    casacore SPEC (DEFAULTTILESHAPE, HYPERCUBES, IndexSize).
+
 ## [3.8.3] - 2026-09-21
 
 ### Fixed (found by the extensive core-tables test suite)

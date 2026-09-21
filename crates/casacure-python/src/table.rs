@@ -2250,6 +2250,28 @@ fn spec_to_dict(py: Python<'_>, spec: &core::DmSpec) -> PyResult<Py<PyAny>> {
                 d.set_item("DEFAULTCUBESHAPE", c.to_vec())?;
             }
         }
+        core::DmSpec::TiledShapeStMan {
+            default_tile_shape,
+            seqnr,
+            hypercubes,
+        } => {
+            d.set_item("MaxCacheSize", 0)?;
+            d.set_item("DEFAULTTILESHAPE", default_tile_shape.clone())?;
+            d.set_item("MAXIMUMCACHESIZE", 0)?;
+            let cubes = PyDict::new(py);
+            for (i, c) in hypercubes.iter().enumerate() {
+                let cd = PyDict::new(py);
+                cd.set_item("CubeShape", c.cube_shape.clone())?;
+                cd.set_item("TileShape", c.tile_shape.clone())?;
+                cd.set_item("CellShape", c.cell_shape.clone())?;
+                cd.set_item("BucketSize", c.bucket_size)?;
+                cd.set_item("ID", PyDict::new(py))?;
+                cubes.set_item(format!("*{}", i + 1), cd)?;
+            }
+            d.set_item("HYPERCUBES", cubes)?;
+            d.set_item("SEQNR", seqnr)?;
+            d.set_item("IndexSize", hypercubes.len())?;
+        }
         core::DmSpec::Unsupported(s) => {
             d.set_item("SPEC", s)?;
         }
