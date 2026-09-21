@@ -323,6 +323,30 @@ def test_getcolnp_fills_buffer(tmp_path):
     t.close()
 
 
+@pytest.mark.parametrize(
+    "vt,dtype", [("complex", "complex64"), ("dcomplex", "complex128"),
+                 ("double", "float64"), ("float", "float32"),
+                 ("int", "int32"), ("int64", "int64"),
+                 ("bool", "bool")], ids=["complex", "dcomplex", "double", "float", "int", "int64", "bool"])
+def test_getcolnp_array_matches_getcol(tmp_path, vt, dtype):
+    """The typed-buffer getcolnp path (StandardStMan array columns) must
+    agree exactly with getcol for the same rows."""
+    p = str(tmp_path / "t.tab")
+    t = table(p, _array_desc("A", vt, [2, 3]), 4)
+    data = _array_data(24, dtype).reshape(4, 2, 3)
+    t.putcol("A", data)
+    expect = np.asarray(t.getcol("A"))
+    buf = np.empty((4, 2, 3), dtype=dtype)
+    t.getcolnp("A", buf)
+    assert buf.dtype == expect.dtype
+    assert np.array_equal(buf, expect), f"{vt}: typed getcolnp != getcol"
+    # a row-range chunk through the typed path too
+    sub = np.empty((2, 2, 3), dtype=dtype)
+    t.getcolnp("A", sub, startrow=1, nrow=2)
+    assert np.array_equal(sub, expect[1:3]), f"{vt}: range mismatch"
+    t.close()
+
+
 # ---------------------------------------------------------------------------
 # Table and column keywords round-trip, including after reopen.
 # ---------------------------------------------------------------------------

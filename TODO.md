@@ -32,6 +32,7 @@ Work areas follow `CASACORE_TO_CASA_RS.md` (tracked as GitHub issues).
 - [X] Multidim string columns as `{"shape", "array"}` dicts (strings returned as `RecordValue::String`; the dict shape is the pyo3 layer)
 - [X] Accept numpy object arrays directly in `putcol` (no segfault wart) — the Rust layer takes `RecordValue`s; the wart is a python-casacore segfault, absent by construction; binding-side conversion is pyo3-layer work
 - [X] `addrows`, `setmaxcachesize` (no-op) — via `WritableTable` (addrows + putcol + flush); `setmaxcachesize` is a no-op
+- [X] **Typed-buffer `getcolnp` (SSM numeric path) + mid-read page dropping** — decode StandardStMan scalar/array numeric cells straight from the mapped data file into the caller's numpy buffer, skipping the per-cell `Vec<RecordValue>`/`ArrayData` intermediate, and drop the mapped pages during a long read, so a single whole-column read holds ~the result buffer only (chunk=all peak 3.2 → 2.2 GiB, at casacore parity) and chunked reads are faster. ISM/TSM/strings/records keep the existing path. See `MEMORY.md`
 
 ## 4. Metadata and descriptors
 

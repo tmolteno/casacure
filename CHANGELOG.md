@@ -61,6 +61,20 @@ subtasks are moved here.
   at a 1000-row chunk (casacore: 136 MiB) and to 425 MiB at 25 000 rows.
   Small/random reads (< 512 rows) keep the page cache. Mechanism and
   trade-offs are documented in `MEMORY.md`.
+- **Typed-buffer `getcolnp` (read path matches casacore memory).** A read
+  handle over a StandardStMan numeric column (scalar or fixed-shape array,
+  incl. bit-packed bool) now decodes cells straight from the mapped data
+  file into the caller's numpy buffer (`Table::getcol_raw` +
+  `array_cell_region`/`scalar_cell_raw`, borrowed slices, with the mapped
+  pages dropped as a long scan advances) — no per-cell `Vec<RecordValue>`/
+  `ArrayData` intermediate. Measured on the 977 MiB benchmark MS: a single
+  whole-column `getcolnp` (`chunk = all`) dropped 3.2 → 2.2 GiB, **at
+  casacore parity** (2209 vs 2202 MiB), and all chunked sizes are at parity
+  too (1163/327/164/164 vs 1163/331/165/136). Dask-ms reads via `getcolnp`,
+  so real workloads now hold ~1 result buffer + a read window. Strings,
+  records, ISM/TSM and variable-shape arrays keep the generic path. Added
+  `test_getcolnp_array_matches_getcol` (typed path vs `getcol` across
+  dtypes) as a regression test.
 - **SSM array-cell decode is no longer per-element.** `read_array_cell`
   decoded every element through the `aipsio::Reader` (bounds checks per
   call, ~20 % of a chunked read's CPU). It now decodes the element region in

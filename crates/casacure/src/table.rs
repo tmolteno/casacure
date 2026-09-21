@@ -1016,6 +1016,8 @@ pub enum TableReadError {
     RowOutOfRange { row: u64, column: String },
     #[error("slice {0:?}..{1:?} does not fit the cell shape {2:?}")]
     BadSlice(Vec<i64>, Vec<i64>, Vec<u32>),
+    #[error("column {name} cannot be served by the raw (borrowed-buffer) read path: {reason}")]
+    UnsupportedRaw { name: String, reason: String },
     #[error(transparent)]
     Ssm(#[from] crate::ssm::SsmError),
     #[error(transparent)]
@@ -1132,6 +1134,96 @@ impl Table {
     /// (see [`Table::drop_data_file_pages`]); smaller reads keep the page
     /// cache for random access.
     const STREAMING_DROP_ROWS: u64 = 512;
+
+    /// True when a `getcolnp` into a caller numpy buffer can be served by
+    /// [`Table::getcol_raw`]: a StandardStMan numeric column (scalar or
+    /// fixed-shape array). Strings/records, ISM and TSM, and variable-shape
+    /// arrays keep the generic `RecordValue` path.
+    pub fn raw_column_supported(&self, col_idx: usize) -> bool {
+        use crate::record::DataType as DT;
+        let Some(desc) = self.dat.desc.columns.get(col_idx) else {
+            return false;
+        };
+        if matches!(
+            desc.data_type,
+            DT::String | DT::Table | DT::Record | DT::Char
+        ) {
+            return false;
+        }
+        if matches!(desc.kind, crate::tabledesc::ColumnKind::Array) {
+            // Variable-shape arrays: per-row element counts differ, so the
+            // fixed-count precheck the caller needs cannot be satisfied.
+            match &desc.shape {
+                Some(s) if s.is_empty() => return false,
+                None => return false,
+                _ => {}
+            }
+        }
+        desc.data_manager_type == "StandardStMan"
+    }
+
+    /// Read `nrow` cells of `col_idx` starting at `startrow`, calling
+    /// `visit(logical_shape, element_bytes)` once per row with the raw
+    /// element bytes **borrowed from the mapped data file** (no per-cell
+    /// allocation). Numeric StandardStMan cells only (see
+    /// [`Table::raw_column_supported`]). Long reads drop the mapped data
+    /// pages as they go, so a whole-column read into a caller buffer stays
+    /// resident at ~a window of the file, not the whole file.
+    pub fn getcol_raw<'a, F>(
+        &'a self,
+        col_idx: usize,
+        startrow: u64,
+        nrow: u64,
+        mut visit: F,
+    ) -> Result<(), TableReadError>
+    where
+        F: FnMut(&[u32], &'a [u8]) -> Result<(), TableReadError>,
+    {
+        use crate::tabledesc::ColumnKind;
+        let desc = &self.dat.desc.columns[col_idx];
+        let (seq, within) = self.column_manager(col_idx);
+        let mut done = 0u64;
+        for r in startrow..startrow + nrow {
+            match desc.data_manager_type.as_str() {
+                "StandardStMan" => {
+                    let file =
+                        self.ssm_file(seq)
+                            .ok_or_else(|| TableReadError::UnsupportedRaw {
+                                name: desc.name.clone(),
+                                reason: "no StandardStMan file".into(),
+                            })?;
+                    let spec =
+                        self.ssm_spec(seq)
+                            .ok_or_else(|| TableReadError::UnsupportedRaw {
+                                name: desc.name.clone(),
+                                reason: "no StandardStMan spec".into(),
+                            })?;
+                    if matches!(desc.kind, ColumnKind::Array) {
+                        let (shape, _nelem, bytes) =
+                            file.array_cell_region(spec, within, desc, r)?;
+                        visit(&shape, bytes)?;
+                    } else {
+                        let bytes = file.scalar_cell_raw(spec, within, desc, r)?;
+                        visit(&[], bytes)?;
+                    }
+                }
+                other => {
+                    return Err(TableReadError::UnsupportedRaw {
+                        name: desc.name.clone(),
+                        reason: format!("{other} data manager"),
+                    })
+                }
+            }
+            done += 1;
+            if done.is_multiple_of(4096) {
+                self.drop_data_file_pages();
+            }
+        }
+        if nrow >= Self::STREAMING_DROP_ROWS {
+            self.drop_data_file_pages();
+        }
+        Ok(())
+    }
 
     /// Read `nrow` cells starting at `startrow` (`table.getcol` /
     /// `getcolnp`).

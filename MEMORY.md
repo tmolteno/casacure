@@ -26,20 +26,19 @@ config per fresh subprocess so `ru_maxrss` is exact).
 
 **Full pass** (every row read), peak RSS:
 
-| chunk (rows) | casacure now | casacure before drop | casacore |
-|---|---|---|---|
-| all (250k) | 3197 MiB | 4185 MiB | 2202 MiB |
-| 125 000 | 1658 MiB | 2643 MiB | 1163 MiB |
-| 25 000 | 425 MiB | 1411 MiB | 331 MiB |
-| 5 000 | 180 MiB | 1166 MiB | 165 MiB |
-| 1 000 | 164 MiB | 1121 MiB | 136 MiB |
+| chunk (rows) | casacure now | casacure typed-buffer | casacure before typed | casacore |
+|---|---|---|---|---|
+| all (250k) | 2209 MiB | 2209 MiB | 3197 MiB | 2202 MiB |
+| 125 000 | 1163 MiB | 1163 MiB | 2643 MiB | 1163 MiB |
+| 25 000 | 327 MiB | 327 MiB | 1411 MiB | 331 MiB |
+| 5 000 | 164 MiB | 164 MiB | 1166 MiB | 165 MiB |
+| 1 000 | 164 MiB | 164 MiB | 1121 MiB | 136 MiB |
 
-Chunked full-column passes now sit at **casacore parity** (164 vs 136 MiB at
-a 1000-row chunk ≈ the Python/dask-ms stack baseline). The remaining gap at
-`chunk = all` is the single whole-column read materialising the full result
-(per-cell `RecordValue` decode + the numpy buffer) inside one call — the
-same call shape costs casacore 2.2 GiB; the "deeper typed-buffer getcolnp"
-would close it.
+casacure is now at **casacore parity across the board**, including the
+single whole-column read (`chunk = all`, where the pre-typed path held a
+third full-size buffer: the per-cell `Vec<RecordValue>` decode). Chunked
+full-column passes sit at the ~Python/dask-ms stack baseline in both
+engines.
 
 **Bounded read** (a 10k-row window = 39 MiB, and 100k = 391 MiB, read at
 1000/10000-row chunks), peak RSS:
@@ -58,7 +57,8 @@ column size.
 |---|---|
 | eager `fs::read` per open | every open copied the whole data file into RAM; a 1000-row chunk of a 1 GiB column cost ~6 GiB RSS |
 | `memmap2` mapping | open is O(1); chunked reads touch only their pages; a *full* pass left the file resident (~1× column, 1.1 GiB floor) |
-| **+ `MADV_DONTNEED` on bulk reads** | full pass streams at ~the working set (164 MiB), no whole-file floor |
+| + `MADV_DONTNEED` on bulk reads | full pass streams at ~the working set (164 MiB), no whole-file floor |
+| **+ typed-buffer `getcolnp`** | SSM numeric cells decode straight from the map into the numpy buffer (no per-cell `Vec<RecordValue>`), so a single whole-column read holds ~1 full buffer + the read window (2.2 GiB, casacore parity) |
 
 ## How it works
 
@@ -74,6 +74,14 @@ in-memory / tests) or `Mapped(memmap2::Mmap)`.
   already copied into `Vec<RecordValue>` / the numpy buffer, so the pages are
   clean and re-fault from disk on the next read — no data loss, just page
   cache eviction.
+- **Typed-buffer `getcolnp`:** for a read handle over a StandardStMan
+  numeric column, `getcolnp` no longer materialises a `Vec<RecordValue>`.
+  `Table::getcol_raw` walks the mapped cells (`array_cell_region` /
+  `scalar_cell_raw`, borrowed slices, no copy) and the pyo3 layer fills the
+  caller's numpy buffer cell-by-cell (`fill_numpy_raw`), also dropping mapped
+  pages as a long scan advances. Scalar/array bool (bit-packed) is handled;
+  strings, records, ISM and TSM, and variable-shape arrays keep the generic
+  path.
 - A read handle stays an open snapshot (documented): a concurrent flush
   rewrites the file, so a stale handle reads its own captured state.
 
@@ -89,9 +97,10 @@ in-memory / tests) or `Mapped(memmap2::Mmap)`.
   process mapping the same table may re-fault the evicted pages (correct,
   just I/O). Write handles read from the in-memory store, so they are
   unaffected.
-- **`chunk = all` still materialises a whole-column `getcol`** inside one
-  call (~3.2 GiB here vs casacore's 2.2 GiB); chunking avoids this, which is
-  the dask-ms contract.
+- **`chunk = all` (a single whole-column `getcolnp`) is at casacore parity**
+  (2.2 GiB): the typed path holds ~1 full buffer plus a read window. The
+  generic (non-raw) `getcol` still materialises per-cell values (~3.2 GiB
+  for this column); dask-ms uses `getcolnp`, which is the typed path.
 - The knob is a compile-time policy, not configurable at runtime.
 
 ## Reproduce

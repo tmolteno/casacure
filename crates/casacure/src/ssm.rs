@@ -380,6 +380,124 @@ impl StandardStManFile {
     }
 }
 
+/// Locate one array cell's element region in the array index file,
+/// returning the logical (row-major) shape, element count, and the raw
+/// element bytes **borrowed from the mapped index file** (no copy). Numeric
+/// cells only; string array cells are served by `read_array_cell`.
+impl StandardStManFile {
+    /// Raw bytes of one numeric scalar cell (borrowed from the mapped data
+    /// file), for the typed-buffer `getcolnp` path. String cells are not
+    /// served (their cell carries a bucket reference, not the value).
+    pub fn scalar_cell_raw<'a>(
+        &'a self,
+        spec: &crate::columnset::StandardStMan,
+        col_idx: usize,
+        desc: &ColumnDesc,
+        row: u64,
+    ) -> Result<&'a [u8], SsmError> {
+        let index_nr = spec
+            .col_index_map
+            .get(col_idx)
+            .copied()
+            .ok_or(SsmError::IndexMissing {
+                index: col_idx,
+                count: spec.col_index_map.len(),
+            })? as usize;
+        let column_offset = spec
+            .column_offset
+            .get(col_idx)
+            .ok_or(SsmError::IndexMissing {
+                index: col_idx,
+                count: spec.column_offset.len(),
+            })?;
+        self.cell_bytes(index_nr, *column_offset, row, scalar_cell_size(desc))
+    }
+
+    pub fn array_cell_region<'a>(
+        &'a self,
+        spec: &crate::columnset::StandardStMan,
+        col_idx: usize,
+        desc: &ColumnDesc,
+        row: u64,
+    ) -> Result<(Vec<u32>, usize, &'a [u8]), SsmError> {
+        let index_nr = spec
+            .col_index_map
+            .get(col_idx)
+            .copied()
+            .ok_or(SsmError::IndexMissing {
+                index: col_idx,
+                count: spec.col_index_map.len(),
+            })? as usize;
+        let column_offset = spec
+            .column_offset
+            .get(col_idx)
+            .ok_or(SsmError::IndexMissing {
+                index: col_idx,
+                count: spec.column_offset.len(),
+            })?;
+        let cell = self.cell_bytes(index_nr, *column_offset, row, ARRAY_REF_SIZE)?;
+        let offset = if self.header.big_endian {
+            i64::from_be_bytes(cell[0..8].try_into().unwrap())
+        } else {
+            i64::from_le_bytes(cell[0..8].try_into().unwrap())
+        };
+        let f0i = self
+            .f0i
+            .as_deref()
+            .ok_or_else(|| SsmError::MissingArrayFile(desc.name.clone(), "table.f0i".into()))?;
+        let off = usize::try_from(offset).map_err(|_| SsmError::BadArrayRef {
+            offset,
+            len: f0i.len(),
+        })?;
+        if off >= f0i.len() {
+            return Err(SsmError::BadArrayRef {
+                offset,
+                len: f0i.len(),
+            });
+        }
+        let version = u32_from(f0i, 0, self.header.big_endian);
+        let mut p = off;
+        if version > 0 {
+            let _ref_count = u32_at(f0i, p, self.header.big_endian)?;
+            p += 4;
+        }
+        let ndim = u32_at(f0i, p, self.header.big_endian)? as usize;
+        p += 4;
+        let mut casa_dims: Vec<u32> = Vec::with_capacity(ndim);
+        for _ in 0..ndim {
+            let d = u32_at(f0i, p, self.header.big_endian)?;
+            p += 4;
+            casa_dims.push(d);
+        }
+        let logical: Vec<u32> = casa_dims.iter().rev().copied().collect();
+        let nelem: usize = casa_dims.iter().map(|&d| d as usize).product();
+        let region_size = if desc.data_type == DataType::Bool {
+            nelem.div_ceil(8)
+        } else {
+            nelem
+                .checked_mul(array_elem_size(desc.data_type))
+                .ok_or(SsmError::BadArrayRef {
+                    offset,
+                    len: f0i.len(),
+                })?
+        };
+        let data_start = p;
+        let data_end = data_start
+            .checked_add(region_size)
+            .ok_or(SsmError::BadArrayRef {
+                offset,
+                len: f0i.len(),
+            })?;
+        if data_end > f0i.len() {
+            return Err(SsmError::BadArrayRef {
+                offset,
+                len: f0i.len(),
+            });
+        }
+        Ok((logical, nelem, &f0i[data_start..data_end]))
+    }
+}
+
 /// Parse the header and bucket index of a StandardStMan data file (no data
 /// copy; the caller keeps the backing bytes).
 fn parse_meta(
@@ -514,63 +632,8 @@ pub fn read_array_cell(
         }));
     }
 
-    let f0i = file
-        .f0i
-        .as_deref()
-        .ok_or_else(|| SsmError::MissingArrayFile(desc.name.clone(), "table.f0i".into()))?;
-    let off = usize::try_from(offset).map_err(|_| SsmError::BadArrayRef {
-        offset,
-        len: f0i.len(),
-    })?;
-    if off >= f0i.len() {
-        return Err(SsmError::BadArrayRef {
-            offset,
-            len: f0i.len(),
-        });
-    }
-    let version = u32_from(f0i, 0, file.header.big_endian);
-    let mut p = off;
-    if version > 0 {
-        let _ref_count = u32_at(f0i, p, file.header.big_endian)?;
-        p += 4;
-    }
-    let ndim = u32_at(f0i, p, file.header.big_endian)? as usize;
-    p += 4;
-    let mut casa_dims: Vec<u32> = Vec::with_capacity(ndim);
-    for _ in 0..ndim {
-        let d = u32_at(f0i, p, file.header.big_endian)?;
-        p += 4;
-        casa_dims.push(d);
-    }
-    let logical: Vec<u32> = casa_dims.iter().rev().copied().collect();
-    let nelem: usize = casa_dims.iter().map(|&d| d as usize).product();
+    let (logical, nelem, data) = file.array_cell_region(spec, col_idx, desc, row)?;
     let elem = desc.data_type;
-    // StManArrayFile: Bool elements are bit-packed; others store one
-    // element per `array_elem_size` bytes.
-    let region_size = if elem == DataType::Bool {
-        nelem.div_ceil(8)
-    } else {
-        nelem
-            .checked_mul(array_elem_size(elem))
-            .ok_or(SsmError::BadArrayRef {
-                offset,
-                len: f0i.len(),
-            })?
-    };
-    let data_start = p;
-    let data_end = data_start
-        .checked_add(region_size)
-        .ok_or(SsmError::BadArrayRef {
-            offset,
-            len: f0i.len(),
-        })?;
-    if data_end > f0i.len() {
-        return Err(SsmError::BadArrayRef {
-            offset,
-            len: f0i.len(),
-        });
-    }
-    let data = &f0i[data_start..data_end];
     // Decode the fixed-size element region in one `chunks_exact` pass with
     // direct from_{le,be}_bytes conversion — no per-element aipsio Reader
     // overhead (the hot path for array-column getcol/getcolnp on an SSM).

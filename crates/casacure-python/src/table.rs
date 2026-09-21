@@ -271,6 +271,153 @@ fn record_fits_column(col: &core::tabledesc::ColumnDesc, v: &RecordValue) -> boo
     }
 }
 
+/// Typed-buffer `getcolnp` fill: decode a StandardStMan numeric column range
+/// straight from the mapped data file into the caller's numpy buffer — no
+/// per-cell `RecordValue`/`ArrayData` intermediate. Returns `Ok(false)` when
+/// `buf` is not a compatible, C-contiguous array of the column's type, so the
+/// caller falls back to the generic path.
+fn fill_numpy_raw(
+    t: &::casacure::Table,
+    col_idx: usize,
+    startrow: u64,
+    nrow: u64,
+    buf: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    let desc = &t.dat.desc.columns[col_idx];
+    let is_array = matches!(desc.kind, core::tabledesc::ColumnKind::Array);
+    let count = if is_array {
+        match &desc.shape {
+            Some(s) if !s.is_empty() => s.iter().rev().map(|&d| d.max(0) as usize).product(),
+            _ => return Ok(false), // variable-shape arrays keep the old path
+        }
+    } else {
+        1
+    };
+    let le = !t.dat.header.big_endian;
+
+    macro_rules! typed {
+        ($ty:ty, $from:expr) => {{
+            if let Ok(arr) = buf.cast::<numpy::PyArrayDyn<$ty>>() {
+                let mut rw = arr.readwrite();
+                let Ok(slice) = rw.as_slice_mut() else {
+                    return Ok(false);
+                };
+                if slice.len() as u64 != nrow * count as u64 {
+                    return Ok(false);
+                }
+                let mut row = 0usize;
+                t.getcol_raw(col_idx, startrow, nrow, |_, bytes| {
+                    let dst = &mut slice[row * count..(row + 1) * count];
+                    let sz = std::mem::size_of::<$ty>();
+                    for (i, b) in bytes.chunks_exact(sz).enumerate() {
+                        dst[i] = $from(b, le);
+                    }
+                    row += 1;
+                    Ok(())
+                })
+                .map_err(err)?;
+                return Ok(true);
+            } else {
+                return Ok(false); // buffer dtype/contiguity mismatch -> fallback
+            }
+        }};
+    }
+
+    if desc.data_type == DataType::Bool && is_array {
+        // Array bool cells are bit-packed in the array index file.
+        if let Ok(arr) = buf.cast::<numpy::PyArrayDyn<bool>>() {
+            let mut rw = arr.readwrite();
+            let Ok(slice) = rw.as_slice_mut() else {
+                return Ok(false);
+            };
+            if slice.len() as u64 != nrow * count as u64 {
+                return Ok(false);
+            }
+            let mut row = 0usize;
+            t.getcol_raw(col_idx, startrow, nrow, |_, bytes| {
+                let dst = &mut slice[row * count..(row + 1) * count];
+                for i in 0..count {
+                    dst[i] = (bytes[i / 8] >> (i % 8)) & 1 != 0;
+                }
+                row += 1;
+                Ok(())
+            })
+            .map_err(err)?;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+
+    match desc.data_type {
+        DataType::Bool => typed!(bool, |b: &[u8], _le: bool| b[0] != 0),
+        DataType::UChar => typed!(u8, |b: &[u8], _le: bool| b[0]),
+        DataType::Short => typed!(i16, |b: &[u8], le: bool| if le {
+            i16::from_le_bytes(b.try_into().unwrap())
+        } else {
+            i16::from_be_bytes(b.try_into().unwrap())
+        }),
+        DataType::UShort => typed!(u16, |b: &[u8], le: bool| if le {
+            u16::from_le_bytes(b.try_into().unwrap())
+        } else {
+            u16::from_be_bytes(b.try_into().unwrap())
+        }),
+        DataType::Int => typed!(i32, |b: &[u8], le: bool| if le {
+            i32::from_le_bytes(b.try_into().unwrap())
+        } else {
+            i32::from_be_bytes(b.try_into().unwrap())
+        }),
+        DataType::UInt => typed!(u32, |b: &[u8], le: bool| if le {
+            u32::from_le_bytes(b.try_into().unwrap())
+        } else {
+            u32::from_be_bytes(b.try_into().unwrap())
+        }),
+        DataType::Int64 => typed!(i64, |b: &[u8], le: bool| if le {
+            i64::from_le_bytes(b.try_into().unwrap())
+        } else {
+            i64::from_be_bytes(b.try_into().unwrap())
+        }),
+        DataType::Float => typed!(f32, |b: &[u8], le: bool| if le {
+            f32::from_le_bytes(b.try_into().unwrap())
+        } else {
+            f32::from_be_bytes(b.try_into().unwrap())
+        }),
+        DataType::Double => typed!(f64, |b: &[u8], le: bool| if le {
+            f64::from_le_bytes(b.try_into().unwrap())
+        } else {
+            f64::from_be_bytes(b.try_into().unwrap())
+        }),
+        DataType::Complex => typed!(numpy::Complex32, |b: &[u8], le: bool| {
+            let (re, im) = if le {
+                (
+                    f32::from_le_bytes(b[0..4].try_into().unwrap()),
+                    f32::from_le_bytes(b[4..8].try_into().unwrap()),
+                )
+            } else {
+                (
+                    f32::from_be_bytes(b[0..4].try_into().unwrap()),
+                    f32::from_be_bytes(b[4..8].try_into().unwrap()),
+                )
+            };
+            numpy::Complex32::new(re, im)
+        }),
+        DataType::DComplex => typed!(numpy::Complex64, |b: &[u8], le: bool| {
+            let (re, im) = if le {
+                (
+                    f64::from_le_bytes(b[0..8].try_into().unwrap()),
+                    f64::from_le_bytes(b[8..16].try_into().unwrap()),
+                )
+            } else {
+                (
+                    f64::from_be_bytes(b[0..8].try_into().unwrap()),
+                    f64::from_be_bytes(b[8..16].try_into().unwrap()),
+                )
+            };
+            numpy::Complex64::new(re, im)
+        }),
+        _ => Ok(false),
+    }
+}
+
 impl Table {
     /// Open or create a table; `desc_json` is the python-casacore table-desc
     /// dict (creates when given) and `nrow` its initial row count.
@@ -990,6 +1137,19 @@ impl Table {
             nrow as u64
         };
         let col_idx = self.col_index(column)?;
+        // Typed-buffer fast path: for a read handle over a StandardStMan
+        // numeric column, decode each cell straight from the mapped data
+        // file into `buf` — no per-cell `RecordValue`/`ArrayData` Vec. This
+        // holds only the numpy result buffer plus a small read window
+        // (mapped pages are dropped as the scan progresses) instead of the
+        // result buffer + a full per-cell copy + the whole mapped file.
+        let inner = self.inner.lock().unwrap();
+        if let Inner::Read(t) = &*inner {
+            if t.raw_column_supported(col_idx) && fill_numpy_raw(t, col_idx, startrow, nrow, buf)? {
+                return Ok(());
+            }
+        }
+        drop(inner);
         let cells = self.read_col(col_idx, startrow, nrow)?;
         let cell = cell_shape_of(&cells).iter().product::<usize>().max(1);
         convert::fill_buffer_by_dtype(buf, &cells, cell)
