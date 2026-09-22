@@ -232,19 +232,39 @@ print(np.asarray(sw.getcol("CHAN_FREQ")).shape)   # -> (1,)   (WRITE handle)
 sw2 = table("data/bpcal.ms/SPECTRAL_WINDOW", readonly=True, ack=False)
 print(np.asarray(sw2.getcol("CHAN_FREQ")).shape)  # -> (1,79) (READ handle)
 ```
-Lead: the writable open (`open_or_update` snapshot in `casacure-python/src/table.rs`) serves
-the SSM array-column read with an empty-shaped cell; compare the snapshot's data-manager state
-vs a fresh read-only open (the `lock_sync_nrrow` nrow override is active in both). This is the
-original `probe_spw_shape.py` / `DBG init` debugging topic — unresolved. Chasing it is a
-separate task from the perf work.
+This was FIXED (commit 51afb43): read merges on writable handles overlaid every
+`addrows` default cell (a `Some(default)` is NOT a written row) — reads now overlay only
+rows with the pending bit set (`WritableTable::pending_cell`). The same commit made
+`getcolnp`'s borrowed-buffer path (`fill_numpy_raw`) fall back to the generic path for any
+column whose DM is not StandardStMan (resolved by sequence number, not list index), which
+fixed the summary-step aborts (`INTERVAL` / `FIELD_ID` / `TIME_CENTROID` are IncrementalStMan /
+TSM on this MS).
+
+**After the abort fix the workload completes** (rc=0): **~46 s / ~2.2 GiB** (3 runs stable)
+vs casacore 5.4 s / 0.54 GiB. FLAG_ROW bit-identical; **FLAG still differs 29.9 %** — isolated:
+
+- casacure's and casacore's READ of the input FLAG are element-wise IDENTICAL (verified).
+- The OUTPUT's non-autos FLAG rows are corrupted: rows in tiles ≥ 1 are the expected
+  content **shifted by 4 bits** (`out == expected << 4` for rows with 1-bits near the wrap;
+  62 % of rows differ, none in tile 0). The output MS uses **829 rows/tile**
+  (casacore's TiledShapeStMan option copied through by dask-ms: cube [2,79,429257],
+  tile [2,79,829]; tile_bits=130982, 6 pad bits) — while casacure's writer/patcher geometry
+  (`tsm_layout`) assumes 26214 rows/tile (4141812 bits = 4 bits over a byte).
+- This is the pre-existing bit-packed-Bool tile-boundary bug (the session's original
+  debugging topic): the READ path now matches casacore (incl. multi-tile), but the WRITE
+  path (write_tsm_file_bool / patch_tsm_column byte-bucket placement for an externally
+  supplied tile shape) is still wrong for tiles ≥ 1 on this MS's geometry. Fix direction:
+  honor the tile shape/padding from the header/TSM option (rows_per_tile + bucket_bytes
+  from `cube.tile_shape`, not `tsm_layout`), in both the full writer and `patch_tsm_column`.
 
 ## Next actions (if interrupted, resume here)
 
-1. Fix the write-handle SPW read (repro above): make the `open_for_update` snapshot serve
-   SSM array-column cells identically to a read-only open (or fix `read_col` merge to read the
-   read-only snapshot directly for array columns). Then the workload completes.
-2. Re-measure A+B cleanly: `./run_local.sh casacure changed` (expect ~2.5 s / ~1.3 GiB) +
-   `compare_flags.py` PARITY OK (one run already verified bit-identical at 2.26 s).
+1. **Fix the bool TSM tile-boundary write** (the 29.9 % FLAG parity gap): derive
+   `rows_per_tile`/bucket geometry from the parsed header (829 on this MS), not
+   `tsm_layout`'s hard 26214, in `write_tsm_file`/`write_tsm_file_bool` and
+   `patch_tsm_column`. Then re-run `out_ok*` parity → expect FLAG bit-identical.
+2. Re-measure A+B cleanly: `./run_local.sh casacure changed` (write phase ~2.5 s; full run
+   with summary ~46 s) + `compare_flags.py` PARITY OK.
 3. (Later) remove the uncommitted `DBG init` print in `skarabina/dask_ms.py`; the full-write /
    freqavg-8 path is a separate slow-write lead.
 
