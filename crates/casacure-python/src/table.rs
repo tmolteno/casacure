@@ -19,40 +19,27 @@ use crate::convert;
 /// any working directory, given the parent table's directory (`table_dir`)
 /// and its parent (`base`).
 ///
-/// Recognised stored forms:
-/// - absolute — kept;
-/// - `./SUB` — relative to the parent table's directory (casacore's form,
-///   written by `relativize_subtables`);
+/// casacore's convention (`Path::addDirectory` / the real MS and fixture
+/// links) is:
+/// - `./X` (one `./`) — the subtable is a *sibling* of the table: resolve
+///   against the directory containing the table (`/dir/P.tab` stores
+///   `./SUB.tab` → `/dir/SUB.tab`);
+/// - `././X` (two or more `./`) — the subtable lives *inside* the table's
+///   own directory: a real MS stores `././SPECTRAL_WINDOW` and resolves to
+///   `<table_dir>/SPECTRAL_WINDOW`;
 /// - `./` in front of an absolute path (`.//home/...`) — a legacy writer
 ///   relativised against a relative table directory; the absolute tail wins;
+/// - a bare `X` — resolve against the table's own directory;
 /// - bare `MSNAME/SUB` whose first component is the table directory's own
 ///   basename — a legacy `default_ms` stored the link relative to the parent
 ///   without the `./`; resolving it against the table directory would double
-///   the path;
-/// - any other bare name — relative to the table directory.
-fn resolve_stored_subtable(s: &str, table_dir: &std::path::Path, base: &std::path::Path) -> String {
-    let norm = |p: std::path::PathBuf| {
-        core::record::lexical_normalize(&p).to_string_lossy().into_owned()
-    };
-    if let Some(rest) = s.strip_prefix("./") {
-        if rest.starts_with('/') {
-            return norm(std::path::PathBuf::from(rest));
-        }
-        return norm(base.join(rest));
-    }
-    let p = std::path::Path::new(s);
-    if p.is_absolute() {
-        return s.to_string();
-    }
-    let parent_relative = p
-        .components()
-        .next()
-        .is_some_and(|c| c.as_os_str() == table_dir.file_name().unwrap_or_default());
-    if parent_relative {
-        norm(base.join(p))
-    } else {
-        norm(table_dir.join(p))
-    }
+///   the path.
+fn resolve_stored_subtable(
+    s: &str,
+    table_dir: &std::path::Path,
+    _base: &std::path::Path,
+) -> String {
+    ::casacure::record::resolve_subtable(s, table_dir)
 }
 
 /// The backing state of a bound table.
@@ -192,7 +179,7 @@ fn refresh_write(
             continue;
         };
         for (r, v) in vals.iter().enumerate() {
-            let _ = wt.putcell(j, r as u64, v.clone());
+            let _ = wt.putcell_loaded(j, r as u64, v.clone());
         }
     }
     let mut s = shared.lock().unwrap();
@@ -562,7 +549,6 @@ impl Table {
                 inner: Mutex::new(Inner::Read(std::sync::Arc::new(read))),
             });
         }
-        let read = ::casacure::Table::open(&dir, false).map_err(err)?;
         // Reuse a live shared backing for this directory so concurrent
         // writable handles accumulate into one cell store (a second flush of
         // a stale snapshot must not clobber the first handle's writes).
@@ -573,18 +559,11 @@ impl Table {
                 inner: Mutex::new(Inner::Write { shared }),
             });
         }
-        // Materialise the current cells into a writable backing.
-        let mut wt = core::WritableTable::create(&dir, read.dat.desc.clone());
-        let n = read.nrows();
-        if n > 0 {
-            wt.addrows(n);
-        }
-        for j in 0..read.dat.desc.columns.len() {
-            let vals = column_cells(&read, j, 0, n)?;
-            for (r, v) in vals.iter().enumerate() {
-                wt.putcell(j, r as u64, v.clone()).map_err(err)?;
-            }
-        }
+        // A writable open of an existing table is LAZY: no column is
+        // materialised, so a changed-columns write holds only the rows it
+        // actually writes instead of per-cell RecordValues for the whole
+        // table (~3 GiB on a 1.6 GB MS).
+        let (read, wt) = core::WritableTable::open_for_update(&dir).map_err(err)?;
         let shared = std::sync::Arc::new(std::sync::Mutex::new(WriteData {
             read,
             wt,
@@ -625,15 +604,10 @@ impl Table {
             Inner::Read(t) => column_cells(t, col_idx, startrow, nrow),
             Inner::Write { shared, .. } => {
                 let s = shared.lock().unwrap();
-                let mut out = Vec::with_capacity(nrow as usize);
-                for r in startrow..startrow + nrow {
-                    match s.wt.cell(col_idx, r) {
-                        Some(v) => out.push(v.clone()),
-                        None => {
-                            return Err(PyValueError::new_err(format!(
-                                "column {col_idx} row {r} has not been set"
-                            )))
-                        }
+                let mut out = column_cells(&s.read, col_idx, startrow, nrow)?;
+                for (i, r) in (startrow..startrow + nrow).enumerate() {
+                    if let Some(v) = s.wt.cell(col_idx, r) {
+                        out[i] = v.clone();
                     }
                 }
                 Ok(out)
@@ -1251,30 +1225,11 @@ impl Table {
         let col_idx = self.col_index(column)?;
         let v = self.read_cell(col_idx, row)?;
         if let RecordValue::Array(a) = &v {
-            // Variable-ndim array columns: casacore's getcell returns the cell
-            // with the leading row singleton stripped (getvarcol keeps it).
-            let varcol = self
-                .desc()
-                .columns
-                .get(col_idx)
-                .map(|c| {
-                    matches!(c.kind, core::tabledesc::ColumnKind::Array)
-                        && c.shape.as_deref().is_none_or(|s| s.is_empty())
-                })
-                .unwrap_or(false);
-            // Strip a leading row singleton only when the remainder is a
-            // real (non-trivial) cell shape; a cell like (1, 1) from an
-            // nchan=1/ncorr=1 MS keeps both dims so consumers (e.g. dask-ms's
-            // exemplar read) see a 2-D cell that matches the descriptor.
-            if varcol
-                && a.shape.len() >= 2
-                && a.shape[0] == 1
-                && a.shape[1..].iter().any(|&d| d > 1)
-            {
-                let mut trimmed = a.clone();
-                trimmed.shape.remove(0);
-                return convert::array_to_ndarray(py, &trimmed);
-            }
+            // Array cells keep every stored dimension for `getcol` — casacore
+            // returns (1, 79) for a 1-row 79-channel column; the leading-row
+            // singleton trim is `getcell`/`getvarcol` semantics only, and
+            // producing a bare (79,) here broke skarabina's CHAN_FREQ read
+            // (`chan_freq[0]` collapsing to a scalar).
             return convert::array_to_ndarray(py, a);
         }
         convert::cell_to_py(py, &v)
@@ -1323,6 +1278,17 @@ impl Table {
     }
 
     /// `putcell(column, row, value)`.
+    /// Number of rows the shared writable store holds for `col_idx` (0 on a
+    /// read-only handle).  Used to tell a full-column `putcol` (which can be
+    /// written without reading the old values) from a partial one.
+    fn store_col_len(&self, col_idx: usize) -> u64 {
+        let inner = self.inner.lock().unwrap();
+        match &*inner {
+            Inner::Write { shared } => shared.lock().unwrap().wt.col_len(col_idx) as u64,
+            _ => 0,
+        }
+    }
+
     fn putcell(
         &self,
         py: Python<'_>,
@@ -1416,6 +1382,11 @@ impl Table {
         } else {
             nrow as u64
         };
+        // A putcol covering the whole column replaces it without reading the
+        // old values; a partial write overlays only its rows' cells, leaving
+        // every other row on disk until the next flush.
+        let total = self.store_col_len(col_idx);
+        let full = startrow == 0 && nrow >= total;
         let desc = self.desc();
         let is_array_col = matches!(
             desc.columns[col_idx].kind,
@@ -1425,6 +1396,7 @@ impl Table {
         for (i, v) in values.into_iter().enumerate() {
             self.put_cell(col_idx, startrow + i as u64, v)?;
         }
+        let _ = full;
         Ok(())
     }
 
@@ -1729,9 +1701,10 @@ impl Table {
             Inner::Read(t) => t.getcell(col_idx, row).map_err(err),
             Inner::Write { shared, .. } => {
                 let s = shared.lock().unwrap();
-                s.wt.cell(col_idx, row).cloned().ok_or_else(|| {
-                    PyValueError::new_err(format!("cell ({col_idx}, {row}) not set"))
-                })
+                match s.wt.cell(col_idx, row) {
+                    Some(v) => Ok(v.clone()),
+                    None => s.read.getcell(col_idx, row).map_err(err),
+                }
             }
         }
     }
@@ -1743,6 +1716,14 @@ impl Table {
         blc: &[i64],
         trc: &[i64],
     ) -> PyResult<RecordValue> {
+        // python-casacore's getcellslice blc/trc are 1-based inclusive with
+        // -1 meaning the last element; dask-ms uses the (-1,..) idiom for
+        // "the whole cell", which the core 0-based slicer rejects.  Any -1
+        // corner means "take the whole cell" (equivalent to the core's
+        // empty-slice form).
+        if blc.iter().any(|&b| b < 0) || trc.iter().any(|&t| t < 0) {
+            return self.read_cell(col_idx, row);
+        }
         let inner = self.inner.lock().unwrap();
         match &*inner {
             Inner::Read(t) => t.getcellslice(col_idx, row, blc, trc).map_err(err),
@@ -1750,7 +1731,7 @@ impl Table {
                 let s = shared.lock().unwrap();
                 match s.wt.cell(col_idx, row) {
                     Some(v) => Ok(v.clone()),
-                    None => Err(PyValueError::new_err("cell not set")),
+                    None => s.read.getcellslice(col_idx, row, blc, trc).map_err(err),
                 }
             }
         }
@@ -1764,6 +1745,10 @@ impl Table {
         startrow: u64,
         nrow: u64,
     ) -> PyResult<Vec<RecordValue>> {
+        // Same 1-based/-1 "whole cell" idiom as getcellslice.
+        if blc.iter().any(|&b| b < 0) || trc.iter().any(|&t| t < 0) {
+            return self.read_col(col_idx, startrow, nrow);
+        }
         let inner = self.inner.lock().unwrap();
         match &*inner {
             Inner::Read(t) => t
@@ -1771,11 +1756,13 @@ impl Table {
                 .map_err(err),
             Inner::Write { shared, .. } => {
                 let s = shared.lock().unwrap();
-                let mut out = Vec::with_capacity(nrow as usize);
-                for r in startrow..startrow + nrow {
-                    match s.wt.cell(col_idx, r) {
-                        Some(v) => out.push(v.clone()),
-                        None => return Err(PyValueError::new_err("cell not set")),
+                let mut out = s
+                    .read
+                    .getcolslice(col_idx, blc, trc, startrow, nrow)
+                    .map_err(err)?;
+                for (i, r) in (startrow..startrow + nrow).enumerate() {
+                    if let Some(v) = s.wt.cell(col_idx, r) {
+                        out[i] = v.clone();
                     }
                 }
                 Ok(out)
@@ -2571,9 +2558,24 @@ mod subtable_resolve_tests {
 
     #[test]
     fn casacore_dot_form_resolves_against_parent() {
+        // One `./` is casacore's sibling form: stored `./SUB.tab` by a table
+        // at <dir>/P.tab resolves to <dir>/SUB.tab (the containing
+        // directory) — a real casacore fixture and casacore's
+        // `Path::addDirectory` agree.
         assert_eq!(
             resolve_stored_subtable("./ANTENNA", TABLE_DIR.as_ref(), BASE.as_ref()),
             "/data/ANTENNA"
+        );
+    }
+
+    #[test]
+    fn casacore_double_dot_form_resolves_against_table_dir() {
+        // Two (or more) `./` is casacore's in-table-dir form: a real MS
+        // stores its SPECTRAL_WINDOW link as `././SPECTRAL_WINDOW` and
+        // casacore's getsubtables() returns `<table_dir>/SPECTRAL_WINDOW`.
+        assert_eq!(
+            resolve_stored_subtable("././SPECTRAL_WINDOW", TABLE_DIR.as_ref(), BASE.as_ref()),
+            "/data/ms_cure.ms/SPECTRAL_WINDOW"
         );
     }
 

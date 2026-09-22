@@ -893,9 +893,8 @@ impl RecordValue {
     }
 
     /// Like `to_json_string`, but resolves subtable (`TpTable`) fields to the
-    /// `"Table: <path>"` string python-casacore returns, joining a relative
-    /// stored path against `base` (the directory containing the parent
-    /// table).
+    /// `"Table: <path>"` string python-casacore returns, joining relative
+    /// stored paths against the parent table's own directory (`base`).
     pub fn to_json_string_ctx(&self, base: Option<&std::path::Path>) -> String {
         match self {
             RecordValue::Bool(b) => b.to_string(),
@@ -943,25 +942,65 @@ impl RecordValue {
     }
 }
 
-/// Resolve a stored subtable name against the directory containing the
-/// parent table, lexically (no filesystem access, matching casacore's
-/// dynamic resolution).
-fn resolve_subtable(name: &str, base: &std::path::Path) -> String {
-    // A writer that relativised against a relative table directory could
-    // store `./` in front of an absolute path (`.//home/...`); the absolute
-    // tail wins over the base.
-    if let Some(rest) = name.strip_prefix("./") {
+/// Resolve a stored subtable name against the parent table's own directory
+/// (`table_dir`, absolute), lexically (no filesystem access, matching
+/// casacore's dynamic resolution).  casacore's convention
+/// (`Path::addDirectory`, and the real MS + fixture links) is:
+///
+/// - `./X` (one `./`) — the subtable is a *sibling* of the table: resolve
+///   against the directory containing the table (`/dir/P.tab` stores
+///   `./SUB.tab` → `/dir/SUB.tab`);
+/// - `././X` (two or more `./`) — the subtable lives inside the table's own
+///   directory (`././SPECTRAL_WINDOW` → `<table_dir>/SPECTRAL_WINDOW`);
+/// - `./` in front of an absolute path (`.//home/...`) — a legacy writer;
+///   the absolute tail wins;
+/// - a bare `X` — resolve against the table's own directory;
+/// - a bare `MSNAME/SUB` whose first component is the table's own basename —
+///   a legacy `default_ms` form stored relative to the parent.
+#[allow(clippy::needless_return)]
+pub fn resolve_subtable(name: &str, table_dir: &std::path::Path) -> String {
+    let norm = |p: std::path::PathBuf| lexical_normalize(&p).display().to_string();
+    let mut rest = name;
+    let mut n_dots = 0;
+    while let Some(r) = rest.strip_prefix("./") {
+        rest = r;
+        n_dots += 1;
+    }
+    if n_dots > 0 {
+        // A writer that relativised against a relative table directory could
+        // store `./` in front of an absolute path (`.//home/...`); the
+        // absolute tail wins over any base.
         if rest.starts_with('/') {
-            return lexical_normalize(std::path::Path::new(rest)).display().to_string();
+            return lexical_normalize(std::path::Path::new(rest))
+                .display()
+                .to_string();
         }
+        let relative_to = if n_dots == 1 {
+            table_dir.parent().unwrap_or(std::path::Path::new("."))
+        } else {
+            table_dir
+        };
+        return norm(relative_to.join(rest));
     }
     let path = std::path::Path::new(name);
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
+    // Bare `MSNAME/SUB` whose first component is the table's own basename
+    // was stored by an old `default_ms` relative to the parent; resolving it
+    // against the table directory would double the path.
+    let parent_relative = path
+        .components()
+        .next()
+        .is_some_and(|c| c.as_os_str() == table_dir.file_name().unwrap_or_default());
+    let joined = if path.is_absolute() || parent_relative {
+        let base = table_dir.parent().unwrap_or(std::path::Path::new("."));
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            base.join(path)
+        }
     } else {
-        base.join(path)
+        table_dir.join(path)
     };
-    lexical_normalize(&joined).display().to_string()
+    norm(joined)
 }
 
 /// Strip `.` components and resolve `..` without touching the filesystem.

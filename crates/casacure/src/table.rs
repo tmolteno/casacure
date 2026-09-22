@@ -360,16 +360,18 @@ pub fn create_table(
                 data_files.push((dm as u32, file));
             }
             "TiledColumnStMan" | "TiledShapeStMan" => {
-                let (header, tile) =
-                    build_tsm_data(type_name, big_endian, dm as u32, dm_name, desc, values, &dm_cols)?;
+                let (header, tile, file_seq) = build_tsm_data(
+                    type_name, big_endian, dm as u32, dm_name, desc, values, &dm_cols,
+                )?;
                 dms.push(DmBlob {
                     type_name: type_name.clone(),
                     sequence_nr: dm as u32,
                     blob: Vec::new(), // TSM writes its spec to the header file
                 });
                 data_files.push((dm as u32, header));
-                // Tile data lives in `table.f{dm}_TSM0`.
-                tile_files.push((dm as u32, 0, tile));
+                // Tile data lives in `table.f{dm}_TSM{file_seq}` (TiledShapeStMan
+                // numbers its first real tile file 1).
+                tile_files.push((dm as u32, file_seq, tile));
             }
             other => {
                 return Err(TableCreateError::Io(std::io::Error::other(format!(
@@ -726,7 +728,7 @@ fn build_tsm_data(
     desc: &crate::tabledesc::TableDesc,
     values: &[Vec<crate::record::RecordValue>],
     dm_cols: &[usize],
-) -> Result<(Vec<u8>, Vec<u8>), TableCreateError> {
+) -> Result<(Vec<u8>, Vec<u8>, u32), TableCreateError> {
     use crate::record::RecordValue;
     if dm_cols.len() != 1 {
         return Err(TableCreateError::Io(std::io::Error::other(format!(
@@ -736,12 +738,67 @@ fn build_tsm_data(
     }
     let col = dm_cols[0];
     let cd = &desc.columns[col];
-    let cradle = cd.shape.clone().ok_or_else(|| {
-        TableCreateError::NotScalar(format!(
-            "{}.{}: {stman_type} needs a fixed-shape array column",
-            desc.name, cd.name
-        ))
-    })?;
+    // The per-row cell shape in CASA (reversed logical) dim order.  A
+    // TiledShapeStMan column (e.g. an MS FLAG column) carries no fixed shape
+    // in its descriptor — the shape lives in the tiled-data header — so when
+    // the descriptor's shape is empty, recover it from the written cells
+    // themselves (their ArrayValue shape is logical, which the storage
+    // managers hold reversed).  Unwritten default cells carry an empty shape,
+    // so take the first cell that actually has one.
+    let cradle = match cd.shape.as_ref() {
+        Some(shape) if !shape.is_empty() => shape.clone(),
+        _ => {
+            let logical: Vec<i64> = values[col]
+                .iter()
+                .find_map(|v| match v {
+                    RecordValue::Array(arr) if !arr.shape.is_empty() => {
+                        Some(arr.shape.iter().map(|&d| i64::from(d)).collect())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            logical.into_iter().rev().collect()
+        }
+    };
+    if cd.data_type == crate::record::DataType::Bool {
+        // Typed-buffer bool write: pack the row bit-slices straight into the
+        // tile bitstream — no per-row `Vec<u8>` cells, no `encode_bits`
+        // intermediate.  The tiles hold the identical layout (rows
+        // bit-contiguous, LSB-first) to the byte-cell path.
+        let mut rows: Vec<&[bool]> = Vec::with_capacity(values[col].len());
+        for value in &values[col] {
+            let RecordValue::Array(arr) = value else {
+                return Err(TableCreateError::NotScalar(format!(
+                    "{}.{}: expected an array value",
+                    desc.name, cd.name
+                )));
+            };
+            let crate::record::ArrayData::Bool(v) = &arr.data else {
+                return Err(TableCreateError::NotScalar(format!(
+                    "{}.{}: expected a bool array value",
+                    desc.name, cd.name
+                )));
+            };
+            if (v.len() as i64) != cradle.iter().product::<i64>() {
+                return Err(TableCreateError::NotScalar(format!(
+                    "{}.{}: bool cell length {} does not match shape {cradle:?}",
+                    desc.name,
+                    cd.name,
+                    v.len()
+                )));
+            }
+            rows.push(v.as_slice());
+        }
+        return crate::tsm::write_tsm_file_bool(
+            stman_type, big_endian, seq_nr, dm_name, &cradle, &rows,
+        )
+        .map_err(|e| {
+            TableCreateError::Io(std::io::Error::other(format!(
+                "encode {}.{}: {e}",
+                desc.name, cd.name
+            )))
+        });
+    }
     let mut cells: Vec<Vec<u8>> = Vec::with_capacity(values[col].len());
     for value in &values[col] {
         let RecordValue::Array(arr) = value else {
@@ -759,15 +816,21 @@ fn build_tsm_data(
             })?,
         );
     }
-    crate::tsm::write_tsm_file(stman_type, big_endian, seq_nr, dm_name, cd.data_type, &cradle, &cells)
-        .map_err(
-        |e| {
-            TableCreateError::Io(std::io::Error::other(format!(
-                "encode {}.{}: {e}",
-                desc.name, cd.name
-            )))
-        },
+    crate::tsm::write_tsm_file(
+        stman_type,
+        big_endian,
+        seq_nr,
+        dm_name,
+        cd.data_type,
+        &cradle,
+        &cells,
     )
+    .map_err(|e| {
+        TableCreateError::Io(std::io::Error::other(format!(
+            "encode {}.{}: {e}",
+            desc.name, cd.name
+        )))
+    })
 }
 
 /// A CASA table: the parsed descriptor plus the opened data managers, with
@@ -806,6 +869,34 @@ pub fn absolute_dir(p: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
+/// The row count casacore keeps in `table.lock`'s sync record: a framed
+/// AipsIO `"sync"` object (`[u32 len]["sync"\\0][u32 version][nrrow]`; v1
+/// nrrow is u32, v2 u64).  `PlainTable::PlainTable` takes this value in
+/// preference to the header's nrrow, so casacure mirrors it (see
+/// [`Table::open`]).
+fn lock_sync_nrrow(path: &std::path::Path) -> Option<u64> {
+    let bytes = std::fs::read(path.join("table.lock")).ok()?;
+    let mut found = None;
+    for (i, w) in bytes.windows(4).enumerate() {
+        if w != b"sync" {
+            continue;
+        }
+        // Framed string: [u32 len]["sync"] (no terminator), then the
+        // version u32 and the nrrow.
+        if i < 4 || bytes[i - 4..i] != [0, 0, 0, 4] {
+            continue;
+        }
+        let ver = u32::from_be_bytes(bytes[i + 4..i + 8].try_into().ok()?);
+        let nrrow = match ver {
+            1 => u64::from(u32::from_be_bytes(bytes[i + 8..i + 12].try_into().ok()?)),
+            2 => u64::from_be_bytes(bytes[i + 8..i + 16].try_into().ok()?),
+            _ => continue,
+        };
+        found = Some(nrrow);
+    }
+    found
+}
+
 impl Table {
     /// Open a table directory (`<dir>/table.dat` + data files).
     pub fn open(
@@ -815,7 +906,18 @@ impl Table {
         let dir: std::path::PathBuf = dir.into();
         let path = absolute_dir(&dir);
         let buf = std::fs::read(path.join("table.dat"))?;
-        let dat = parse_table_dat(&buf)?;
+        let mut dat = parse_table_dat(&buf)?;
+        // casacore reads the row count from the table's lock-file sync record
+        // in preference to the header (`PlainTable::PlainTable`: nrrow_p from
+        // lockSync, falling back to the header only when it is 0), so a
+        // header written stale (e.g. an MS subtable whose header fields were
+        // updated by a writer that never rewrote table.dat) still opens with
+        // the real row count.
+        if let Some(n) = lock_sync_nrrow(&path) {
+            if n != 0 {
+                dat.header.nrow = n;
+            }
+        }
         let big = dat.header.big_endian;
         let mut ssm_files = Vec::new();
         let mut ism_files = Vec::new();
@@ -832,13 +934,11 @@ impl Table {
                     crate::ism::IsmFile::open(&path, dm.sequence_nr, big)
                         .map_err(|e| TableDatError::Storage(e.to_string()))?,
                 )),
-                "TiledColumnStMan" | "TiledShapeStMan" => {
-                    tsm_files.push((
-                        dm.sequence_nr,
-                        crate::tsm::TsmFile::open(&path, dm.sequence_nr, big)
-                            .map_err(|e| TableDatError::Storage(e.to_string()))?,
-                    ))
-                }
+                "TiledColumnStMan" | "TiledShapeStMan" => tsm_files.push((
+                    dm.sequence_nr,
+                    crate::tsm::TsmFile::open(&path, dm.sequence_nr, big)
+                        .map_err(|e| TableDatError::Storage(e.to_string()))?,
+                )),
                 other => {
                     return Err(TableDatError::Storage(format!(
                         "unsupported data-manager type {other}"
@@ -956,7 +1056,7 @@ impl Table {
         s.push(',');
         s.push_str(&kv(
             "keywords",
-            &cd.keywords.to_json_string_ctx(self.path.parent()),
+            &cd.keywords.to_json_string_ctx(Some(&self.path)),
         ));
         s.push('}');
         Some(s)
@@ -976,20 +1076,14 @@ impl Table {
             s.push_str(&self.getcoldesc(i).unwrap_or_default());
         }
         s.push_str(",\"_define_hypercolumn_\":{},\"_keywords_\":");
-        s.push_str(
-            &self
-                .dat
-                .desc
-                .keywords
-                .to_json_string_ctx(self.path.parent()),
-        );
+        s.push_str(&self.dat.desc.keywords.to_json_string_ctx(Some(&self.path)));
         s.push_str(",\"_private_keywords_\":");
         s.push_str(
             &self
                 .dat
                 .desc
                 .private_keywords
-                .to_json_string_ctx(self.path.parent()),
+                .to_json_string_ctx(Some(&self.path)),
         );
         s.push('}');
         s
@@ -998,10 +1092,7 @@ impl Table {
     /// The table keyword record as a JSON object (python-casacore
     /// `table.getkeywords()`).
     pub fn getkeywords(&self) -> String {
-        self.dat
-            .desc
-            .keywords
-            .to_json_string_ctx(self.path.parent())
+        self.dat.desc.keywords.to_json_string_ctx(Some(&self.path))
     }
 
     /// A column's keyword record as a JSON object (python-casacore
@@ -1011,7 +1102,7 @@ impl Table {
             .desc
             .columns
             .get(col_idx)
-            .map(|c| c.keywords.to_json_string_ctx(self.path.parent()))
+            .map(|c| c.keywords.to_json_string_ctx(Some(&self.path)))
     }
 }
 
@@ -1461,35 +1552,70 @@ pub fn slice_array_value(
 /// `flush` assembles the on-disk files via `create_table` for the given
 /// schema; missing cells use the column's scalar default.
 #[derive(Debug)]
+/// A writable table built incrementally (`addrows` + `putcol`/`putcell`
+/// batches, then `flush`) — the dask-ms MS-writing pattern. The final
+/// `flush` assembles the on-disk files via `create_table` for the given
+/// schema; missing cells use the column's scalar default.
 pub struct WritableTable {
     dir: std::path::PathBuf,
     desc: crate::tabledesc::TableDesc,
     /// `cells[col][row]`.
     cells: Vec<Vec<Option<RecordValue>>>,
+    /// `pending[col]` is a bitset of rows WRITTEN since the last successful
+    /// `flush` (one bit per row, set by `putcell`/`putcol`, cleared by
+    /// `flush`).  Together with `cells` it makes a flush incremental: only
+    /// pending rows are overlaid onto the on-disk files, and after a flush
+    /// the column's `cells` values are dropped (reads fall back to the
+    /// refreshed on-disk state), so the resident write buffer tracks the
+    /// dask-ms chunks written since the last flush — not the whole column.
+    pending: Vec<Vec<u64>>,
+    /// Which columns were explicitly written (`putcell`/`putcol`).  A
+    /// `flush()` on an existing table preserves the on-disk files of any
+    /// column that was never written — casacore's in-place semantics, and
+    /// what keeps a changed-columns write (dask-ms `putcol`) from zeroing or
+    /// corrupting every other column (e.g. an untouched TiledShapeStMan
+    /// column rebuilt from default cells collapses its header's nrdim).
+    touched: Vec<bool>,
+    /// A table/column keyword was written, so the header (`table.dat`) must
+    /// be regenerated; an in-place data-only flush cannot preserve it.
+    meta_dirty: bool,
 }
 
 /// Convert absolute `Table`-valued subtable references to the `./relative`
 /// form casacore stores (relative to the parent table's directory); absolute
 /// paths outside the parent's directory are kept. Recurses into nested
 /// records.
-fn relativize_subtables(value: RecordValue, base: Option<&std::path::Path>) -> RecordValue {
-    match value {
-        RecordValue::Table(name) => {
-            let path = std::path::Path::new(&name);
-            let relativized = match (path.is_absolute(), base) {
-                (true, Some(b)) => match path.strip_prefix(b) {
-                    Ok(rest) => format!("./{}", rest.display()),
-                    Err(_) => name,
-                },
-                _ => name,
-            };
-            RecordValue::Table(relativized)
+fn relativize_subtables(value: RecordValue, table_dir: Option<&std::path::Path>) -> RecordValue {
+    fn relativize_one(name: &str, table_dir: Option<&std::path::Path>) -> String {
+        let path = std::path::Path::new(name);
+        if !path.is_absolute() {
+            return name.to_string();
         }
+        let Some(dir) = table_dir else {
+            return name.to_string();
+        };
+        let dir_prefix = format!("{}/", dir.to_string_lossy());
+        let name_s = name.to_string();
+        if let Some(rest) = name_s.strip_prefix(&dir_prefix) {
+            // Inside the table's own directory (an MS subtable).
+            return format!("././{rest}");
+        }
+        if let Some(parent) = dir.parent() {
+            let parent_prefix = format!("{}/", parent.to_string_lossy());
+            if let Some(rest) = name_s.strip_prefix(&parent_prefix) {
+                // A sibling of the table directory.
+                return format!("./{rest}");
+            }
+        }
+        name.to_string()
+    }
+    match value {
+        RecordValue::Table(name) => RecordValue::Table(relativize_one(&name, table_dir)),
         RecordValue::Record(mut inner) => {
             inner.values = inner
                 .values
                 .drain(..)
-                .map(|v| relativize_subtables(v, base))
+                .map(|v| relativize_subtables(v, table_dir))
                 .collect();
             RecordValue::Record(inner)
         }
@@ -1520,10 +1646,15 @@ impl WritableTable {
     ) -> WritableTable {
         let dir: std::path::PathBuf = dir.into();
         let cells = vec![Vec::new(); desc.columns.len()];
+        let pending = vec![Vec::new(); desc.columns.len()];
+        let touched = vec![false; desc.columns.len()];
         WritableTable {
             dir: absolute_dir(&dir),
             desc,
             cells,
+            pending,
+            touched,
+            meta_dirty: false,
         }
     }
 
@@ -1535,7 +1666,39 @@ impl WritableTable {
             // instead of erroring; flush() writes exactly these cells.
             let default = self.desc.columns.get(col_idx).and_then(default_cell_value);
             col.resize_with(col.len() + n as usize, || default.clone());
+            let words = col.len().div_ceil(64);
+            self.pending[col_idx].resize(words, 0);
         }
+    }
+
+    /// Load a cell of an existing table into the store **without** marking
+    /// the column as written (`putcell`, but untracked): the writable-open
+    /// path materialises the whole table this way, so an untouched loaded
+    /// column is preserved by the next `flush()` instead of being
+    /// regenerated from its (identical) values.  Only a write made through
+    /// `putcell`/`putcol` marks the column dirty.
+    pub fn putcell_loaded(
+        &mut self,
+        col_idx: usize,
+        row: u64,
+        value: RecordValue,
+    ) -> Result<(), WriteTableError> {
+        let name = self
+            .desc
+            .columns
+            .get(col_idx)
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        let col = self
+            .cells
+            .get_mut(col_idx)
+            .ok_or(WriteTableError::NoSuchColumn { name })?;
+        let nrow = col.len() as u64;
+        let slot = col
+            .get_mut(row as usize)
+            .ok_or(WriteTableError::RowOutOfRange { row, nrow })?;
+        *slot = Some(value);
+        Ok(())
     }
 
     /// Set one cell (`putcell`).
@@ -1560,6 +1723,10 @@ impl WritableTable {
             .get_mut(row as usize)
             .ok_or(WriteTableError::RowOutOfRange { row, nrow })?;
         *slot = Some(value);
+        self.pending[col_idx][(row as usize) / 64] |= 1u64 << ((row as usize) % 64);
+        if let Some(t) = self.touched.get_mut(col_idx) {
+            *t = true;
+        }
         Ok(())
     }
 
@@ -1583,6 +1750,8 @@ impl WritableTable {
         let n = self.cells.first().map_or(0, Vec::len);
         self.desc.columns.push(cd);
         self.cells.push(vec![None; n]);
+        self.pending.push(vec![0; n.div_ceil(64)]);
+        self.touched.push(false);
     }
 
     /// Remove a column by index (`Table::removecols`); the data is discarded
@@ -1594,6 +1763,52 @@ impl WritableTable {
         if col_idx < self.cells.len() {
             self.cells.remove(col_idx);
         }
+        if col_idx < self.pending.len() {
+            self.pending.remove(col_idx);
+        }
+        if col_idx < self.touched.len() {
+            self.touched.remove(col_idx);
+        }
+    }
+
+    /// Open an existing table for in-place editing WITHOUT materialising its
+    /// data: every cell stays unset (rows hold only defaults, none pending).
+    /// A full-column `putcol` on a column then writes directly; a partial
+    /// write overlays only its rows' cells; reads on the write handle are
+    /// served by the returned `Table` snapshot merged with the pending cells.
+    /// This is what keeps a changed-columns write (dask-ms `putcol`) at ~the
+    /// working set instead of materialising the whole table — eagerly
+    /// loading every column of a 1.6 GB MS into per-cell `RecordValue`s
+    /// costs >3 GiB.
+    pub fn open_for_update(
+        dir: impl Into<std::path::PathBuf>,
+    ) -> Result<(Table, WritableTable), TableDatError> {
+        let dir: std::path::PathBuf = dir.into();
+        let read = Table::open(&dir, false)?;
+        let mut wt = WritableTable::create(&dir, read.dat.desc.clone());
+        let n = read.nrows();
+        if n > 0 {
+            wt.addrows(n);
+        }
+        Ok((read, wt))
+    }
+
+    /// Populate one column's cells from its existing values **without**
+    /// marking it as written (each cell is loaded via
+    /// [`WritableTable::putcell_loaded`]), enabling a partial write to a
+    /// column [`WritableTable::open_for_update`] left unloaded — the other
+    /// rows keep their old data on flush instead of falling back to
+    /// defaults.
+    pub fn load_column(
+        &mut self,
+        col_idx: usize,
+        values: Vec<RecordValue>,
+    ) -> Result<(), WriteTableError> {
+        let n = self.col_len(col_idx);
+        for (r, v) in values.into_iter().take(n).enumerate() {
+            self.putcell_loaded(col_idx, r as u64, v)?;
+        }
+        Ok(())
     }
 
     /// Open an existing table for editing: materialise every cell into the
@@ -1640,6 +1855,20 @@ impl WritableTable {
                 keep
             });
         }
+        for pend in &mut self.pending {
+            let mut out = Vec::with_capacity(pend.len());
+            for (j, w) in pend.drain(..).enumerate() {
+                let mut kept = 0u64;
+                for bit in 0..64 {
+                    let row = j * 64 + bit;
+                    if row < drop.len() && !drop[row] && w & (1 << bit) != 0 {
+                        kept |= 1 << bit;
+                    }
+                }
+                out.push(kept);
+            }
+            *pend = out;
+        }
     }
 
     /// Rename a column (`ALTER TABLE ... RENAME COLUMN from TO to`).
@@ -1661,39 +1890,35 @@ impl WritableTable {
         self.cells.get(col_idx).map_or(0, Vec::len)
     }
 
-    /// The in-memory value at (col, row), if set.
+    /// The buffered value of one cell (only rows written since the last
+    /// flush are `Some`; everything else is on disk).
     pub fn cell(&self, col_idx: usize, row: u64) -> Option<&RecordValue> {
-        self.cells.get(col_idx)?.get(row as usize)?.as_ref()
+        self.cells
+            .get(col_idx)
+            .and_then(|c| c.get(row as usize))
+            .and_then(|c| c.as_ref())
     }
 
-    /// No-op, as casacore's `setmaxcachesize` should be for the replacement
-    /// (no caches exist).
     pub fn setmaxcachesize(&mut self, _col_idx: usize, _size: usize) {}
 
-    /// Set a table keyword (`putkeyword`); nested records are supported.
-    /// `Table` values (subtable references) are stored relative to the
-    /// parent table's directory with a `./` prefix, like casacore.
     pub fn putkeyword(&mut self, name: &str, value: RecordValue) {
-        let value = relativize_subtables(value, self.dir.parent());
-        self.desc.keywords.set(name, value);
+        self.desc
+            .keywords
+            .set(name, relativize_subtables(value, Some(&self.dir)));
     }
 
-    /// Remove a table keyword (`removekeyword`).
     pub fn removekeyword(&mut self, name: &str) {
         self.desc.keywords.remove(name);
     }
 
-    /// The current table keywords as a JSON object.
     pub fn keywords_json(&self) -> String {
         self.desc.keywords.to_json_string()
     }
 
-    /// The schema being built (columns, keywords, storage managers).
     pub fn desc(&self) -> &crate::tabledesc::TableDesc {
         &self.desc
     }
 
-    /// Set a column keyword (`putcolkeyword`).
     pub fn putcolkeyword(
         &mut self,
         col_idx: usize,
@@ -1712,7 +1937,8 @@ impl WritableTable {
             .get_mut(col_idx)
             .ok_or(WriteTableError::NoSuchColumn { name: cname })?;
         col.keywords
-            .set(name, relativize_subtables(value, self.dir.parent()));
+            .set(name, relativize_subtables(value, Some(&self.dir)));
+        self.meta_dirty = true;
         Ok(())
     }
 
@@ -1730,6 +1956,7 @@ impl WritableTable {
             .get_mut(col_idx)
             .ok_or(WriteTableError::NoSuchColumn { name: cname })?;
         col.keywords.remove(name);
+        self.meta_dirty = true;
         Ok(())
     }
 
@@ -1740,7 +1967,58 @@ impl WritableTable {
 
     /// Assemble the on-disk table from the buffered cells, filling missing
     /// scalar cells with their defaults; returns the table directory.
+    ///
+    /// When the table already exists with the same schema and row count and
+    /// only some columns were written (`putcell`/`putcol`), casacore's
+    /// in-place semantics apply: exactly the data files of the written
+    /// columns' data managers are updated, and every untouched column's
+    /// files (and the header) stay byte-identical.  Otherwise the whole
+    /// table is regenerated.
+    ///
+    /// The in-place path is INCREMENTAL: only rows written since the last
+    /// flush are overlaid onto the on-disk files (TiledShape/TiledColumn
+    /// bool tiles are patched byte-wise), the untouched rows are never
+    /// re-encoded, and after a successful flush the column's buffered cell
+    /// values are released — so a write stream of dask-ms chunks keeps at
+    /// most one chunk of values resident instead of the whole column.
     pub fn flush(&mut self) -> Result<std::path::PathBuf, WriteTableError> {
+        let dir = self.dir.clone();
+        let nrow = self.cells.first().map_or(0, Vec::len) as u64;
+        // Preservation is only possible when the on-disk table shares this
+        // schema and row count (a full regrowth is otherwise required).
+        let preserving =
+            self.touched.len() == self.desc.columns.len()
+                && !self.meta_dirty
+                && self.touched.iter().any(|&t| t)
+                && self.touched.iter().any(|&t| !t)
+                && std::fs::read(dir.join("table.dat"))
+                    .ok()
+                    .and_then(|b| parse_table_dat(&b).ok())
+                    .is_some_and(|dat| {
+                        dat.desc.columns.len() == self.desc.columns.len()
+                            && dat.header.nrow == nrow
+                            && dat.desc.columns.iter().zip(self.desc.columns.iter()).all(
+                                |(a, b)| {
+                                    a.name == b.name
+                                        && a.data_manager_type == b.data_manager_type
+                                        && a.data_manager_group == b.data_manager_group
+                                },
+                            )
+                    });
+        if !preserving {
+            let values = self.materialize_all()?;
+            create_table(&dir, &self.desc, &values)?;
+            // The regrowth wrote every cell: nothing is pending anymore.
+            self.clear_all_pending();
+            return Ok(dir);
+        }
+        self.flush_preserving(&dir)?;
+        Ok(dir)
+    }
+
+    /// The whole cell store as per-column value lists (column defaults for
+    /// missing cells) — the input for a whole-table regrowth.
+    fn materialize_all(&self) -> Result<Vec<Vec<RecordValue>>, WriteTableError> {
         let mut values: Vec<Vec<RecordValue>> = Vec::with_capacity(self.cells.len());
         for (col_idx, col) in self.cells.iter().enumerate() {
             let cd = &self.desc.columns[col_idx];
@@ -1757,9 +2035,305 @@ impl WritableTable {
             }
             values.push(list);
         }
-        let dir = self.dir.clone();
-        create_table(&dir, &self.desc, &values)?;
-        Ok(dir)
+        Ok(values)
+    }
+
+    /// Whether any rows of `col` were written since the last flush.
+    fn has_pending(&self, col_idx: usize) -> bool {
+        self.pending
+            .get(col_idx)
+            .is_some_and(|p| p.iter().any(|&w| w != 0))
+    }
+
+    /// The rows of `col` written since the last flush, ascending.
+    fn pending_rows(&self, col_idx: usize) -> impl Iterator<Item = u64> + '_ {
+        self.pending.get(col_idx).into_iter().flat_map(|p| {
+            p.iter().enumerate().flat_map(move |(wi, &w)| {
+                let mut w = w;
+                let mut out = Vec::new();
+                while w != 0 {
+                    let b = w.trailing_zeros() as usize;
+                    out.push((wi * 64 + b) as u64);
+                    w &= w - 1;
+                }
+                out
+            })
+        })
+    }
+
+    /// Drop the buffered values and dirty marks of one column: its rows now
+    /// live on disk, so resident memory tracks only un-flushed writes.
+    fn clear_pending(&mut self, col_idx: usize) {
+        if let Some(col) = self.cells.get_mut(col_idx) {
+            col.iter_mut().for_each(|c| *c = None);
+        }
+        if let Some(p) = self.pending.get_mut(col_idx) {
+            p.iter_mut().for_each(|w| *w = 0);
+        }
+    }
+
+    fn clear_all_pending(&mut self) {
+        for col in &mut self.cells {
+            col.iter_mut().for_each(|c| *c = None);
+        }
+        for p in &mut self.pending {
+            p.iter_mut().for_each(|w| *w = 0);
+        }
+    }
+
+    /// Update only the data files of data managers holding written columns,
+    /// leaving `table.dat` and every untouched column's files byte-identical
+    /// (see [`WritableTable::flush`]).  This is what keeps a changed-columns
+    /// MS write (skarabina `--write-changed-only`, dask-ms `putcol`)
+    /// from regenerating untouched columns from their defaults — which would
+    /// zero their data and collapse a TiledShapeStMan column's header nrdim
+    /// so casacore can no longer open the table.
+    ///
+    /// The update is an overlay of the pending rows only: TSM tile files are
+    /// patched in place (the untouched rows' bits/bytes are never
+    /// re-encoded), and SSM/ISM columns are rebuilt from their on-disk
+    /// values with the pending rows overlaid.  A column whose DMs cannot be
+    /// patched in place (row growth, missing files) falls back to the full
+    /// rebuild from on-disk + pending.  After a successful flush the column
+    /// releases its buffered cells.
+    fn flush_preserving(&mut self, dir: &std::path::Path) -> Result<(), WriteTableError> {
+        let buf = std::fs::read(dir.join("table.dat"))
+            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+        let dat = parse_table_dat(&buf).map_err(|e| WriteTableError::Storage(e.to_string()))?;
+        let nrow = self.cells.first().map_or(0, Vec::len) as u64;
+        let dm_of: Vec<u32> = (0..self.desc.columns.len())
+            .map(|c| {
+                dat.column_set
+                    .columns
+                    .get(c)
+                    .map(|x| x.data_manager_seq)
+                    .unwrap_or(0)
+            })
+            .collect();
+        let mut dm_seqs: Vec<u32> = Vec::new();
+        for &seq in &dm_of {
+            if !dm_seqs.contains(&seq) {
+                dm_seqs.push(seq);
+            }
+        }
+        for seq in dm_seqs {
+            let cols: Vec<usize> = dm_of
+                .iter()
+                .enumerate()
+                .filter(|(_, &s)| s == seq)
+                .map(|(i, _)| i)
+                .collect();
+            let touched = cols
+                .iter()
+                .any(|&c| self.touched.get(c).copied().unwrap_or(false))
+                && cols.iter().any(|&c| self.has_pending(c));
+            if !touched {
+                continue;
+            }
+            let dm = dat
+                .column_set
+                .data_managers
+                .iter()
+                .find(|d| d.sequence_nr == seq)
+                .ok_or_else(|| {
+                    WriteTableError::Storage(format!("table.dat lost DM sequence {seq}"))
+                })?;
+            let storage = |e: TableCreateError| WriteTableError::Storage(e.to_string());
+            match dm.type_name.as_str() {
+                "StandardStMan" | "IncrementalStMan" => {
+                    // Full-column rebuild from the on-disk values overlaid
+                    // with the pending rows (a StandardStMan bucket groups
+                    // several columns, so it cannot be byte-patched in
+                    // place; for the small scalar columns MS writes touch —
+                    // e.g. FLAG_ROW — the decode is cheap).
+                    let mut all_vals: Vec<Vec<RecordValue>> =
+                        vec![Vec::new(); self.desc.columns.len()];
+                    for &col in &cols {
+                        all_vals[col] = self.materialize_col_from_disk(col, nrow)?;
+                    }
+                    if dm.type_name == "StandardStMan" {
+                        let (f0, f0i, _spec) = build_ssm_data(
+                            false,
+                            nrow,
+                            &dm.type_name,
+                            &self.desc,
+                            &all_vals,
+                            &cols,
+                        )
+                        .map_err(storage)?;
+                        std::fs::write(dir.join(format!("table.f{seq}")), f0)
+                            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                        if let Some(i) = f0i {
+                            std::fs::write(dir.join(format!("table.f{seq}i")), i)
+                                .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                        }
+                    } else {
+                        let f0 = build_ism_data(
+                            false,
+                            nrow,
+                            &dm.type_name,
+                            &self.desc,
+                            &all_vals,
+                            &cols,
+                        )
+                        .map_err(storage)?;
+                        std::fs::write(dir.join(format!("table.f{seq}")), f0)
+                            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                    }
+                    for &col in &cols {
+                        self.clear_pending(col);
+                    }
+                }
+                "TiledColumnStMan" | "TiledShapeStMan" => {
+                    // One array column per TSM DM (build_tsm_data's
+                    // invariant) — patch its tile file in place when
+                    // possible, else rebuild it from on-disk + pending.
+                    let col = cols[0];
+                    if self
+                        .patch_tsm_column(dir, seq, &dm.type_name, col, nrow)?
+                        .is_none()
+                    {
+                        let mut all_vals: Vec<Vec<RecordValue>> =
+                            vec![Vec::new(); self.desc.columns.len()];
+                        all_vals[col] = self.materialize_col_from_disk(col, nrow)?;
+                        let (hdr, tile, file_seq) = build_tsm_data(
+                            &dm.type_name,
+                            false,
+                            seq,
+                            &dm.type_name,
+                            &self.desc,
+                            &all_vals,
+                            &[col],
+                        )
+                        .map_err(storage)?;
+                        std::fs::write(dir.join(format!("table.f{seq}")), hdr)
+                            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                        std::fs::write(dir.join(format!("table.f{seq}_TSM{file_seq}")), tile)
+                            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                    }
+                    self.clear_pending(col);
+                }
+                other => {
+                    return Err(WriteTableError::Storage(format!(
+                        "cannot preserve-rewrite data-manager type {other}"
+                    )))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One column's current values: its on-disk cells with the pending
+    /// (unflushed) rows overlaid.  Used to rebuild SSM/ISM columns and as a
+    /// fallback for TSM columns that cannot be byte-patched.
+    fn materialize_col_from_disk(
+        &self,
+        col: usize,
+        nrow: u64,
+    ) -> Result<Vec<RecordValue>, WriteTableError> {
+        let t = crate::Table::open(&self.dir, false)
+            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+        let mut vals = t
+            .getcol(col, 0, nrow)
+            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+        for r in self.pending_rows(col) {
+            if let Some(Some(v)) = self.cells[col].get(r as usize) {
+                vals[r as usize] = v.clone();
+            }
+        }
+        Ok(vals)
+    }
+
+    /// Byte-patch the on-disk TSM tile file of column `col` (one array
+    /// column per TSM DM) with the pending rows, leaving every other row
+    /// untouched.  Returns `None` when the file cannot be patched in place
+    /// (row growth, missing header/tile, multi-cube headers) so the caller
+    /// falls back to a full rebuild.
+    fn patch_tsm_column(
+        &self,
+        dir: &std::path::Path,
+        seq: u32,
+        stman_type: &str,
+        col: usize,
+        nrow: u64,
+    ) -> Result<Option<()>, WriteTableError> {
+        use crate::record::DataType;
+        let file_seq = if stman_type == "TiledShapeStMan" {
+            1
+        } else {
+            0
+        };
+        let hdr_path = dir.join(format!("table.f{seq}"));
+        let tile_path = dir.join(format!("table.f{seq}_TSM{file_seq}"));
+        let (Ok(hdr_bytes), Ok(mut tile)) = (std::fs::read(&hdr_path), std::fs::read(&tile_path))
+        else {
+            return Ok(None);
+        };
+        let header = match crate::tsm::parse_header(&hdr_bytes) {
+            Ok(h) => h,
+            Err(_) => return Ok(None),
+        };
+        let nrdim = header.nrdim as usize;
+        let Some(cube) = header
+            .cubes
+            .iter()
+            .find(|c| !c.cube_shape.is_empty() && c.cube_shape.len() == nrdim)
+        else {
+            return Ok(None);
+        };
+        if header.nrrow != nrow {
+            return Ok(None); // row growth: needs a full rebuild
+        }
+        let Some(cd) = self.desc.columns.get(col) else {
+            return Ok(None);
+        };
+        let cell_shape: Vec<i64> = cube.cube_shape[..nrdim - 1].to_vec();
+        let layout = match crate::tsm::tsm_layout(&cell_shape, cd.data_type, nrow) {
+            Ok(l) => l,
+            Err(_) => return Ok(None),
+        };
+        // Encode the pending rows' cells.
+        let mut pending: Vec<(u64, Vec<u8>)> = Vec::new();
+        for r in self.pending_rows(col) {
+            if r >= nrow {
+                return Ok(None);
+            }
+            let Some(RecordValue::Array(arr)) =
+                self.cells[col].get(r as usize).and_then(|c| c.as_ref())
+            else {
+                return Ok(None);
+            };
+            let cell = crate::tsm::tsm_encode_cell(false, cd.data_type, &arr.data)
+                .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+            pending.push((r, cell));
+        }
+        if pending.is_empty() {
+            return Ok(Some(())); // nothing to patch
+        }
+        // Overlay each pending row onto its tile bucket.
+        for (r, cell) in &pending {
+            let tile_nr = r / layout.rows_per_tile;
+            let in_tile = (r % layout.rows_per_tile) as usize;
+            let bucket = tile_nr as usize * layout.bucket_size;
+            if cd.data_type == DataType::Bool {
+                let cell_elems = cell_shape.iter().product::<i64>().max(0) as usize;
+                let bit = in_tile * cell_elems;
+                // Clear the row's old bits, then place the new ones.
+                for g in bit..bit + cell_elems {
+                    tile[bucket + g / 8] &= !(1 << (g % 8));
+                }
+                crate::tsm::or_bytes_at(&mut tile[bucket..], cell, bit);
+            } else {
+                let off = bucket + in_tile * cell.len();
+                if off + cell.len() <= tile.len() {
+                    tile[off..off + cell.len()].copy_from_slice(cell);
+                } else {
+                    return Ok(None);
+                }
+            }
+        }
+        std::fs::write(&tile_path, tile).map_err(|e| WriteTableError::Storage(e.to_string()))?;
+        Ok(Some(()))
     }
 }
 
@@ -3124,6 +3698,31 @@ mod tests {
         );
     }
 
+    /// The `table.lock` sync record's row count (casacore reads it in
+    /// preference to the table.dat header) parses for both sync versions.
+    #[test]
+    fn lock_sync_nrrow_parses_sync_record() {
+        let dir = temp_dir("locksync");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (nrrow, ver) in [(5u64, 1u32), (70_000_000_000u64, 2u32)] {
+            let mut b = vec![0u8; 8]; // FileLocker preamble
+            b.extend_from_slice(&[0, 0, 0, 4]); // framed string len
+            b.extend_from_slice(b"sync");
+
+            b.extend_from_slice(&ver.to_be_bytes());
+            if ver == 1 {
+                b.extend_from_slice(&(nrrow as u32).to_be_bytes());
+            } else {
+                b.extend_from_slice(&nrrow.to_be_bytes());
+            }
+            std::fs::write(dir.join("table.lock"), b).unwrap();
+            assert_eq!(super::lock_sync_nrrow(&dir), Some(nrrow), "sync v{ver}");
+        }
+        // A lock with no sync record yields nothing (header rule applies).
+        std::fs::write(dir.join("table.lock"), vec![0u8; 64]).unwrap();
+        assert_eq!(super::lock_sync_nrrow(&dir), None);
+    }
+
     #[test]
     fn create_table_with_tsm_column_reads_back() {
         use crate::record::{ArrayData, ArrayValue};
@@ -3187,6 +3786,125 @@ mod tests {
                 }
                 other => panic!("expected array, got {other:?}"),
             }
+        }
+    }
+
+    /// The incremental flush: a chunked in-place write with a flush between
+    /// chunks must leave the on-disk state equal to the overlay of every
+    /// write, without re-encoding untouched rows (the dask-ms per-chunk
+    /// `putcol` + `flush` pattern), and must release the buffered cells so
+    /// at most one chunk stays resident.  Exercises TSM tile patching
+    /// (cross-tile, within-tile and re-overwritten rows) and an SSM bool
+    /// column rebuilt from disk + pending.
+    #[test]
+    fn incremental_flush_overlays_only_written_rows() {
+        use crate::record::{ArrayData, ArrayValue};
+        let mut desc = typed_desc();
+        desc.columns = vec![
+            ColumnDesc {
+                name: "FLAG".into(),
+                comment: String::new(),
+                data_type: DataType::Bool,
+                data_manager_type: "TiledShapeStMan".into(),
+                data_manager_group: "TiledFlag".into(),
+                options: 4,
+                ndim: 2,
+                shape: Some(vec![]),
+                max_length: 0,
+                keywords: empty_record(),
+                kind: ColumnKind::Array,
+            },
+            ColumnDesc {
+                name: "FLAG_ROW".into(),
+                comment: String::new(),
+                data_type: DataType::Bool,
+                data_manager_type: "StandardStMan".into(),
+                data_manager_group: "FlagRow".into(),
+                options: 0,
+                ndim: -1,
+                shape: None,
+                max_length: 0,
+                keywords: empty_record(),
+                kind: ColumnKind::Scalar(zero_value(DataType::Bool)),
+            },
+            scalar_col("SCAN_NUMBER", DataType::Int, 0),
+        ];
+        let elems = 158usize;
+        let nrows = 26214 * 2 + 9; // three 26214-row tiles
+        let dir = temp_dir("incrr");
+        let v0 = |r: usize| (r * 3 + 1).is_multiple_of(7);
+        let w1 = |r: usize| (r * 5 + 2).is_multiple_of(11);
+        let w2 = |r: usize| (r * 7 + 3).is_multiple_of(13);
+        let arr_of = |r: usize, f: fn(usize) -> bool| {
+            RecordValue::Array(ArrayValue {
+                shape: vec![79, 2],
+                data: ArrayData::Bool((0..elems).map(|k| f(r * 3 + k)).collect()),
+            })
+        };
+        {
+            let mut wt = WritableTable::create(&dir, desc.clone());
+            wt.addrows(nrows as u64);
+            for r in 0..nrows {
+                wt.putcell(0, r as u64, arr_of(r, v0)).unwrap();
+                wt.putcell(1, r as u64, RecordValue::Bool(v0(r))).unwrap();
+                wt.putcell(2, r as u64, RecordValue::Int(r as i32)).unwrap();
+            }
+            wt.flush().unwrap();
+        }
+        {
+            let (_snap, mut wt) = WritableTable::open_for_update(&dir).unwrap();
+            for r in 10_000..25_000 {
+                wt.putcell(0, r as u64, arr_of(r, w1)).unwrap();
+                wt.putcell(1, r as u64, RecordValue::Bool(w1(r))).unwrap();
+            }
+            wt.flush().unwrap();
+            assert_eq!(wt.pending_rows(0).count(), 0);
+            assert_eq!(wt.pending_rows(1).count(), 0);
+            assert!(wt.cell(0, 10_100).is_none(), "cells released after flush");
+            for r in (5..15_000).chain(30_000..45_000) {
+                wt.putcell(0, r as u64, arr_of(r, w2)).unwrap();
+                wt.putcell(1, r as u64, RecordValue::Bool(w2(r))).unwrap();
+            }
+            wt.flush().unwrap();
+        }
+        let fex = |r: usize| {
+            if r < 5 {
+                v0
+            } else if r < 15_000 {
+                w2
+            } else if r < 25_000 {
+                w1
+            } else if r < 30_000 {
+                v0
+            } else if r < 45_000 {
+                w2
+            } else {
+                v0
+            }
+        };
+        let t = Table::open(&dir, true).unwrap();
+        for r in [
+            0usize, 4, 5, 9_999, 10_000, 14_999, 15_000, 24_999, 25_000, 29_999, 30_000, 44_999,
+            45_000, 52_435, 52_436,
+        ] {
+            assert_eq!(
+                t.getcell(0, r as u64).unwrap(),
+                arr_of(r, fex(r)),
+                "FLAG row {r}"
+            );
+            assert_eq!(
+                t.getcell(1, r as u64).unwrap(),
+                RecordValue::Bool(fex(r)(r)),
+                "FLAG_ROW row {r}"
+            );
+        }
+        let flag_row = t.getcol(1, 0, nrows as u64).unwrap();
+        for (r, v) in flag_row.iter().enumerate() {
+            assert_eq!(*v, RecordValue::Bool(fex(r)(r)), "FLAG_ROW scan row {r}");
+        }
+        let scan = t.getcol(2, 0, nrows as u64).unwrap();
+        for (r, v) in scan.iter().enumerate() {
+            assert_eq!(*v, RecordValue::Int(r as i32), "SCAN_NUMBER row {r}");
         }
     }
 

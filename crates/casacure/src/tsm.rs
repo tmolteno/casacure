@@ -125,11 +125,7 @@ impl TsmFile {
         // no cube holding data (every cell unset — casacore skips writing
         // the tile file entirely) opens with an empty buffer; every read
         // resolves to the column default.
-        let file_seq = header
-            .cubes
-            .iter()
-            .map(|c| c.file_seq_nr)
-            .find(|&f| f >= 0);
+        let file_seq = header.cubes.iter().map(|c| c.file_seq_nr).find(|&f| f >= 0);
         let tile_data = match file_seq {
             Some(file_seq) => {
                 let path = dir.join(format!("table.f{seq_nr}_TSM{file_seq}"));
@@ -192,15 +188,16 @@ impl TsmFile {
                     if pos < 0 {
                         return self.read_default_cell(desc);
                     }
-                    self.header.cubes.get(self.header.cube_map[i] as usize).and_then(
-                        |cube| {
+                    self.header
+                        .cubes
+                        .get(self.header.cube_map[i] as usize)
+                        .and_then(|cube| {
                             // A placeholder cube (casacore writes one for
                             // not-yet-set cells, with no shape) means the
                             // row is unset.
                             let rows = *cube.cube_shape.last().unwrap_or(&0);
                             (rows > 0).then_some((cube, pos as u64))
-                        },
-                    )
+                        })
                 }
                 _ => None,
             }
@@ -256,7 +253,11 @@ impl TsmFile {
         // Bool elements are bit-packed in the tile (LSB-first, casacore's
         // `Conversion::bitToBool`); every other element type is byte-based.
         let is_bool = desc.data_type == DataType::Bool;
-        let elem_bits: i64 = if is_bool { 1 } else { elem_size(desc.data_type)? as i64 * 8 };
+        let elem_bits: i64 = if is_bool {
+            1
+        } else {
+            elem_size(desc.data_type)? as i64 * 8
+        };
         let cell_bits = if is_bool {
             // from the cube: the desc's shape may be absent (variable-shape)
             cell_elems
@@ -264,9 +265,16 @@ impl TsmFile {
             cell_elems * elem_size(desc.data_type)? * 8
         };
         let tile_bits = tile_size * elem_bits;
-        let _bucket_size = (tile_bits as usize).div_ceil(8);
-        let bit_off = tile_nr as i64 * tile_bits + row_in_tile * cell_bits as i64;
-        let byte_off = cube.file_offset as usize + (bit_off / 8) as usize;
+        // Each tile occupies a whole, byte-aligned bucket (the writer pads
+        // the final byte of a bit-packed tile), so a tile starts at
+        // `tile_nr * bucket_bytes` — never at a raw bit count, which drifts
+        // when the per-tile bit count is not a whole number of bytes (an MS
+        // FLAG tile: 158 bools x 26214 rows/tile = 4141812 bits, 4 bits over
+        // a byte boundary).
+        let bucket_bytes = (tile_bits as usize).div_ceil(8);
+        let bit_off = row_in_tile * cell_bits as i64;
+        let byte_off =
+            cube.file_offset as usize + tile_nr as usize * bucket_bytes + (bit_off / 8) as usize;
         let skip = (bit_off % 8) as usize;
         let nbytes = (skip + cell_bits).div_ceil(8);
         let end = byte_off + nbytes;
@@ -297,13 +305,10 @@ impl TsmFile {
     /// An unset cell (no cube covers its row): the column's default, zeros
     /// in the declared shape, like casacore's storage managers.
     fn read_default_cell(&self, desc: &ColumnDesc) -> Result<RecordValue, TsmError> {
-        let casa_shape = desc
-            .shape
-            .as_deref()
-            .ok_or(TsmError::RowOutOfRange {
-                row: self.header.nrrow,
-                nrow: self.header.nrrow,
-            })?;
+        let casa_shape = desc.shape.as_deref().ok_or(TsmError::RowOutOfRange {
+            row: self.header.nrrow,
+            nrow: self.header.nrrow,
+        })?;
         let cell_elems: usize = casa_shape.iter().product::<i64>().max(0) as usize;
         let nbytes = if desc.data_type == DataType::Bool {
             cell_elems.div_ceil(8)
@@ -321,25 +326,73 @@ impl TsmFile {
 
 /// Row -> entry index into the header's row/cube/pos maps (-1 = unset
 /// cell); empty when the header has no maps (TiledColumnStMan).
+/// 256-entry table: for each packed byte value, the eight expanded bool
+/// values (LSB-first). Mirrors casacore `Conversion::conv_tab` so a single
+/// lookup + 8-byte copy (a Vec<bool> element is one byte) decodes one input
+/// byte into eight Bools.
+const BOOL_LUT: [[bool; 8]; 256] = build_bool_lut();
+
+const fn build_bool_lut() -> [[bool; 8]; 256] {
+    let mut tab = [[false; 8]; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        let mut bit = 0usize;
+        while bit < 8 {
+            tab[b][bit] = (b >> bit) & 1 != 0;
+            bit += 1;
+        }
+        b += 1;
+    }
+    tab
+}
+
 /// Decode `nbits` bits starting at bit `skip` of `bytes` (LSB-first within
-/// each byte, casacore `Conversion::bitToBool`).
+/// each byte, casacore `Conversion::bitToBool`) to one bool per bit.
 fn decode_bits(bytes: &[u8], skip: usize, nbits: usize) -> Result<ArrayData, TsmError> {
     let mut v = Vec::with_capacity(nbits);
-    for i in 0..nbits {
-        let bit = (skip + i) % 8;
-        let byte = bytes[(skip + i) / 8];
-        v.push(byte & (1 << bit) != 0);
+    if skip.is_multiple_of(8) {
+        // Byte-aligned fast path: one 256-entry table lookup writes eight
+        // 0/1 bytes, matching casacore `bitToBool`'s conv_tab loop.
+        let base = skip / 8;
+        for k in 0..nbits.div_ceil(8) {
+            v.extend_from_slice(&BOOL_LUT[bytes[base + k] as usize]);
+        }
+        v.truncate(nbits);
+    } else {
+        for i in 0..nbits {
+            let bit = (skip + i) % 8;
+            let byte = bytes[(skip + i) / 8];
+            v.push(byte & (1 << bit) != 0);
+        }
     }
     Ok(ArrayData::Bool(v))
 }
 
 /// Pack bools into bytes, LSB-first (the inverse of [`decode_bits`]).
+/// Full bytes use the SWAR gather that mirrors casacore `boolToBit`'s SSE
+/// `_mm_cmpeq_epi8` + `_mm_movemask_epi8` (0/1 bytes, one multiply packs 8
+/// bits), branch-free and bit-order-correct on any endian host.
 fn encode_bits(values: &[bool]) -> Vec<u8> {
-    let mut out = vec![0u8; values.len().div_ceil(8)];
-    for (i, b) in values.iter().enumerate() {
-        if *b {
-            out[i / 8] |= 1 << (i % 8);
+    let n = values.len();
+    let mut out = vec![0u8; n.div_ceil(8)];
+    let mut i = 0usize;
+    while i + 8 <= n {
+        let mut word = 0u64;
+        for j in 0..8 {
+            word |= (values[i + j] as u64) << (8 * j);
         }
+        out[i >> 3] =
+            ((word & 0x0101_0101_0101_0101).wrapping_mul(0x0102_0408_1020_4080) >> 56) as u8;
+        i += 8;
+    }
+    let mut acc = 0u8;
+    for (k, b) in values[i..].iter().enumerate() {
+        if *b {
+            acc |= 1 << k;
+        }
+    }
+    if i < n {
+        out[i >> 3] = acc;
     }
     out
 }
@@ -581,23 +634,22 @@ const DEFAULT_TILE_BYTES: usize = 524288;
 /// subclass payload is the default tile shape for `TiledShapeStMan`, an
 /// empty IPosition for `TiledColumnStMan`. `cell_shape` is the fixed
 /// per-row cell shape in CASA (reversed logical) dim order; `cells[i]`
-/// holds the encoded bytes of that row's cell. Returns
-/// `(table.f{seq} bytes, table.f{seq}_TSM0 bytes)`.
-pub fn write_tsm_file(
-    stman_type: &str,
-    big_endian: bool,
-    seq_nr: u32,
-    hypercolumn_name: &str,
-    data_type: DataType,
+/// holds the encoded bytes of that row's cell.  Returns
+/// `(table.f{seq} bytes, table.f{seq}_TSM{file_seq} tile bytes, file_seq)` —
+/// Tile geometry shared by both TSM writers: rows per (512 KiB) tile, tile
+/// count, and the bucket (tile) size in bytes for `nrow` rows of
+/// `cell_shape` elements.
+pub(crate) struct TsmLayout {
+    pub(crate) rows_per_tile: u64,
+    pub(crate) n_tiles: u64,
+    pub(crate) bucket_size: usize,
+}
+
+pub(crate) fn tsm_layout(
     cell_shape: &[i64],
-    cells: &[Vec<u8>],
-) -> Result<(Vec<u8>, Vec<u8>), TsmError> {
-    if stman_type != "TiledColumnStMan" && stman_type != "TiledShapeStMan" {
-        return Err(TsmError::UnexpectedType {
-            expected: "TiledColumnStMan".into(),
-            found: stman_type.into(),
-        });
-    }
+    data_type: DataType,
+    nrow: u64,
+) -> Result<TsmLayout, TsmError> {
     let elem_size = elem_size(data_type)?;
     let is_bool = data_type == DataType::Bool;
     let cell_elems: i64 = cell_shape.iter().product::<i64>();
@@ -606,10 +658,6 @@ pub fn write_tsm_file(
     } else {
         cell_elems as usize * elem_size
     };
-    if cells.iter().any(|c| c.len() != cell_bytes) {
-        return Err(TsmError::UnsupportedType(data_type));
-    }
-    let nrow = cells.len() as u64;
     let rows_per_tile = (DEFAULT_TILE_BYTES / cell_bytes.max(1)).max(1) as u64;
     let n_tiles = nrow.div_ceil(rows_per_tile).max(1);
     let tile_elems = cell_elems * rows_per_tile as i64;
@@ -618,40 +666,94 @@ pub fn write_tsm_file(
     } else {
         tile_elems as usize * elem_size
     };
+    Ok(TsmLayout {
+        rows_per_tile,
+        n_tiles,
+        bucket_size,
+    })
+}
 
-    // Tile data file (data-file endianness; rows fill the tile grid). Bool
-    // cells are bit-packed (LSB-first), so a row's bits start at an
-    // arbitrary bit of the bucket: write through a bit cursor.
-    let mut tile_file = vec![0u8; bucket_size * n_tiles as usize];
-    for (row, cell) in cells.iter().enumerate() {
-        let tile = row as u64 / rows_per_tile;
-        let in_tile = row as u64 % rows_per_tile;
-        let bucket = tile as usize * bucket_size;
-        if is_bool {
-            // `cell` is the row's bit-packed elements; copy its bits to the
-            // row's bit position in the bucket (LSB-first, unaligned).
-            let bit = in_tile as usize * cell_elems as usize;
-            for (i, b) in cell.iter().enumerate() {
-                let mut byte = *b;
-                while byte != 0 {
-                    let j = byte.trailing_zeros() as usize;
-                    byte &= byte - 1;
-                    let g = bit + i * 8 + j;
-                    tile_file[bucket + g / 8] |= 1 << (g % 8);
-                }
-            }
+/// Place `src`'s bits (LSB-first) into `out` starting at bit `bit`,
+/// OR-ing over any existing bits.  Full bytes pack eight source bools per
+/// SWAR step (the portable form of casacore's `_mm_cmpeq_epi8` +
+/// `_mm_movemask_epi8`), straddling destination bytes when unaligned; only
+/// the trailing <8 bits fall back to per-bit stores.
+fn or_bits_at(out: &mut [u8], src: &[bool], bit: usize) {
+    let mut i = 0usize;
+    while i + 8 <= src.len() {
+        let mut w = 0u64;
+        for j in 0..8 {
+            w |= (src[i + j] as u64) << (8 * j);
+        }
+        let byte = ((w & 0x0101_0101_0101_0101).wrapping_mul(0x0102_0408_1020_4080) >> 56) as u8;
+        let o = (bit + i) >> 3;
+        let sh = (bit + i) & 7;
+        if sh == 0 {
+            out[o] |= byte;
         } else {
-            let off = bucket + in_tile as usize * cell_bytes;
-            tile_file[off..off + cell_bytes].copy_from_slice(cell);
+            out[o] |= byte << sh;
+            out[o + 1] |= byte >> (8 - sh);
+        }
+        i += 8;
+    }
+    for (k, b) in src[i..].iter().enumerate() {
+        let g = bit + i + k;
+        out[g >> 3] |= (*b as u8) << (g & 7);
+    }
+}
+
+/// Same as [`or_bits_at`] but the source is already a byte-aligned bit
+/// stream (`src[0]` holds bits 0..8, LSB-first) — the form the general cell
+/// writer keeps per row.
+pub(crate) fn or_bytes_at(out: &mut [u8], src: &[u8], bit: usize) {
+    for (i, byte) in src.iter().enumerate() {
+        let o = (bit + i * 8) >> 3;
+        let sh = (bit + i * 8) & 7;
+        if sh == 0 {
+            out[o] |= byte;
+        } else {
+            out[o] |= byte << sh;
+            out[o + 1] |= byte >> (8 - sh);
         }
     }
+}
 
+/// The writes both TSM writers pass to [`tsm_header`].
+struct TsmHeaderParams<'a> {
+    stman_type: &'a str,
+    big_endian: bool,
+    seq_nr: u32,
+    hypercolumn_name: &'a str,
+    data_type: DataType,
+    cell_shape: &'a [i64],
+    nrow: u64,
+    layout: &'a TsmLayout,
+    tile_file_len: usize,
+}
+
+/// The canonical big-endian AipsIO TSM header, shared by both writers.  For
+/// TiledShapeStMan this must reproduce casacore's exact layout or casacore
+/// cannot open the table: two file entries (a placeholder file 0, then the
+/// real tile file with sequence number 1), a placeholder cube 0 (no shape,
+/// file -1) before the real cube, and the singleHypercube row maps (verified
+/// against a casacore-written MS FLAG header).
+fn tsm_header(p: TsmHeaderParams<'_>) -> Vec<u8> {
+    let TsmHeaderParams {
+        stman_type,
+        big_endian,
+        seq_nr,
+        hypercolumn_name,
+        data_type,
+        cell_shape,
+        nrow,
+        layout,
+        tile_file_len,
+    } = p;
     let mut cube_shape = cell_shape.to_vec();
     cube_shape.push(nrow as i64);
     let mut tile_shape = cell_shape.to_vec();
-    tile_shape.push(rows_per_tile as i64);
+    tile_shape.push(layout.rows_per_tile as i64);
 
-    // Header: canonical big-endian AipsIO.
     let mut hw = crate::aipsio::Writer::new();
     hw.put_root_object_start(stman_type, 1);
     // Subclass payload: only TiledColumnStMan writes the fixed cell shape
@@ -675,59 +777,202 @@ pub fn write_tsm_file(
     hw.put_string(hypercolumn_name);
     hw.put_u32(0); // pers max cache size
     hw.put_i32(cell_shape.len() as i32 + 1); // nrdim = cell dims + rows
-    hw.put_u32(1); // nrfile
+                                             // Files: casacore's TiledShapeStMan always keeps a placeholder file 0
+                                             // and numbers the first real tile file 1 (the tile lives in
+                                             // `table.f{seq}_TSM1`); TiledColumnStMan uses a single file 0.
+    let is_shape = stman_type == "TiledShapeStMan";
+    let real_file_seq: i32 = if is_shape { 1 } else { 0 };
+    let nrfile: u32 = if is_shape { 2 } else { 1 };
+    hw.put_u32(nrfile);
+    if is_shape {
+        hw.put_bool(false); // file[0]: placeholder, absent
+    }
     hw.put_bool(true);
     hw.put_u32(1); // TSMFile version
-    hw.put_u32(0); // file sequence nr
-    hw.put_u32(tile_file.len() as u32); // file length
-    hw.put_u32(1); // nrcube
-                   // One TSMCube.
+    hw.put_u32(real_file_seq as u32); // TSMFile sequence number
+    hw.put_u32(tile_file_len as u32); // TSMFile length
+                                      // Cubes: TiledShapeStMan keeps a placeholder cube 0 (extensible=false,
+                                      // no shape, file -1) and the real cube at index 1; the singleHypercube
+                                      // row maps reference that index.
+    let nrcube: u32 = if is_shape { 2 } else { 1 };
+    hw.put_u32(nrcube);
+    if is_shape {
+        // cube[0]: placeholder for not-yet-set cells.
+        hw.put_u32(1); // cube version
+        put_empty_values_record(&mut hw);
+        hw.put_bool(false); // extensible
+        hw.put_i32(0); // nrdim
+        put_iposition(&mut hw, &[]); // cube_shape
+        put_iposition(&mut hw, &[]); // tile_shape
+        hw.put_i32(-1); // file seq nr (no file)
+        hw.put_u32(0); // file offset
+    }
+    // cube[1] (or the sole cube for TiledColumnStMan): the real data cube.
     hw.put_u32(1); // cube version
-                   // Empty hypercolumn values Record.
-    hw.put_object_start("Record", 1);
-    hw.put_object_start("RecordDesc", 2);
-    hw.put_i32(0); // no fields
-    hw.put_object_end();
-    hw.put_i32(0); // record type (Fixed)
-    hw.put_object_end();
+    put_empty_values_record(&mut hw);
     hw.put_bool(true); // extensible
     hw.put_i32(cube_shape.len() as i32);
     put_iposition(&mut hw, &cube_shape);
     put_iposition(&mut hw, &tile_shape);
-    hw.put_i32(0); // file sequence nr
+    hw.put_i32(real_file_seq); // file sequence nr
     hw.put_u32(0); // file offset (cube version 1)
     hw.put_object_end(); // TiledStMan
-    // TiledShapeStMan closes with the default tile shape and the row-interval
-    // maps (rowMap/cubeMap/posMap hold the LAST row of each interval, its
-    // cube and the last cell position). Two entries covering all rows of
-    // cube 0: casacore collapses a single entry into `singleHypercube()`,
-    // which indexes the placeholder cube 1 every MS keeps before its data
-    // cubes — a file with our single real cube at index 0 must avoid that
-    // path.
-    if stman_type == "TiledShapeStMan" {
+    if is_shape {
+        // TiledShapeStMan closes with the default tile shape and the
+        // row-interval maps (rowMap/cubeMap/posMap hold the LAST row of each
+        // interval, its cube and the last cell position).  A single real
+        // cube covering every row collapses to casacore's singleHypercube:
+        // one entry mapping row nrow-1 to cube 1 at position nrow-1.
         put_iposition(&mut hw, &tile_shape);
-        match nrow {
-            0 => {
-                hw.put_u32(0);
-            }
-            1 => {
-                hw.put_u32(1);
-                write_block(&mut hw, &[0]);
-                write_block(&mut hw, &[0]);
-                write_block(&mut hw, &[0]);
-            }
-            n => {
-                hw.put_u32(2);
-                let split = n as u32 - 2;
-                write_block(&mut hw, &[split, n as u32 - 1]);
-                write_block(&mut hw, &[0, 0]);
-                write_block(&mut hw, &[split, n as u32 - 1]);
-            }
+        if nrow == 0 {
+            hw.put_u32(0);
+        } else {
+            hw.put_u32(1);
+            write_block(&mut hw, &[nrow as u32 - 1]);
+            write_block(&mut hw, &[1]);
+            write_block(&mut hw, &[nrow as u32 - 1]);
         }
     }
     hw.put_object_end(); // stman_type
+    hw.into_bytes()
+}
 
-    Ok((hw.into_bytes(), tile_file))
+/// Write a whole bool column straight from its row bit-slices: the
+/// typed-buffer form of [`write_tsm_file`].  `rows[r]` holds cell `r`'s
+/// `cell_elems` bools (LSB-first); rows pack contiguously into the tiles —
+/// no per-row byte-aligning, intermediate `Vec<u8>` cells, or set-bit
+/// scatter at write time.
+pub fn write_tsm_file_bool(
+    stman_type: &str,
+    big_endian: bool,
+    seq_nr: u32,
+    hypercolumn_name: &str,
+    cell_shape: &[i64],
+    rows: &[&[bool]],
+) -> Result<(Vec<u8>, Vec<u8>, u32), TsmError> {
+    if stman_type != "TiledColumnStMan" && stman_type != "TiledShapeStMan" {
+        return Err(TsmError::UnexpectedType {
+            expected: "TiledColumnStMan".into(),
+            found: stman_type.into(),
+        });
+    }
+    let cell_elems = cell_shape.iter().product::<i64>();
+    if cell_elems <= 0 {
+        return Err(TsmError::UnsupportedType(DataType::Bool));
+    }
+    let cell_elems = cell_elems as usize;
+    if rows.iter().any(|r| r.len() != cell_elems) {
+        return Err(TsmError::UnsupportedType(DataType::Bool));
+    }
+    let nrow = rows.len() as u64;
+    let layout = tsm_layout(cell_shape, DataType::Bool, nrow)?;
+    let mut tile_file = vec![0u8; layout.bucket_size * layout.n_tiles as usize];
+    for (row, r) in rows.iter().enumerate() {
+        let tile = row as u64 / layout.rows_per_tile;
+        let in_tile = row as u64 % layout.rows_per_tile;
+        let bucket = tile as usize * layout.bucket_size;
+        or_bits_at(&mut tile_file[bucket..], r, in_tile as usize * cell_elems);
+    }
+    let hdr = tsm_header(TsmHeaderParams {
+        stman_type,
+        big_endian,
+        seq_nr,
+        hypercolumn_name,
+        data_type: DataType::Bool,
+        cell_shape,
+        nrow,
+        layout: &layout,
+        tile_file_len: tile_file.len(),
+    });
+    let real_file_seq = if stman_type == "TiledShapeStMan" {
+        1
+    } else {
+        0
+    };
+    Ok((hdr, tile_file, real_file_seq))
+}
+
+/// casacore numbers TiledShapeStMan's first real tile file 1.
+pub fn write_tsm_file(
+    stman_type: &str,
+    big_endian: bool,
+    seq_nr: u32,
+    hypercolumn_name: &str,
+    data_type: DataType,
+    cell_shape: &[i64],
+    cells: &[Vec<u8>],
+) -> Result<(Vec<u8>, Vec<u8>, u32), TsmError> {
+    if stman_type != "TiledColumnStMan" && stman_type != "TiledShapeStMan" {
+        return Err(TsmError::UnexpectedType {
+            expected: "TiledColumnStMan".into(),
+            found: stman_type.into(),
+        });
+    }
+    let elem_size = elem_size(data_type)?;
+    let is_bool = data_type == DataType::Bool;
+    let cell_elems: i64 = cell_shape.iter().product::<i64>();
+    let cell_bytes = if is_bool {
+        (cell_elems as usize).div_ceil(8)
+    } else {
+        cell_elems as usize * elem_size
+    };
+    if cells.iter().any(|c| c.len() != cell_bytes) {
+        return Err(TsmError::UnsupportedType(data_type));
+    }
+    let nrow = cells.len() as u64;
+    let layout = tsm_layout(cell_shape, data_type, nrow)?;
+
+    // Tile data file (data-file endianness; rows fill the tile grid). Bool
+    // cells are bit-packed (LSB-first), so a row's bits start at an
+    // arbitrary bit of the bucket: each byte-aligned cell is placed at the
+    // row's bit position (word-oriented, not bit-by-bit).
+    let mut tile_file = vec![0u8; layout.bucket_size * layout.n_tiles as usize];
+    for (row, cell) in cells.iter().enumerate() {
+        let tile = row as u64 / layout.rows_per_tile;
+        let in_tile = row as u64 % layout.rows_per_tile;
+        let bucket = tile as usize * layout.bucket_size;
+        if is_bool {
+            or_bytes_at(
+                &mut tile_file[bucket..],
+                cell,
+                in_tile as usize * cell_elems as usize,
+            );
+        } else {
+            let off = bucket + in_tile as usize * cell_bytes;
+            tile_file[off..off + cell_bytes].copy_from_slice(cell);
+        }
+    }
+
+    let hdr = tsm_header(TsmHeaderParams {
+        stman_type,
+        big_endian,
+        seq_nr,
+        hypercolumn_name,
+        data_type,
+        cell_shape,
+        nrow,
+        layout: &layout,
+        tile_file_len: tile_file.len(),
+    });
+    let real_file_seq = if stman_type == "TiledShapeStMan" {
+        1
+    } else {
+        0
+    };
+    Ok((hdr, tile_file, real_file_seq as u32))
+}
+
+/// The hypercolumn 'values' Record casacore stores in each TSM cube: an
+/// empty Record (RecordDesc with no fields) whose record type is 1 —
+/// byte-verified against a casacore-written MS FLAG header (the type field
+/// is 1, not the 0 a plain empty record would carry).
+fn put_empty_values_record(hw: &mut crate::aipsio::Writer) {
+    hw.put_object_start("Record", 1);
+    hw.put_object_start("RecordDesc", 2);
+    hw.put_i32(0); // no fields
+    hw.put_object_end();
+    hw.put_i32(1); // record type (Fixed)
+    hw.put_object_end();
 }
 
 fn put_iposition(w: &mut crate::aipsio::Writer, dims: &[i64]) {
@@ -850,8 +1095,16 @@ mod tests {
             .iter()
             .map(|d| tsm_encode_cell(big_endian, dt, d).unwrap())
             .collect();
-        let (header_bytes, tile_data) =
-            write_tsm_file("TiledColumnStMan", big_endian, 0, "TiledData_GROUP", dt, &casa_shape, &cells).unwrap();
+        let (header_bytes, tile_data, _) = write_tsm_file(
+            "TiledColumnStMan",
+            big_endian,
+            0,
+            "TiledData_GROUP",
+            dt,
+            &casa_shape,
+            &cells,
+        )
+        .unwrap();
         let header = parse_header(&header_bytes).unwrap();
 
         // Header geometry: fixed cell dims + the extensible row axis.
@@ -919,8 +1172,16 @@ mod tests {
     fn bool_tiles_are_bit_packed() {
         let data = ArrayData::Bool(vec![true, false, true, true, false, false]);
         let cells = vec![tsm_encode_cell(false, DataType::Bool, &data).unwrap()];
-        let (header, tile_data) =
-            write_tsm_file("TiledColumnStMan", false, 0, "g", DataType::Bool, &[3, 2], &cells).unwrap();
+        let (header, tile_data, _) = write_tsm_file(
+            "TiledColumnStMan",
+            false,
+            0,
+            "g",
+            DataType::Bool,
+            &[3, 2],
+            &cells,
+        )
+        .unwrap();
         // The six elements pack into one byte, LSB-first: bits 0, 2, 3 set.
         assert_eq!(&tile_data[..1], &[0b1101]);
         // And it still decodes to the original cell.
@@ -939,14 +1200,16 @@ mod tests {
     fn bool_rows_straddle_byte_boundaries() {
         let mut rows = Vec::new();
         for r in 0..4u8 {
-            rows.push(tsm_encode_cell(
-                false,
-                DataType::Bool,
-                &ArrayData::Bool(vec![r & 1 != 0, r & 2 != 0, r & 4 != 0]),
-            )
-            .unwrap());
+            rows.push(
+                tsm_encode_cell(
+                    false,
+                    DataType::Bool,
+                    &ArrayData::Bool(vec![r & 1 != 0, r & 2 != 0, r & 4 != 0]),
+                )
+                .unwrap(),
+            );
         }
-        let (header, tile_data) = write_tsm_file(
+        let (header, tile_data, _) = write_tsm_file(
             "TiledShapeStMan",
             false,
             0,
@@ -973,6 +1236,97 @@ mod tests {
         }
     }
 
+    /// The LUT/SWAR bit conversions must agree with the naive scalar form
+    /// on every bit pattern, including non-byte-aligned starts, tails, and
+    /// partial bytes (casacore `bitToBool`/`boolToBit` parity).
+    #[test]
+    fn bit_conversions_match_scalar() {
+        fn scalar_decode(bytes: &[u8], skip: usize, nbits: usize) -> Vec<bool> {
+            (0..nbits)
+                .map(|i| bytes[(skip + i) / 8] & (1 << ((skip + i) % 8)) != 0)
+                .collect()
+        }
+        fn scalar_encode(values: &[bool]) -> Vec<u8> {
+            let mut out = vec![0u8; values.len().div_ceil(8)];
+            for (i, b) in values.iter().enumerate() {
+                if *b {
+                    out[i / 8] |= 1 << (i % 8);
+                }
+            }
+            out
+        }
+        let mut rng = 0x1234_5678_9abc_def0u64;
+        let mut next = move || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng >> 33) as u8
+        };
+        for len in [0usize, 1, 7, 8, 9, 15, 16, 17, 31, 64, 65, 1000, 4097] {
+            let bytes: Vec<u8> = (0..len.div_ceil(8)).map(|_| next()).collect();
+            for skip in (0..16).chain([31, 63]) {
+                let nbits = len.saturating_sub(skip);
+                let vals = scalar_decode(&bytes, skip, nbits);
+                let ArrayData::Bool(got) = decode_bits(&bytes, skip, nbits).unwrap() else {
+                    panic!("decode len {len} skip {skip}");
+                };
+                assert_eq!(got, vals, "decode len {len} skip {skip}");
+                // encode() packs from bit 0 (no skip), LSB-first, incl. tails.
+                let enc = encode_bits(&vals);
+                assert_eq!(enc, scalar_encode(&vals), "encode len {len} skip {skip}");
+                let ArrayData::Bool(back) = decode_bits(&enc, 0, nbits).unwrap() else {
+                    panic!("re-decode len {len} skip {skip}");
+                };
+                assert_eq!(back, vals, "round-trip len {len} skip {skip}");
+            }
+        }
+        // Spot-check a fixed byte against casacore's conv_tab values.
+        let ArrayData::Bool(b8) = decode_bits(&[0b1010_0101], 0, 8).unwrap() else {
+            panic!();
+        };
+        assert_eq!(
+            b8,
+            vec![true, false, true, false, false, true, false, true],
+            "0xa5 decodes LSB-first"
+        );
+        assert_eq!(encode_bits(&b8), vec![0b1010_0101]);
+    }
+
+    /// The typed-buffer bool writer must produce byte-identical header and
+    /// tile files to the general per-cell writer for the same rows, for
+    /// both TSM storage managers and bit counts that force unaligned rows
+    /// and multi-tile columns.
+    #[test]
+    fn bool_typed_writer_matches_general_writer() {
+        let mut rng = 0xdead_beef_cafe_f00du64;
+        let mut next = move || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng >> 33) as u8
+        };
+        for &stman in &["TiledColumnStMan", "TiledShapeStMan"] {
+            for &cell_elems in &[3usize, 6, 8, 9, 158, 316] {
+                let nrow = 500 + (next() as usize % 400); // up to ~2 tiles
+                let rows: Vec<Vec<bool>> = (0..nrow)
+                    .map(|_| (0..cell_elems).map(|_| next() & 1 != 0).collect())
+                    .collect();
+                let shape = vec![cell_elems as i64];
+                let cells: Vec<Vec<u8>> = rows.iter().map(|r| encode_bits(r)).collect();
+                let general =
+                    write_tsm_file(stman, false, 0, "g", DataType::Bool, &shape, &cells).unwrap();
+                let typed_rows: Vec<&[bool]> = rows.iter().map(|r| r.as_slice()).collect();
+                let typed = write_tsm_file_bool(stman, false, 0, "g", &shape, &typed_rows).unwrap();
+                assert_eq!(general.0, typed.0, "header {stman} cell_elems {cell_elems}");
+                assert_eq!(general.1, typed.1, "tile {stman} cell_elems {cell_elems}");
+                assert_eq!(
+                    general.2, typed.2,
+                    "file_seq {stman} cell_elems {cell_elems}"
+                );
+            }
+        }
+    }
+
     /// A cell large enough to force more than one tile per row-spill boundary:
     /// 1024 dcomplex = 16 KiB/cell -> 32 rows per 512 KiB tile; 65 rows
     /// straddle three tiles. Exercises `tile_nr * bucket_size` offsets.
@@ -987,7 +1341,8 @@ mod tests {
             .map(|d| tsm_encode_cell(false, dt, d).unwrap())
             .collect();
         // 1-D cell of 1024 dcomplex (CASA shape).
-        let (header, tile_data) = write_tsm_file("TiledColumnStMan", false, 0, "g", dt, &[1024], &cells).unwrap();
+        let (header, tile_data, _) =
+            write_tsm_file("TiledColumnStMan", false, 0, "g", dt, &[1024], &cells).unwrap();
         let header = parse_header(&header).unwrap();
         let rows_per_tile = header.cubes[0].tile_shape[1];
         assert_eq!(rows_per_tile, 32);
@@ -1009,8 +1364,16 @@ mod tests {
     fn rejects_row_out_of_range() {
         let data = [sample_cell(DataType::Int, 0)];
         let cells = vec![tsm_encode_cell(false, DataType::Int, &data[0]).unwrap()];
-        let (header, tile_data) =
-            write_tsm_file("TiledColumnStMan", false, 0, "g", DataType::Int, &[3, 2], &cells).unwrap();
+        let (header, tile_data, _) = write_tsm_file(
+            "TiledColumnStMan",
+            false,
+            0,
+            "g",
+            DataType::Int,
+            &[3, 2],
+            &cells,
+        )
+        .unwrap();
         let header = parse_header(&header).unwrap();
         let tsm = TsmFile::from_header(header, tile_data, false);
         assert!(matches!(
@@ -1032,7 +1395,15 @@ mod tests {
         // One 1-byte and one 2-byte (u16) cell: 4-element Int cells are 16 B.
         let cells = vec![vec![0u8; 8], vec![0u8; 9]];
         assert!(matches!(
-            write_tsm_file("TiledColumnStMan", false, 0, "g", DataType::Int, &[3, 2], &cells),
+            write_tsm_file(
+                "TiledColumnStMan",
+                false,
+                0,
+                "g",
+                DataType::Int,
+                &[3, 2],
+                &cells
+            ),
             Err(TsmError::UnsupportedType(DataType::Int))
         ));
     }
@@ -1040,7 +1411,16 @@ mod tests {
     #[test]
     fn header_rejects_wrong_root_type() {
         let cells = vec![vec![0u8; 4]];
-        let (header, _) = write_tsm_file("TiledColumnStMan", false, 0, "g", DataType::Int, &[1], &cells).unwrap();
+        let (header, _, _) = write_tsm_file(
+            "TiledColumnStMan",
+            false,
+            0,
+            "g",
+            DataType::Int,
+            &[1],
+            &cells,
+        )
+        .unwrap();
         // Corrupt the root type name "TiledColumnStMan" in place.
         let mut bad = header;
         bad[12] = b'X';
@@ -1155,7 +1535,7 @@ mod tests {
             .iter()
             .map(|d| tsm_encode_cell(false, DataType::Int, d).unwrap())
             .collect();
-        let (header_bytes, tile_data) = write_tsm_file(
+        let (header_bytes, tile_data, _tsfile_seq) = write_tsm_file(
             "TiledShapeStMan",
             false,
             7,
@@ -1167,11 +1547,14 @@ mod tests {
         .unwrap();
         let header = parse_header(&header_bytes).unwrap();
         assert_eq!(header.root_type, "TiledShapeStMan");
+        assert_eq!(header.seq_nr, 7);
+        // casacore layout: a placeholder cube[0] precedes the real data cube.
+        assert_eq!(header.cubes.len(), 2);
+        assert_eq!(header.cubes[0].nrdim, 0);
         assert_eq!(
-            header.subclass_shape, header.cubes[0].tile_shape,
+            header.subclass_shape, header.cubes[1].tile_shape,
             "the header carries the default tile shape"
         );
-        assert_eq!(header.seq_nr, 7);
         let tsm = TsmFile::from_header(header, tile_data, false);
         let desc = array_desc(DataType::Int);
         for (row, d) in data.iter().enumerate() {
@@ -1189,11 +1572,12 @@ mod tests {
     /// default (zeros in the declared shape), like casacore.
     #[test]
     fn rows_outside_any_cube_read_as_defaults() {
-        let cells = vec![
-            tsm_encode_cell(false, DataType::Float, &ArrayData::Float(vec![1.0, 2.0])).unwrap(),
-        ];
+        let cells =
+            vec![
+                tsm_encode_cell(false, DataType::Float, &ArrayData::Float(vec![1.0, 2.0])).unwrap(),
+            ];
         // One cube holding a single row; the header claims 3 rows total.
-        let (header_bytes, tile_data) = write_tsm_file(
+        let (header_bytes, tile_data, _tsfile_seq) = write_tsm_file(
             "TiledShapeStMan",
             false,
             0,
@@ -1205,7 +1589,8 @@ mod tests {
         .unwrap();
         let mut header = parse_header(&header_bytes).unwrap();
         header.nrrow = 3;
-        header.cubes[0].cube_shape[1] = 1;
+        // The real data cube is cube[1] (cube[0] is the placeholder).
+        header.cubes[1].cube_shape[1] = 1;
         let tsm = TsmFile::from_header(header, tile_data, false);
         let mut desc = array_desc(DataType::Float);
         desc.shape = Some(vec![2]);
