@@ -311,6 +311,26 @@ fn fill_numpy_raw(
     buf: &Bound<'_, PyAny>,
 ) -> PyResult<bool> {
     let desc = &t.dat.desc.columns[col_idx];
+    // The raw borrowed-buffer path reads a column's bytes straight from the
+    // StandardStMan data file; any other storage manager (TiledShapeStMan
+    // scalar columns, ISM, ...) has no byte-addressable raw layout and must
+    // fall back to the generic path instead of erroring.
+    let is_ssm = t
+        .dat
+        .column_set
+        .columns
+        .get(col_idx)
+        .and_then(|c| {
+            t.dat
+                .column_set
+                .data_managers
+                .iter()
+                .find(|d| d.sequence_nr == c.data_manager_seq)
+        })
+        .is_some_and(|d| d.type_name == "StandardStMan");
+    if !is_ssm {
+        return Ok(false);
+    }
     let is_array = matches!(desc.kind, core::tabledesc::ColumnKind::Array);
     let count = if is_array {
         match &desc.shape {
@@ -606,7 +626,7 @@ impl Table {
                 let s = shared.lock().unwrap();
                 let mut out = column_cells(&s.read, col_idx, startrow, nrow)?;
                 for (i, r) in (startrow..startrow + nrow).enumerate() {
-                    if let Some(v) = s.wt.cell(col_idx, r) {
+                    if let Some(v) = s.wt.pending_cell(col_idx, r) {
                         out[i] = v.clone();
                     }
                 }
@@ -1701,7 +1721,7 @@ impl Table {
             Inner::Read(t) => t.getcell(col_idx, row).map_err(err),
             Inner::Write { shared, .. } => {
                 let s = shared.lock().unwrap();
-                match s.wt.cell(col_idx, row) {
+                match s.wt.pending_cell(col_idx, row) {
                     Some(v) => Ok(v.clone()),
                     None => s.read.getcell(col_idx, row).map_err(err),
                 }
@@ -1729,7 +1749,7 @@ impl Table {
             Inner::Read(t) => t.getcellslice(col_idx, row, blc, trc).map_err(err),
             Inner::Write { shared, .. } => {
                 let s = shared.lock().unwrap();
-                match s.wt.cell(col_idx, row) {
+                match s.wt.pending_cell(col_idx, row) {
                     Some(v) => Ok(v.clone()),
                     None => s.read.getcellslice(col_idx, row, blc, trc).map_err(err),
                 }
@@ -1761,7 +1781,7 @@ impl Table {
                     .getcolslice(col_idx, blc, trc, startrow, nrow)
                     .map_err(err)?;
                 for (i, r) in (startrow..startrow + nrow).enumerate() {
-                    if let Some(v) = s.wt.cell(col_idx, r) {
+                    if let Some(v) = s.wt.pending_cell(col_idx, r) {
                         out[i] = v.clone();
                     }
                 }

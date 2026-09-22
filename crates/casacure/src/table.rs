@@ -1899,6 +1899,25 @@ impl WritableTable {
             .and_then(|c| c.as_ref())
     }
 
+    /// The value of one cell IF it was written since the last flush: the
+    /// pending-bit-filtered view of [`WritableTable::cell`].  A lazily
+    /// opened table's rows hold `Some(default)` cells (from `addrows`) that
+    /// are NOT pending and must not overlay the on-disk values on a merged
+    /// read — only rows actually `putcell`/`putcol`'d are pending.
+    pub fn pending_cell(&self, col_idx: usize, row: u64) -> Option<&RecordValue> {
+        let bit = 1u64 << ((row as usize) % 64);
+        if self
+            .pending
+            .get(col_idx)?
+            .get((row as usize) / 64)
+            .is_some_and(|w| w & bit != 0)
+        {
+            self.cell(col_idx, row)
+        } else {
+            None
+        }
+    }
+
     pub fn setmaxcachesize(&mut self, _col_idx: usize, _size: usize) {}
 
     pub fn putkeyword(&mut self, name: &str, value: RecordValue) {
