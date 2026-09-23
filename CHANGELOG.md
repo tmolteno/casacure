@@ -3,9 +3,18 @@
 All notable changes to this project are documented here. Completed `TODO.md`
 subtasks are moved here.
 
-## [Unreleased]
+## [3.8.4] - 2026-09-23
 
 ### Added
+
+- **Memory-vs-dask-ms-chunking test suite** (`tests/test_memory_chunking.py`):
+  measures peak RSS on both backends for dask-ms chunked reads and a
+  skarabina-style write-changed-only FLAG patch, asserting memory tracks the
+  dask-ms row chunk rather than the whole column (FLAG parity workload
+  covered; see handover.md). Skips without dask-ms (CI), each backend only
+  when importable; peak RSS is polled from the child's `/proc` VmHWM because
+  sandboxed `getrusage`/`ru_maxrss` (inherited across fork+exec) are
+  unreliable.
 
 - **TiledShapeStMan: read and write** — the storage manager real casacore
   MSs use for DATA/FLAG/WEIGHT_SPECTRUM (tiling hypercubes across many

@@ -47,7 +47,7 @@ dependencies = ["numpy"]
 # interface changes). The crates.io crate and this wheel share the same
 # three-part A.B.P, so both are published together per release
 # (see Cargo.toml [workspace.package]).
-version = "3.8.3"
+version = "3.8.4"
 
 [project.scripts]
 casacure-test = "casacure:run_tests"
