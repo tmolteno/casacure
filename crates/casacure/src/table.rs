@@ -2029,27 +2029,81 @@ impl WritableTable {
             create_table(&dir, &self.desc, &values)?;
             // The regrowth wrote every cell: nothing is pending anymore.
             self.clear_all_pending();
+            self.touched.fill(false);
             return Ok(dir);
         }
         self.flush_preserving(&dir)?;
+        // `touched` is scoped to the un-flushed writes of one session: a
+        // later write round (possibly on a reused handle) must be judged
+        // against the flushed state, not forever keep every previously
+        // written column "touched" -- otherwise a table whose columns have
+        // all been written at least once could never take the incremental
+        // preserving path again.
+        self.touched.fill(false);
         Ok(dir)
     }
 
-    /// The whole cell store as per-column value lists (column defaults for
-    /// missing cells) — the input for a whole-table regrowth.
+    /// The whole cell store as per-column value lists — the input for a
+    /// whole-table regrowth.  A column with every cell buffered (a full
+    /// session write) is taken straight from memory; only columns with
+    /// unreleased `None` cells read their on-disk values for those rows (a
+    /// regrowth must never default-fill rows whose values were released by
+    /// an earlier flush, or a later partial write would clobber the
+    /// untouched rows to defaults).  Rows beyond the on-disk row count
+    /// (fresh `addrows`) default-fill; a table that does not exist on disk
+    /// yet (first flush of a new table) defaults the whole column.
     fn materialize_all(&self) -> Result<Vec<Vec<RecordValue>>, WriteTableError> {
+        let nrow = self.cells.first().map_or(0, Vec::len) as u64;
+        let file_exists = self.dir.join("table.dat").is_file();
         let mut values: Vec<Vec<RecordValue>> = Vec::with_capacity(self.cells.len());
-        for (col_idx, col) in self.cells.iter().enumerate() {
-            let cd = &self.desc.columns[col_idx];
-            let mut list = Vec::with_capacity(col.len());
-            for cell in col {
-                match cell {
-                    Some(v) => list.push(v.clone()),
-                    None => list.push(default_cell_value(cd).ok_or_else(|| {
+        for (col_idx, cd) in self.desc.columns.iter().enumerate() {
+            let col = &self.cells[col_idx];
+            let has_none = col.iter().any(Option::is_none);
+            let mut list: Vec<RecordValue> = if !has_none {
+                // Everything is buffered in memory: no disk involvement.
+                col.iter()
+                    .cloned()
+                    .map(|v| v.expect("covered by has_none"))
+                    .collect()
+            } else if file_exists {
+                let t = crate::Table::open(&self.dir, false)
+                    .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                // A column this session added (ALTER TABLE) does not exist
+                // in the on-disk table yet: default-fill it below.
+                let on_disk = col_idx < t.dat.desc.columns.len();
+                let disk_rows = if on_disk { t.nrows().min(nrow) } else { 0 };
+                let mut l: Vec<RecordValue> = if on_disk {
+                    t.getcol(col_idx, 0, disk_rows)
+                        .map_err(|e| WriteTableError::Storage(e.to_string()))?
+                } else {
+                    Vec::new()
+                };
+                // Rows added since the on-disk state default-fill.
+                while l.len() < nrow as usize {
+                    l.push(
+                        default_cell_value(cd).ok_or_else(|| WriteTableError::NoDefault {
+                            name: cd.name.clone(),
+                        })?,
+                    );
+                }
+                l
+            } else {
+                Vec::with_capacity(col.len())
+            };
+            if list.is_empty() {
+                for _ in 0..nrow {
+                    list.push(default_cell_value(cd).ok_or_else(|| {
                         WriteTableError::NoDefault {
                             name: cd.name.clone(),
                         }
-                    })?),
+                    })?);
+                }
+            }
+            for (r, cell) in col.iter().enumerate() {
+                if let Some(v) = cell {
+                    if let Some(slot) = list.get_mut(r) {
+                        *slot = v.clone();
+                    }
                 }
             }
             values.push(list);
@@ -2160,44 +2214,55 @@ impl WritableTable {
             let storage = |e: TableCreateError| WriteTableError::Storage(e.to_string());
             match dm.type_name.as_str() {
                 "StandardStMan" | "IncrementalStMan" => {
-                    // Full-column rebuild from the on-disk values overlaid
-                    // with the pending rows (a StandardStMan bucket groups
-                    // several columns, so it cannot be byte-patched in
-                    // place; for the small scalar columns MS writes touch —
-                    // e.g. FLAG_ROW — the decode is cheap).
-                    let mut all_vals: Vec<Vec<RecordValue>> =
-                        vec![Vec::new(); self.desc.columns.len()];
-                    for &col in &cols {
-                        all_vals[col] = self.materialize_col_from_disk(col, nrow)?;
-                    }
-                    if dm.type_name == "StandardStMan" {
-                        let (f0, f0i, _spec) = build_ssm_data(
-                            false,
-                            nrow,
-                            &dm.type_name,
-                            &self.desc,
-                            &all_vals,
-                            &cols,
-                        )
-                        .map_err(storage)?;
-                        std::fs::write(dir.join(format!("table.f{seq}")), f0)
-                            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
-                        if let Some(i) = f0i {
-                            std::fs::write(dir.join(format!("table.f{seq}i")), i)
+                    // Incremental in-place path (StandardStMan): patch the
+                    // pending rows' buckets directly — a bucket holds
+                    // fixed-size cells at stable byte offsets, so only the
+                    // touched buckets are read and rewritten and resident
+                    // memory tracks the dask-ms write chunk, not the column.
+                    // Strings / records / array columns fall back to the
+                    // full-column rebuild (their cells reference
+                    // variable-size string / array buckets).
+                    let patched = dm.type_name == "StandardStMan"
+                        && self.patch_ssm_column(dir, seq, &dat, &cols)?;
+                    if !patched {
+                        // Full-column rebuild from the on-disk values
+                        // overlaid with the pending rows (the fallback for
+                        // IncrementalStMan, variable-size cells, and rows
+                        // whose DM cannot be byte-patched).
+                        let mut all_vals: Vec<Vec<RecordValue>> =
+                            vec![Vec::new(); self.desc.columns.len()];
+                        for &col in &cols {
+                            all_vals[col] = self.materialize_col_from_disk(col, nrow)?;
+                        }
+                        if dm.type_name == "StandardStMan" {
+                            let (f0, f0i, _spec) = build_ssm_data(
+                                false,
+                                nrow,
+                                &dm.type_name,
+                                &self.desc,
+                                &all_vals,
+                                &cols,
+                            )
+                            .map_err(storage)?;
+                            std::fs::write(dir.join(format!("table.f{seq}")), f0)
+                                .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                            if let Some(i) = f0i {
+                                std::fs::write(dir.join(format!("table.f{seq}i")), i)
+                                    .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                            }
+                        } else {
+                            let f0 = build_ism_data(
+                                false,
+                                nrow,
+                                &dm.type_name,
+                                &self.desc,
+                                &all_vals,
+                                &cols,
+                            )
+                            .map_err(storage)?;
+                            std::fs::write(dir.join(format!("table.f{seq}")), f0)
                                 .map_err(|e| WriteTableError::Storage(e.to_string()))?;
                         }
-                    } else {
-                        let f0 = build_ism_data(
-                            false,
-                            nrow,
-                            &dm.type_name,
-                            &self.desc,
-                            &all_vals,
-                            &cols,
-                        )
-                        .map_err(storage)?;
-                        std::fs::write(dir.join(format!("table.f{seq}")), f0)
-                            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
                     }
                     for &col in &cols {
                         self.clear_pending(col);
@@ -2240,6 +2305,137 @@ impl WritableTable {
             }
         }
         Ok(())
+    }
+
+    /// Byte-patch the on-disk StandardStMan data file of data-manager `seq`
+    /// with its pending rows, leaving every other bucket untouched.  A
+    /// StandardStMan bucket holds each column's fixed-size cells at stable
+    /// byte offsets, so the pending rows are written straight into their
+    /// bucket regions and only the touched buckets are read back and
+    /// rewritten — resident memory tracks the written rows (one dask-ms
+    /// chunk), not the whole column.
+    ///
+    /// Only fixed-size scalar columns (numeric and bit-packed Bool) can be
+    /// patched in place; a DM containing string / record / array columns is
+    /// not (those cells reference variable-size string / array buckets).
+    /// Returns `Ok(false)` so the caller keeps the full-rebuild path.
+    fn patch_ssm_column(
+        &self,
+        dir: &std::path::Path,
+        seq: u32,
+        dat: &TableDat,
+        cols: &[usize],
+    ) -> Result<bool, WriteTableError> {
+        use std::collections::BTreeMap;
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        use crate::columnset::DataManagerBlob;
+        use crate::record::DataType;
+        use crate::ssm::{encode_scalar_cell, scalar_cell_size, StandardStManFile, DATA_START};
+        use crate::tabledesc::ColumnKind;
+
+        if cols.iter().any(|&c| {
+            let cd = &self.desc.columns[c];
+            !matches!(cd.kind, ColumnKind::Scalar(_)) || cd.data_type == DataType::String
+        }) {
+            return Ok(false);
+        }
+        let big_endian = dat.header.big_endian;
+        let dm = dat
+            .column_set
+            .data_managers
+            .iter()
+            .find(|d| d.sequence_nr == seq)
+            .ok_or_else(|| WriteTableError::Storage(format!("table.dat lost DM sequence {seq}")))?;
+        let DataManagerBlob::StandardStMan(spec) = &dm.blob else {
+            return Ok(false);
+        };
+        let parsed = StandardStManFile::open(dir, seq, big_endian)
+            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+        let bucket_size = parsed.header.bucket_size as usize;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join(format!("table.f{seq}")))
+            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+
+        // Per touched bucket: bit set/clear ops (byte -> (set, clear) mask;
+        // several pending Bool rows share a byte, so masks must accumulate)
+        // and whole-byte cell replacements for fixed-size scalar cells.
+        let mut bit_ops: BTreeMap<u32, BTreeMap<usize, (u8, u8)>> = BTreeMap::new();
+        let mut byte_patches: BTreeMap<u32, Vec<(usize, Vec<u8>)>> = BTreeMap::new();
+        for &col in cols {
+            let cd = self.desc.columns[col].clone();
+            let cell_size = u64::from(scalar_cell_size(&cd));
+            let is_bit_cell = cd.data_type == DataType::Bool;
+            let cell_bits = if is_bit_cell { 1 } else { cell_size * 8 };
+            let index_nr = *spec.col_index_map.get(col).unwrap_or(&0) as usize;
+            let index = parsed
+                .indices
+                .get(index_nr)
+                .ok_or_else(|| WriteTableError::Storage(format!("SSM index {index_nr} missing")))?;
+            let column_offset = u64::from(*spec.column_offset.get(col).unwrap_or(&0));
+            for r in self.pending_rows(col) {
+                let Some(Some(value)) = self.cells[col].get(r as usize) else {
+                    continue;
+                };
+                let bucket = index
+                    .find(r)
+                    .ok_or_else(|| WriteTableError::Storage(format!("SSM row {r} out of range")))?;
+                let bit_off = column_offset * 8 + (r - bucket.start_row) * cell_bits;
+                let cell = encode_scalar_cell(big_endian, &cd, value)
+                    .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                let byte = usize::try_from(bit_off / 8).unwrap_or(usize::MAX);
+                if is_bit_cell {
+                    let mask = 1u8 << (bit_off % 8);
+                    let e = bit_ops
+                        .entry(bucket.number)
+                        .or_default()
+                        .entry(byte)
+                        .or_insert((0, 0));
+                    if cell.first() != Some(&0) {
+                        e.0 |= mask; // set the bit
+                    } else {
+                        e.1 |= mask; // clear the bit
+                    }
+                } else {
+                    byte_patches
+                        .entry(bucket.number)
+                        .or_default()
+                        .push((byte, cell));
+                }
+            }
+        }
+        let buckets: std::collections::BTreeSet<u32> =
+            bit_ops.keys().chain(byte_patches.keys()).copied().collect();
+        for number in buckets {
+            let base = DATA_START + number as usize * bucket_size;
+            let mut buf = vec![0u8; bucket_size];
+            file.seek(SeekFrom::Start(base as u64))
+                .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+            file.read_exact(&mut buf)
+                .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+            if let Some(ops) = bit_ops.get(&number) {
+                for (&byte, &(set, clear)) in ops {
+                    if let Some(b) = buf.get_mut(byte) {
+                        *b = (*b | set) & !clear;
+                    }
+                }
+            }
+            if let Some(patches) = byte_patches.get(&number) {
+                for (off, bytes) in patches {
+                    let (off, end) = (*off, off + bytes.len());
+                    if end <= buf.len() {
+                        buf[off..end].copy_from_slice(bytes);
+                    }
+                }
+            }
+            file.seek(SeekFrom::Start(base as u64))
+                .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+            file.write_all(&buf)
+                .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+        }
+        Ok(true)
     }
 
     /// One column's current values: its on-disk cells with the pending
@@ -3939,6 +4135,185 @@ mod tests {
         let scan = t.getcol(2, 0, nrows as u64).unwrap();
         for (r, v) in scan.iter().enumerate() {
             assert_eq!(*v, RecordValue::Int(r as i32), "SCAN_NUMBER row {r}");
+        }
+    }
+
+    /// An incremental (patch-in-place) StandardStMan flush must leave the
+    /// data file byte-identical to a full rebuild of the same final state:
+    /// byte-level proof that the bucket patch writes the same cell bytes at
+    /// the same offsets as `build_ssm_data`, including the bit-packed Bool
+    /// region where several rows share a byte, and that untouched buckets
+    /// (header, index chain, unmodified rows) never change.  Exercises
+    /// mixed bit + int columns in one SSM DM with rows spanning several
+    /// buckets, plus a second flush re-overwriting the same rows.
+    #[test]
+    fn ssm_incremental_flush_matches_full_rebuild() {
+        use crate::record::RecordValue;
+        let mut desc = typed_desc();
+        desc.columns = vec![
+            scalar_col("FLAG_ROW", DataType::Bool, 0),
+            scalar_col("SCAN_NUMBER", DataType::Int, 0),
+            scalar_col("TIME", DataType::Double, 0),
+        ];
+        let nrows = 300usize;
+        // Rewritten rows: heavily in the first bucket (bit sharing between
+        // rows 0..31) and spread across later buckets too.
+        let changed: Vec<usize> = (0..nrows).filter(|&r| r < 90 || r % 5 == 0).collect();
+        let base = |r: usize, c: usize| -> RecordValue {
+            match c {
+                0 => RecordValue::Bool((r * 3 + 1).is_multiple_of(7)),
+                1 => RecordValue::Int((r * 5 + c) as i32),
+                _ => RecordValue::Double(r as f64 * 1.5 + c as f64),
+            }
+        };
+        // First patch round: bool toggles set+clear patterns, ints take
+        // non-trivial values.
+        let p1 = |r: usize, c: usize| -> RecordValue {
+            match c {
+                0 => RecordValue::Bool((r * 7 + 3).is_multiple_of(11)),
+                _ => RecordValue::Int((r as i32 * 3) ^ c as i32),
+            }
+        };
+        // Second round overwrites the same rows (different values).
+        let p2 = |r: usize, c: usize| -> RecordValue {
+            match c {
+                0 => RecordValue::Bool(((r * 13 + 5).is_multiple_of(17)) == (r.is_multiple_of(2))),
+                _ => RecordValue::Int(((r * r + c) % 1000) as i32),
+            }
+        };
+        let final_val = |r: usize, c: usize| -> RecordValue {
+            if c == 2 {
+                base(r, c)
+            } else if changed.contains(&r) {
+                p2(r, c)
+            } else {
+                base(r, c)
+            }
+        };
+        let dir = temp_dir("ssmpatch");
+        {
+            // Full write of the base state through a fresh table.
+            let mut wt = WritableTable::create(&dir, desc.clone());
+            wt.addrows(nrows as u64);
+            for r in 0..nrows {
+                for c in 0..3 {
+                    wt.putcell(c, r as u64, base(r, c)).unwrap();
+                }
+            }
+            wt.flush().unwrap();
+        }
+        {
+            // Incremental rounds on a fresh update handle (the dask-ms
+            // per-chunk pattern), touching only columns 0 and 1 so TIME
+            // stays untouched and the flush is incremental rather than a
+            // regrowth.
+            let (_snap, mut wt) = WritableTable::open_for_update(&dir).unwrap();
+            for &r in &changed {
+                wt.putcell(0, r as u64, p1(r, 0)).unwrap();
+                wt.putcell(1, r as u64, p1(r, 1)).unwrap();
+            }
+            wt.flush().unwrap(); // incremental patch #1
+            for &r in &changed {
+                wt.putcell(0, r as u64, p2(r, 0)).unwrap();
+                wt.putcell(1, r as u64, p2(r, 1)).unwrap();
+            }
+            wt.flush().unwrap(); // incremental patch #2 (re-overwrites)
+        }
+        let dir2 = temp_dir("ssmpatch2");
+        {
+            // A single full write of the same final state.
+            let mut wt = WritableTable::create(&dir2, desc.clone());
+            wt.addrows(nrows as u64);
+            for r in 0..nrows {
+                for c in 0..3 {
+                    wt.putcell(c, r as u64, final_val(r, c)).unwrap();
+                }
+            }
+            wt.flush().unwrap();
+        }
+        let patched = std::fs::read(dir.join("table.f0")).unwrap();
+        let rebuilt = std::fs::read(dir2.join("table.f0")).unwrap();
+        assert_eq!(
+            patched, rebuilt,
+            "incremental SSM flush must be byte-identical to a full rebuild"
+        );
+        let t = Table::open(&dir, true).unwrap();
+        for r in 0..nrows as u64 {
+            for c in 0..3u64 {
+                assert_eq!(
+                    t.getcell(c as usize, r).unwrap(),
+                    final_val(r as usize, c as usize),
+                    "row {r} col {c}"
+                );
+            }
+        }
+    }
+
+    /// A table fully written in one session must survive a second session
+    /// that rewrites only one column: the flush must take the incremental
+    /// preserving path (fresh `touched` after the first flush) and the
+    /// fallback regrowth must read the on-disk values rather than
+    /// default-filling every row the session did not buffer — otherwise a
+    /// reopen-then-rewrite clobbers the untouched columns to their defaults
+    /// (observed as `TIME` being zeroed after a dask-ms DATA write-back).
+    #[test]
+    fn reopen_partial_write_preserves_untouched_columns() {
+        use crate::record::RecordValue;
+        let mut desc = typed_desc();
+        desc.columns = vec![
+            scalar_col("A", DataType::Int, 0),
+            scalar_col("B", DataType::Double, 0),
+            scalar_col("C", DataType::Bool, 0),
+        ];
+        let nrows = 200usize;
+        let dir = temp_dir("reopen");
+        {
+            let mut wt = WritableTable::create(&dir, desc.clone());
+            wt.addrows(nrows as u64);
+            for r in 0..nrows {
+                wt.putcell(0, r as u64, RecordValue::Int(r as i32)).unwrap();
+                wt.putcell(1, r as u64, RecordValue::Double(r as f64 / 3.0))
+                    .unwrap();
+                wt.putcell(2, r as u64, RecordValue::Bool(r.is_multiple_of(2)))
+                    .unwrap();
+            }
+            wt.flush().unwrap();
+        }
+        {
+            // Second session: rewrite only rows 10..50 of column A.
+            let (_snap, mut wt) = WritableTable::open_for_update(&dir).unwrap();
+            assert!(
+                wt.touched.iter().all(|&t| !t),
+                "fresh update handle starts with no touched columns"
+            );
+            for r in 10..50usize {
+                wt.putcell(0, r as u64, RecordValue::Int((r * 3) as i32))
+                    .unwrap();
+            }
+            wt.flush().unwrap();
+            assert!(
+                wt.touched.iter().all(|&t| !t),
+                "touched resets after a successful flush"
+            );
+        }
+        let t = Table::open(&dir, true).unwrap();
+        for r in 0..nrows as u64 {
+            let a_exp = if (10..50).contains(&(r as usize)) {
+                RecordValue::Int((r as i32) * 3)
+            } else {
+                RecordValue::Int(r as i32)
+            };
+            assert_eq!(t.getcell(0, r).unwrap(), a_exp, "A row {r}");
+            assert_eq!(
+                t.getcell(1, r).unwrap(),
+                RecordValue::Double(r as f64 / 3.0),
+                "B row {r} clobbered to default"
+            );
+            assert_eq!(
+                t.getcell(2, r).unwrap(),
+                RecordValue::Bool(r.is_multiple_of(2)),
+                "C row {r} clobbered to default"
+            );
         }
     }
 

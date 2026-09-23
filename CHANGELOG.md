@@ -3,6 +3,30 @@
 All notable changes to this project are documented here. Completed `TODO.md`
 subtasks are moved here.
 
+## [Unreleased]
+
+### Fixed
+
+- **StandardStMan flushes are now incremental** (`patch_ssm_column`): a
+  per-chunk dask-ms write no longer rebuilds the whole SSM column — only
+  the buckets holding the written rows are patched in place (numeric and
+  bit-packed Bool scalar cells; strings/records/arrays still rebuild). Peak
+  RSS tracks the write chunk instead of the column: the skarabina
+  write-changed-only FLAG+FLAG_ROW workload measured 273 MiB @ 2000-row
+  chunks (was ~O(column) on every flush) vs 128 MiB for real casacore.
+  Byte-identical to a full rebuild (regression test
+  `ssm_incremental_flush_matches_full_rebuild`).
+- **Partial writes after a full session no longer clobber untouched
+  columns.** Two defects in the incremental-flush design: `touched` stayed
+  sticky across flush/reopen (forcing a whole-table regrowth on every later
+  flush), and the regrowth path default-filled every released cell instead
+  of reading the on-disk value — so the dask-ms write-back smoke
+  ("TIME clobbered") and a reopen-then-rewrite dropped whole columns to
+  their defaults. `touched` now resets after each flush and
+  `materialize_all` reads the disk for unreleased cells. Regression test
+  `reopen_partial_write_preserves_untouched_columns`; the dask-ms smoke
+  passes end to end.
+
 ## [3.8.4] - 2026-09-23
 
 ### Added

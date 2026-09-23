@@ -379,3 +379,64 @@ complex64 DATA = 100 MiB):**
 Verified: **6/6 pass** in `.venv-bench` (both backends, TSM flag); 2/2 pass +
 parity/flag skip in a casacure-only env (no real casacore); whole module
 skips without dask-ms (CI). ~2.5 min runtime.
+
+## Next action taken: SSM incremental flush + write-path correctness fixes (2026-09-24)
+
+Released **v3.8.4** (tag pushed 2026-09-23; PyPI + crates.io publish via OIDC CI).
+Next action implemented on top of that release:
+
+**1. StandardStMan flush is now incremental (`patch_ssm_column` in table.rs).**
+`flush_preserving`'s StandardStMan branch previously rebuilt the whole column
+per flush (`materialize_col_from_disk` read every row + `build_ssm_data`
+rewrote the file) — the O(column) gap behind the ~870 MiB flat flag-write on
+SSM layouts. Now, for a DM whose pending columns are fixed-size scalars
+(numeric + bit-packed Bool), the pending rows' buckets are patched in place:
+read only the touched buckets, apply cell bytes / accumulate per-byte bit
+set+clear masks (several Bool rows share a byte — the first attempt replaced
+whole bytes and wiped co-located rows' bits), write the buckets back. Header,
+index chain and untouched buckets never change. Strings/records/arrays and
+IncrementalStMan still fall back to the full rebuild (their cells reference
+variable-size buckets). Guarded by
+`ssm_incremental_flush_matches_full_rebuild` (byte-identical to a full
+rebuild) and the existing incremental test.
+
+Measured (skarabina-exact synthetic MS: DATA TiledColumnStMan, FLAG
+TiledShapeStMan bool, FLAG_ROW StandardStMan bool, 100k rows; flag =
+write FLAG + FLAG_ROW changed-only via dask-ms, flush per chunk):
+
+| workload | chunk | casacure (MiB) | casacore (MiB) |
+|---|---|---|---|
+| flag-write (TSM FLAG + SSM FLAG_ROW) | 2000 | **273** | 128 |
+| flag-write (TSM FLAG + SSM FLAG_ROW) | 50000 | **407** | 203 |
+
+(previous numbers for the same workload included the FLAG_ROW O(column)
+rebuild per chunk). SSM **array** columns (e.g. a synthetic FLAG stored on
+StandardStMan) still take the full-rebuild path — real MSes store FLAG as
+TSM, so the production path is covered.
+
+**2. Fixed a pre-existing data-loss bug in the incremental-flush design**
+(confirmed against the baseline build and the released wheel, i.e. not
+introduced by this work): a table fully written in one session, then reopened
+and partially rewritten, had the untouched columns **clobbered to defaults**.
+The dask-ms write-back smoke (`tests/daskms_smoke.py` "TIME clobbered") hit
+it. Two root causes, both fixed in table.rs:
+- `WritableTable::touched` was sticky across flush/reopen (the shared write
+  backing kept every once-written column "touched" forever), so any later
+  flush was forced onto the full-regrowth path. `touched` now resets to
+  false after each successful flush.
+- The regrowth path (`materialize_all`) default-filled every cell the session
+  had not buffered (released by an earlier flush). It now reads the on-disk
+  column and overlays the buffered cells; only rows added past the on-disk
+  row count default-fill. Fresh-table creation is unchanged.
+Guarded by `reopen_partial_write_preserves_untouched_columns`.
+
+**3. Pre-existing Python-suite failures on this machine (NOT from this
+work; reproduce identically on the baseline build and the released 3.8.3
+wheel):**
+`test_casacore_ported.py::{test_check_putdata, test_tableascii}` ("row 0 not
+covered by any indexed bucket"), `test_casacore_helpers.py::{test_removecols,
+test_getcell_keeps_singleton_dims, test_relative_path_ms_links_resolve_from_any_cwd}`,
+`test_core_tables_e2e.py::test_scalar_roundtrip_incremental[boolean]`,
+`test_core_tables_e2e.py::test_error_paths[out-of-range_getcell]` (7 total,
+122 pass). The dask-ms smoke "TIME clobbered" was #2 above and is fixed.
+Rust: 148 lib + 15 integration tests pass.
