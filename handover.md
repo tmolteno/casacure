@@ -63,6 +63,22 @@ flag counts to confirm identical work. Report ratio vs casacore.
 
 ## Status / results
 
+- **Current comparison (2026-09-23, updated)** — full changed-only flag run on `data/bpcal.ms`
+  (freqav=1, all verbs incl. `save:imported`, `spectral-window`, `--summary`, rc=0), 3 runs
+  each, medians, same workload both backends:
+
+  | backend | wall (median) | peak RSS (median) | ratio |
+  |---|---|---|---|
+  | casacure | **53.7 s** (53.3–54.8) | **2241 MiB** (2225–2250) | 2.85× wall, 4.04× RSS |
+  | casacore | 18.9 s (18.5–20.0) | 555 MiB (553–574) | 1.0 |
+
+  vs the session-start baseline (casacure 69.1 s / 3.35 GiB; casacore 5.4 s / 0.57 GiB —
+  that casacore figure predates the current input state, which now carries accumulated
+  flagversions and re-measures ~18.9 s): casacure wall **69 → 54 s** and RSS **3.35 → 2.24 GiB**
+  (~1.3× wall, ~1.5× memory improvement from the incremental flush + pending-cell changes;
+  the gap to casacore is 2.85× / 4.0×). Correctness caveat: FLAG_ROW is bit-identical but
+  FLAG still differs 29.9 % (the 4-bit tile-boundary write bug, next action #1 below).
+
 - [Plan] handover created; harness run via bench.py confirmed (subprocess, wait4 rusage).
 - [Smoke] `flag ms_cure_2k.ms`: casacure rc=0 (freqavg 8), **casacore FAILS to even build the
   dask-ms graph** — `ValueError: conflicting sizes for dimension 'uvw'`. Cause: the synthetic MS,
