@@ -2306,11 +2306,27 @@ impl WritableTable {
         let Some(cd) = self.desc.columns.get(col) else {
             return Ok(None);
         };
+        // Tile geometry from the parsed header's real data cube — never
+        // recomputed from the descriptor.  The reader (`TsmFile::read_cell`)
+        // groups rows by the cube's tile shape and places each tile at a
+        // byte-aligned bucket of `ceil(tile_bits/8)`, so the patch must use
+        // the SAME rows-per-tile and bucket bytes or every tile >= 1 of a
+        // table whose tile shape differs from the default (e.g. a casacore-
+        // written MS with 829-row tiles) is mis-placed.  Equivalent to
+        // `tsm_layout` when the header was written by this crate, which keeps
+        // the two self-consistent.
+        let rows_per_tile = cube.tile_shape[nrdim - 1] as u64;
         let cell_shape: Vec<i64> = cube.cube_shape[..nrdim - 1].to_vec();
-        let layout = match crate::tsm::tsm_layout(&cell_shape, cd.data_type, nrow) {
-            Ok(l) => l,
-            Err(_) => return Ok(None),
+        let cell_elems = cell_shape.iter().product::<i64>().max(0) as usize;
+        let bucket_bytes = match cd.data_type {
+            crate::record::DataType::Bool => (cell_elems * rows_per_tile as usize).div_ceil(8),
+            _ => {
+                let elem = crate::tsm::elem_size(cd.data_type)
+                    .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                cell_elems * elem * rows_per_tile as usize
+            }
         };
+
         // Encode the pending rows' cells.
         let mut pending: Vec<(u64, Vec<u8>)> = Vec::new();
         for r in self.pending_rows(col) {
@@ -2331,11 +2347,10 @@ impl WritableTable {
         }
         // Overlay each pending row onto its tile bucket.
         for (r, cell) in &pending {
-            let tile_nr = r / layout.rows_per_tile;
-            let in_tile = (r % layout.rows_per_tile) as usize;
-            let bucket = tile_nr as usize * layout.bucket_size;
+            let tile_nr = r / rows_per_tile;
+            let in_tile = (r % rows_per_tile) as usize;
+            let bucket = tile_nr as usize * bucket_bytes;
             if cd.data_type == DataType::Bool {
-                let cell_elems = cell_shape.iter().product::<i64>().max(0) as usize;
                 let bit = in_tile * cell_elems;
                 // Clear the row's old bits, then place the new ones.
                 for g in bit..bit + cell_elems {
