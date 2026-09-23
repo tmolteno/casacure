@@ -23,7 +23,8 @@ fn main() {
         let l = i32::from_be_bytes(cell.0[8..12].try_into().unwrap());
         println!(
             "S row {row} ref: bucket={b} offset={o} len={l} cell={:?}",
-            cell.0.iter()
+            cell.0
+                .iter()
                 .map(|x| format!("{x:02x}"))
                 .collect::<Vec<_>>()
                 .join(" ")

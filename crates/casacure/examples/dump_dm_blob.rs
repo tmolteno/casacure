@@ -1,7 +1,9 @@
 //! Dump the raw per-data-manager spec blobs of a table.dat (debug helper).
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: dump_dm_blob <table.dat>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: dump_dm_blob <table.dat>");
     let buf = std::fs::read(&path).unwrap();
     let dat = casacure::table::parse_table_dat(&buf).unwrap();
     for dm in &dat.column_set.data_managers {

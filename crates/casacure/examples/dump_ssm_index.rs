@@ -1,7 +1,9 @@
 //! Dump every SSM index of a table (debug helper for storage layouts).
 
 fn main() {
-    let dir = std::env::args().nth(1).expect("usage: dump_ssm_index <msdir>");
+    let dir = std::env::args()
+        .nth(1)
+        .expect("usage: dump_ssm_index <msdir>");
     let dat_bytes = std::fs::read(format!("{dir}/table.dat")).unwrap();
     let dat = casacure::table::parse_table_dat(&dat_bytes).unwrap();
     for dm in &dat.column_set.data_managers {

@@ -252,9 +252,12 @@ impl StandardStManFile {
         // column's bucket region, casacore `Conversion::bitToBool`); the
         // returned slice carries the cell's bits starting at `skip`.
         let is_bit_cell = cell_size == 0;
-        let cell_bits: u64 = if is_bit_cell { 1 } else { u64::from(cell_size) * 8 };
-        let bit_offset =
-            u64::from(column_offset) * 8 + (row - bucket.start_row) * cell_bits;
+        let cell_bits: u64 = if is_bit_cell {
+            1
+        } else {
+            u64::from(cell_size) * 8
+        };
+        let bit_offset = u64::from(column_offset) * 8 + (row - bucket.start_row) * cell_bits;
         let base =
             (DATA_START as u64) + u64::from(bucket.number) * u64::from(self.header.bucket_size);
         let byte_off = base + bit_offset / 8;
@@ -277,11 +280,14 @@ impl StandardStManFile {
                 offset: bit_offset / 8,
                 len: nbytes64,
             })?;
-        let slice = self.data.get(start_us..end).ok_or(SsmError::CellOutOfRange {
-            bucket: bucket.number,
-            offset: bit_offset / 8,
-            len: nbytes64,
-        })?;
+        let slice = self
+            .data
+            .get(start_us..end)
+            .ok_or(SsmError::CellOutOfRange {
+                bucket: bucket.number,
+                offset: bit_offset / 8,
+                len: nbytes64,
+            })?;
         Ok((slice, skip))
     }
 
@@ -318,7 +324,8 @@ impl StandardStManFile {
                 index: col_idx,
                 count: spec.column_offset.len(),
             })?;
-        let (cell, skip) = self.cell_bytes(index_nr, *column_offset, row, scalar_cell_size(desc))?;
+        let (cell, skip) =
+            self.cell_bytes(index_nr, *column_offset, row, scalar_cell_size(desc))?;
         if desc.data_type == DataType::Bool {
             // One bit per row, LSB-first within the column's bit region.
             let bit = (cell[0] >> skip) & 1 != 0;

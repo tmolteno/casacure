@@ -24,10 +24,7 @@ fn main() {
             casacure::columnset::DataManagerBlob::StandardStMan(ssm) => {
                 println!(
                     "seq {} {} file len {} col_offset {:?}",
-                    dm.sequence_nr,
-                    dm.type_name,
-                    len,
-                    ssm.column_offset
+                    dm.sequence_nr, dm.type_name, len, ssm.column_offset
                 );
             }
             _ => {
