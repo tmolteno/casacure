@@ -257,31 +257,26 @@ fixed the summary-step aborts (`INTERVAL` / `FIELD_ID` / `TIME_CENTROID` are Inc
 TSM on this MS).
 
 **After the abort fix the workload completes** (rc=0): **~46 s / ~2.2 GiB** (3 runs stable)
-vs casacore 5.4 s / 0.54 GiB. FLAG_ROW bit-identical; **FLAG still differs 29.9 %** — isolated:
+vs casacore 5.4 s / 0.54 GiB.
 
-- casacure's and casacore's READ of the input FLAG are element-wise IDENTICAL (verified).
-- The OUTPUT's non-autos FLAG rows are corrupted: rows in tiles ≥ 1 are the expected
-  content **shifted by 4 bits** (`out == expected << 4` for rows with 1-bits near the wrap;
-  62 % of rows differ, none in tile 0). The output MS uses **829 rows/tile**
-  (casacore's TiledShapeStMan option copied through by dask-ms: cube [2,79,429257],
-  tile [2,79,829]; tile_bits=130982, 6 pad bits) — while casacure's writer/patcher geometry
-  (`tsm_layout`) assumes 26214 rows/tile (4141812 bits = 4 bits over a byte).
-- This is the pre-existing bit-packed-Bool tile-boundary bug (the session's original
-  debugging topic): the READ path now matches casacore (incl. multi-tile), but the WRITE
-  path (write_tsm_file_bool / patch_tsm_column byte-bucket placement for an externally
-  supplied tile shape) is still wrong for tiles ≥ 1 on this MS's geometry. Fix direction:
-  honor the tile shape/padding from the header/TSM option (rows_per_tile + bucket_bytes
-  from `cube.tile_shape`, not `tsm_layout`), in both the full writer and `patch_tsm_column`.
+**FLAG parity — FIXED (commit f40f4ea):** the earlier 29.9 % FLAG gap is closed. Root cause:
+skarabina/dask-ms writes the output by copying the input table (shared column groups) and
+then patching FLAG per chunk via `patch_tsm_column`, which placed pending rows with
+`tsm_layout`'s default geometry (26214 rows/tile, 4 bits over a byte) into a file whose
+header declares the input's casacore geometry (829 rows/tile) → tiles ≥ 1 written 4 bits off
+(`content == expected << 4`). Fix: `patch_tsm_column` now derives `rows_per_tile` +
+`bucket_bytes` from the parsed header's REAL data cube (the exact geometry
+`TsmFile::read_cell` uses), self-consistent for casacore-copied (829) and casacure-written
+(26214) tables. **Verified: autos-only AND the full flag workload now produce bit-identical
+FLAG + FLAG_ROW vs casacore (PARITY OK, rc=0).**
 
 ## Next actions (if interrupted, resume here)
 
-1. **Fix the bool TSM tile-boundary write** (the 29.9 % FLAG parity gap): derive
-   `rows_per_tile`/bucket geometry from the parsed header (829 on this MS), not
-   `tsm_layout`'s hard 26214, in `write_tsm_file`/`write_tsm_file_bool` and
-   `patch_tsm_column`. Then re-run `out_ok*` parity → expect FLAG bit-identical.
-2. Re-measure A+B cleanly: `./run_local.sh casacure changed` (write phase ~2.5 s; full run
-   with summary ~46 s) + `compare_flags.py` PARITY OK.
-3. (Later) remove the uncommitted `DBG init` print in `skarabina/dask_ms.py`; the full-write /
+1. Final: re-run the recorded comparison (3× both backends) and publish the parity-OK
+   numbers; optionally make the fresh-table TSM writer honor an external tile shape
+   (today `write_tsm_file`/`write_tsm_file_bool` always use 26214 for newly created tiles —
+   fine for casacure reads, a casacore-compat concern only).
+2. (Later) remove the uncommitted `DBG init` print in `skarabina/dask_ms.py`; the full-write /
    freqavg-8 path is a separate slow-write lead.
 
 ## Root cause — repeated writing (confirmed 2026-09-22)
