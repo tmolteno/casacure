@@ -7,6 +7,23 @@ subtasks are moved here.
 
 ### Fixed
 
+- **A writable open no longer materialises the table** (`WritableTable`): the
+  row count is now authoritative and a column's cell store is allocated only
+  when that column is written, instead of `addrows` filling every row of every
+  column with a clone of the column default. Opening the 429k-row, 25-column
+  `bpcal.ms` for update — the first thing dask-ms's write-changed-only path
+  does — cost **800.8 MiB before the first value was written**; it is now
+  80.3 MiB, exactly python-casacore's 80.3 MiB. A read of an unwritten row
+  answers with the column default (unchanged contract), and a flush writes it
+  out. Flushed columns also release their buffers outright instead of blanking
+  per-row slots. Measured on the skarabina changed-only flag workload
+  (100k × [32,4] TSM MS, dask-ms per-chunk flush): the flag write went from
+  2.09× casacore to **0.98×** at 2000-row chunks (266.7 → 125.7 MiB vs
+  casacore 127.5 MiB) and 1.98× → 1.25× at 50 000-row chunks; the same
+  end-to-end workload on `bpcal.ms` (VmHWM) fell from ~2.2 GiB to 0.86 GiB
+  against casacore's 0.55 GiB. New regression test
+  `tests/test_memory_chunking.py::test_writable_open_does_not_materialize_the_table`.
+
 - **Writable-handle reads merge disk, pending writes and defaults.** A read on
   a write handle sent the whole row range to the on-disk snapshot, so rows
   added since the last flush (a freshly created table's `addrows`, or a column

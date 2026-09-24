@@ -16,7 +16,10 @@ observed to report a ~600 MiB container-level peak on a 9 MiB process, while
 The assertions encode the dask-ms contract reported by the numbers in
 ``MEMORY.md``/``BENCHMARK.md``: for a chunked scan, peak RSS must track the
 row chunk size / the rows actually read -- NOT the whole column size -- and
-casacure must stay within a bounded factor of python-casacore.
+casacure must stay within a bounded factor of python-casacore.  That includes
+the WRITE side: opening the output table writable (what dask-ms's
+write-changed-only path does before its first chunk) must not materialise a
+cell per row per column.
 
 Skip policy
 -----------
@@ -80,6 +83,25 @@ t.close()
 """
 
 _PROBE = "import casacore.tables  # noqa: F401"
+
+_OPEN_WORKER = r"""
+import sys
+import casacore
+want = sys.argv[1] == "casacure"
+_is_casacure = ("casacure" in casacore.__file__) or ("shim" in casacore.__file__)
+if _is_casacure != want:
+    raise SystemExit(
+        f"backend mismatch: wanted casacure={want} but "
+        f"casacore resolved to {casacore.__file__}"
+    )
+from casacore.tables import table
+mode, path = sys.argv[2], sys.argv[3]
+# Open and close without writing anything: the writable open is what
+# dask-ms's write-changed-only path does before its first chunk.
+t = table(path, readonly=(mode == "read"), ack=False)
+print(f"{t.nrows()} rows, {len(t.colnames())} columns")
+t.close()
+"""
 
 _BUILD_SSM = r"""
 import sys
@@ -310,6 +332,14 @@ def _measure(ms, mode, chunk, backend, window=0):
     return rss
 
 
+def _measure_open(path, mode, backend):
+    """Peak RSS of opening `path` (no data read, no write)."""
+    env = _casacure_env() if backend == "casacure" else _casacore_env()
+    rc, out, rss = _run(_OPEN_WORKER, [backend, mode, path], env)
+    assert rc == 0, f"{backend} open {mode} failed:\n{out}"
+    return rss
+
+
 # --- tests ---
 
 
@@ -365,6 +395,38 @@ def test_memory_parity_with_casacore(ms):
             f"casacure {mode} chunk={chunk}: {cure:.1f} MiB vs "
             f"casacore {core:.1f} MiB"
         )
+
+
+def test_writable_open_does_not_materialize_the_table(ms):
+    """Opening the MS writable must not cost memory proportional to
+    rows × columns.
+
+    dask-ms's write-changed-only path opens the output MS writable before it
+    writes its first chunk, so this cost is paid up front on every skarabina
+    flag run.  casacore's writable open is at the read-only baseline; casacure's
+    `addrows` used to fill EVERY cell of EVERY column with a clone of the
+    column default (one buffered `RecordValue` per row per column), which on a
+    429k-row, 25-column MS measured 801 MiB against casacore's 81 MiB.  The
+    fixed-shape DATA column alone is one full column of defaults here, so a
+    quarter of it is the budget.
+    """
+    if not (CASACORE_AVAILABLE and CASACURE_AVAILABLE):
+        pytest.skip("need both backends importable")
+    path, _is_tsm = ms
+    write = {}
+    for backend in BACKENDS:
+        read = _measure_open(path, "read", backend)
+        write[backend] = _measure_open(path, "write", backend)
+        assert write[backend] - read <= 0.25 * COLUMN_MIB, (
+            f"{backend}: a writable open peaks at {write[backend]:.1f} MiB vs "
+            f"{read:.1f} MiB read-only (+{write[backend] - read:.1f} MiB); "
+            "opening for update must not materialise the table "
+            f"(one column is {COLUMN_MIB:.0f} MiB)"
+        )
+    assert write["casacure"] <= 1.5 * write["casacore"] + 15, (
+        f"writable-open parity: casacure {write['casacure']:.1f} MiB vs "
+        f"casacore {write['casacore']:.1f} MiB"
+    )
 
 
 def test_flagging_write_respects_chunk_size(ms):

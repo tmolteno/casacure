@@ -633,3 +633,70 @@ Re-run after any change:
   maturin build --release -o target/wheels && rm -rf target/devpkg &&
   python3 -m zipfile -e target/wheels/casacure-3.8.4-*.whl target/devpkg/ &&
   PYTHONPATH=target/devpkg:tests/shim $VENV/bin/python -m pytest tests/ -q
+
+## Session 2026-09-24 (later): dask-ms memory parity — the WRITE path
+
+Question asked: "is there memory parity with casacore under dask-ms?" Answer
+was **reads yes, writes no**; the write gap is now fixed (TDD: memory test
+first, then the fix).
+
+**What the suite asserted before:** `test_memory_parity_with_casacore` covers
+the READ paths only (`cure <= 1.5 * core + 15`); the flagging-write test had no
+cross-backend assertion at all.
+
+**Measured on the suite's synthetic TSM MS (100k × [32,4] complex64):**
+
+| workload | casacore | casacure before | casacure after |
+|---|---|---|---|
+| full read @2000 | 128.2 | 126.0 (0.98×) | 125.0 (0.97×) |
+| full read @all | 330.6 | 423.4 (1.28×) | 417.1 (1.26×) |
+| bounded 15k window | 127.4 | 125.9 (0.99×) | 125.5 (0.98×) |
+| flag write @2000 | 127.5 | 266.7 (**2.09×**) | 125.7 (**0.98×**) |
+| flag write @50000 | 202.7 | 401.8 (1.98×) | 253.3 (1.25×) |
+
+**Root cause (isolated):** opening the MS *writable and writing nothing* —
+exactly what dask-ms's write-changed-only path does first — cost casacure
+**800.8 MiB vs casacore's 80.3 MiB** on `bpcal.ms` (429 257 rows × 25 cols;
+162.0 vs 80.4 MiB on the synthetic MS). `WritableTable::addrows` was
+materialising one `Option<RecordValue>` clone of the column default per row
+PER COLUMN (~78 B/cell measured) — O(rows × columns) before a single value was
+written. The incremental-flush machinery was never the problem.
+
+**Fix (`crates/casacure/src/table.rs`):** `WritableTable` now carries the
+authoritative `rows: u64`; `cells[col]` starts empty and is grown to `rows`
+(filled with `None`) by the first `putcell`/`putcol` on that column
+(`grow_cells`). `addrows` only bumps the row count. `col_len`/`nrows`/`flush`/
+`materialize_all`/`drop_rows` read `self.rows`; `materialize_all` pads every
+column to `nrow` and skips the disk for a column whose every row is pending
+AND materialised; `clear_pending` *releases* the buffers (`*col = Vec::new()`)
+instead of blanking per-row slots. An unwritten/unallocated row already reads
+back as the column default through the new `buffered_default_cell` fallback in
+the python bridge, so no read semantics changed (the `probe_backend_parity.py`
+report is byte-identical before/after apart from temp dir names).
+
+**TDD evidence:** `tests/test_memory_chunking.py::test_writable_open_does_not_materialize_the_table`
+(new) asserted `write_open - read_open <= 0.25 * COLUMN_MIB` plus a
+`1.5 × casacore` parity bound; it failed (`+71.6 MiB` on casacure) before the
+fix and passes after.
+
+**End-to-end, real workload** (`bpcal.ms`, changed-only flag, same input
+state, peak VmHWM, driver `target/probe/real_flag.py`; pre-fix = wheel built
+from commit e31470e via `git worktree`):
+
+| backend | wall | peak RSS | vs casacore |
+|---|---|---|---|
+| casacore 3.8.1 | 23.8 s | 565 MiB | 1.00 |
+| casacure before (e31470e) | 51.6 s | 2265 MiB | 4.01× |
+| casacure after | 49.4 s | **864 MiB** | **1.53×** |
+
+(the pre-fix 2265 MiB reproduces the handover's earlier 2241 MiB, so the
+harness is consistent). **Speed is unchanged — the remaining ~2.1× wall gap is
+the separate lead.** Residual memory gap: LARGE chunks (1.14–1.28× on reads
+and the 50k flag write), inside the suite's bound.
+
+Verification after the fix: Python **137 passed, 1 skipped**; Rust 151 + 15 + 6;
+`cargo clippy --workspace --all-targets` clean; dask-ms smoke green end to end;
+`scripts/probe_backend_parity.py` unchanged vs the pre-fix build. Docs:
+MEMORY.md (new "The write path" section + TL;DR + history row), CHANGELOG.md
+[Unreleased], and the test module docstring now states the write-side contract.
+

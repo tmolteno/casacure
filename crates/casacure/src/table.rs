@@ -1562,7 +1562,14 @@ pub fn slice_array_value(
 pub struct WritableTable {
     dir: std::path::PathBuf,
     desc: crate::tabledesc::TableDesc,
-    /// `cells[col][row]`.
+    /// The table's row count. Authoritative: `cells[col]` may hold FEWER
+    /// entries — the unallocated tail has no buffered value (a read answers
+    /// with the column default, a flush with the on-disk value) — so that
+    /// opening a table for update costs no memory until a column is actually
+    /// written (see [`WritableTable::open_for_update`]).
+    rows: u64,
+    /// `cells[col][row]`; only rows actually written (or explicitly loaded)
+    /// hold a value.
     cells: Vec<Vec<Option<RecordValue>>>,
     /// `pending[col]` is a bitset of rows WRITTEN since the last successful
     /// `flush` (one bit per row, set by `putcell`/`putcol`, cleared by
@@ -1654,6 +1661,7 @@ impl WritableTable {
         WritableTable {
             dir: absolute_dir(&dir),
             desc,
+            rows: 0,
             cells,
             pending,
             touched,
@@ -1662,16 +1670,40 @@ impl WritableTable {
     }
 
     /// Append `n` empty rows (`addrows`).
+    ///
+    /// No cells are allocated: an unwritten row's value is the column's
+    /// default (like casacore), which reads answer with directly and a flush
+    /// writes out — allocating one buffered `RecordValue` per row per column
+    /// here is what made opening a 429k-row, 25-column MS for update cost
+    /// 800 MiB before a single value was written.
     pub fn addrows(&mut self, n: u64) {
-        for (col_idx, col) in self.cells.iter_mut().enumerate() {
-            // New cells hold the column's default value (like casacore), so a
-            // read of an unwritten scalar cell returns the declared default
-            // instead of erroring; flush() writes exactly these cells.
-            let default = self.desc.columns.get(col_idx).and_then(default_cell_value);
-            col.resize_with(col.len() + n as usize, || default.clone());
-            let words = col.len().div_ceil(64);
-            self.pending[col_idx].resize(words, 0);
+        self.rows += n;
+    }
+
+    /// Grow one column's cell store to the table's row count (the entry
+    /// point of every write: a lazily opened column holds nothing).
+    fn grow_cells(&mut self, col_idx: usize) -> Result<(), WriteTableError> {
+        let name = self
+            .desc
+            .columns
+            .get(col_idx)
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        let rows = self.rows as usize;
+        let col = self
+            .cells
+            .get_mut(col_idx)
+            .ok_or(WriteTableError::NoSuchColumn { name })?;
+        if col.len() < rows {
+            col.resize_with(rows, || None);
         }
+        let words = rows.div_ceil(64);
+        if let Some(pending) = self.pending.get_mut(col_idx) {
+            if pending.len() < words {
+                pending.resize(words, 0);
+            }
+        }
+        Ok(())
     }
 
     /// Load a cell of an existing table into the store **without** marking
@@ -1686,22 +1718,35 @@ impl WritableTable {
         row: u64,
         value: RecordValue,
     ) -> Result<(), WriteTableError> {
-        let name = self
-            .desc
-            .columns
-            .get(col_idx)
-            .map(|c| c.name.clone())
-            .unwrap_or_default();
+        if row >= self.rows {
+            return Err(WriteTableError::RowOutOfRange {
+                row,
+                nrow: self.rows,
+            });
+        }
+        let name = self.col_name(col_idx);
+        self.grow_cells(col_idx)?;
         let col = self
             .cells
             .get_mut(col_idx)
             .ok_or(WriteTableError::NoSuchColumn { name })?;
-        let nrow = col.len() as u64;
         let slot = col
             .get_mut(row as usize)
-            .ok_or(WriteTableError::RowOutOfRange { row, nrow })?;
+            .ok_or(WriteTableError::RowOutOfRange {
+                row,
+                nrow: self.rows,
+            })?;
         *slot = Some(value);
         Ok(())
+    }
+
+    /// The name of `col_idx` (for error messages).
+    fn col_name(&self, col_idx: usize) -> String {
+        self.desc
+            .columns
+            .get(col_idx)
+            .map(|c| c.name.clone())
+            .unwrap_or_default()
     }
 
     /// Set one cell (`putcell`).
@@ -1711,20 +1756,24 @@ impl WritableTable {
         row: u64,
         value: RecordValue,
     ) -> Result<(), WriteTableError> {
-        let name = self
-            .desc
-            .columns
-            .get(col_idx)
-            .map(|c| c.name.clone())
-            .unwrap_or_default();
+        if row >= self.rows {
+            return Err(WriteTableError::RowOutOfRange {
+                row,
+                nrow: self.rows,
+            });
+        }
+        let name = self.col_name(col_idx);
+        self.grow_cells(col_idx)?;
         let col = self
             .cells
             .get_mut(col_idx)
             .ok_or(WriteTableError::NoSuchColumn { name })?;
-        let nrow = col.len() as u64;
         let slot = col
             .get_mut(row as usize)
-            .ok_or(WriteTableError::RowOutOfRange { row, nrow })?;
+            .ok_or(WriteTableError::RowOutOfRange {
+                row,
+                nrow: self.rows,
+            })?;
         *slot = Some(value);
         self.pending[col_idx][(row as usize) / 64] |= 1u64 << ((row as usize) % 64);
         if let Some(t) = self.touched.get_mut(col_idx) {
@@ -1750,10 +1799,9 @@ impl WritableTable {
     /// Append a column (`Table::addcols`); existing rows default to the
     /// column's default value at flush.
     pub fn addcol(&mut self, cd: crate::tabledesc::ColumnDesc) {
-        let n = self.cells.first().map_or(0, Vec::len);
         self.desc.columns.push(cd);
-        self.cells.push(vec![None; n]);
-        self.pending.push(vec![0; n.div_ceil(64)]);
+        self.cells.push(Vec::new());
+        self.pending.push(Vec::new());
         self.touched.push(false);
     }
 
@@ -1844,7 +1892,7 @@ impl WritableTable {
         if rows.is_empty() || self.cells.is_empty() {
             return;
         }
-        let mut drop: Vec<bool> = vec![false; self.cells[0].len()];
+        let mut drop: Vec<bool> = vec![false; self.rows as usize];
         for &r in rows {
             if let Some(slot) = drop.get_mut(r as usize) {
                 *slot = true;
@@ -1891,6 +1939,9 @@ impl WritableTable {
             }
             *pend = out;
         }
+        // The surviving rows are the new row count (the materialised cells
+        // were compacted above; any unallocated tail stays unallocated).
+        self.rows = next;
     }
 
     /// Rename a column (`ALTER TABLE ... RENAME COLUMN from TO to`).
@@ -1907,13 +1958,21 @@ impl WritableTable {
         Ok(())
     }
 
-    /// The number of rows in the in-memory cell store.
+    /// The table's row count (the write store's authoritative row count;
+    /// a column's buffered cells may be shorter — see
+    /// [`WritableTable::cell`]).
     pub fn col_len(&self, col_idx: usize) -> usize {
-        self.cells.get(col_idx).map_or(0, Vec::len)
+        if col_idx < self.cells.len() {
+            self.rows as usize
+        } else {
+            0
+        }
     }
 
-    /// The buffered value of one cell (only rows written since the last
-    /// flush are `Some`; everything else is on disk).
+    /// The buffered value of one cell: `Some` only for rows actually written
+    /// (or loaded); a row that was never written — including the whole
+    /// unallocated tail of a lazily opened column — is `None`, and a read
+    /// answers with the column default.
     pub fn cell(&self, col_idx: usize, row: u64) -> Option<&RecordValue> {
         self.cells
             .get(col_idx)
@@ -1923,9 +1982,9 @@ impl WritableTable {
 
     /// The value of one cell IF it was written since the last flush: the
     /// pending-bit-filtered view of [`WritableTable::cell`].  A lazily
-    /// opened table's rows hold `Some(default)` cells (from `addrows`) that
-    /// are NOT pending and must not overlay the on-disk values on a merged
-    /// read — only rows actually `putcell`/`putcol`'d are pending.
+    /// opened table's never-written rows hold no cell at all and must not
+    /// overlay the on-disk values on a merged read — only rows actually
+    /// `putcell`/`putcol`'d are pending.
     pub fn pending_cell(&self, col_idx: usize, row: u64) -> Option<&RecordValue> {
         let bit = 1u64 << ((row as usize) % 64);
         if self
@@ -2003,7 +2062,7 @@ impl WritableTable {
 
     /// Number of rows written so far.
     pub fn nrows(&self) -> u64 {
-        self.cells.first().map_or(0, Vec::len) as u64
+        self.rows
     }
 
     /// Assemble the on-disk table from the buffered cells, filling missing
@@ -2024,7 +2083,7 @@ impl WritableTable {
     /// most one chunk of values resident instead of the whole column.
     pub fn flush(&mut self) -> Result<std::path::PathBuf, WriteTableError> {
         let dir = self.dir.clone();
-        let nrow = self.cells.first().map_or(0, Vec::len) as u64;
+        let nrow = self.rows;
         // Preservation is only possible when the on-disk table shares this
         // schema and row count (a full regrowth is otherwise required).
         let preserving =
@@ -2080,7 +2139,7 @@ impl WritableTable {
     /// after `removecols` (python `test_removecols`: the surviving column
     /// read back as its default).
     fn materialize_all(&self) -> Result<Vec<Vec<RecordValue>>, WriteTableError> {
-        let nrow = self.cells.first().map_or(0, Vec::len) as u64;
+        let nrow = self.rows;
         let file_exists = self.dir.join("table.dat").is_file();
         // One on-disk snapshot for all columns (opened lazily).
         let disk = if file_exists {
@@ -2109,9 +2168,11 @@ impl WritableTable {
             // Every row written this session (a whole-column write): the
             // buffer is the truth and the on-disk column — which may hold
             // never-written array cells — is irrelevant.
-            let full_session_write = nrow > 0 && self.pending_count(col_idx) >= nrow;
+            let full_session_write =
+                nrow > 0 && self.pending_count(col_idx) >= nrow && col.len() as u64 >= nrow;
             let mut list: Vec<RecordValue> = if full_session_write {
                 col.iter()
+                    .take(nrow as usize)
                     .map(|c| c.clone().unwrap_or_else(|| default.clone()))
                     .collect()
             } else if let (Some(t), Some(di)) = (&disk, disk_idx) {
@@ -2125,11 +2186,21 @@ impl WritableTable {
                 }
                 l
             } else {
-                // No on-disk column: buffered values, default where unset.
-                col.iter()
+                // No on-disk column: buffered values, default where unset —
+                // including the whole unallocated tail of a lazily opened
+                // column, which holds no cell at all.
+                let mut l: Vec<RecordValue> = col
+                    .iter()
+                    .take(nrow as usize)
                     .map(|c| c.clone().unwrap_or_else(|| default.clone()))
-                    .collect()
+                    .collect();
+                l.resize(nrow as usize, default.clone());
+                l
             };
+            // Every column must be represented for all `nrow` rows: the
+            // disk/buffer branches can come up short (rows added since the
+            // last flush, a column added this session).
+            list.resize(nrow as usize, default.clone());
             // Overlay the rows written THIS session (pending) — non-pending
             // buffered cells (addrows defaults) must not clobber disk data.
             for r in self.pending_rows(col_idx) {
@@ -2173,22 +2244,25 @@ impl WritableTable {
     }
 
     /// Drop the buffered values and dirty marks of one column: its rows now
-    /// live on disk, so resident memory tracks only un-flushed writes.
+    /// live on disk, so resident memory tracks only un-flushed writes.  The
+    /// buffers are RELEASED (not just blanked): the point of the incremental
+    /// flush is that a chunked write stream stays at ~one chunk, so the
+    /// per-row slots must go back to the allocator.
     fn clear_pending(&mut self, col_idx: usize) {
         if let Some(col) = self.cells.get_mut(col_idx) {
-            col.iter_mut().for_each(|c| *c = None);
+            *col = Vec::new();
         }
         if let Some(p) = self.pending.get_mut(col_idx) {
-            p.iter_mut().for_each(|w| *w = 0);
+            *p = Vec::new();
         }
     }
 
     fn clear_all_pending(&mut self) {
         for col in &mut self.cells {
-            col.iter_mut().for_each(|c| *c = None);
+            *col = Vec::new();
         }
         for p in &mut self.pending {
-            p.iter_mut().for_each(|w| *w = 0);
+            *p = Vec::new();
         }
     }
 
@@ -2211,7 +2285,7 @@ impl WritableTable {
         let buf = std::fs::read(dir.join("table.dat"))
             .map_err(|e| WriteTableError::Storage(e.to_string()))?;
         let dat = parse_table_dat(&buf).map_err(|e| WriteTableError::Storage(e.to_string()))?;
-        let nrow = self.cells.first().map_or(0, Vec::len) as u64;
+        let nrow = self.rows;
         let dm_of: Vec<u32> = (0..self.desc.columns.len())
             .map(|c| {
                 dat.column_set

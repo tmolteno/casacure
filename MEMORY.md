@@ -16,6 +16,11 @@ long scan resident at ~the working set instead of the whole file.
   analogue of casacore's bounded LRU storage-manager cache.
 - Small / random reads (< 512 rows) do **not** drop pages, so the page cache
   is retained for repeated random access.
+- A **writable** open allocates nothing either: `WritableTable` holds the row
+  count and grows a column's cell store only when that column is written, so
+  opening the output MS for update (the first thing dask-ms's
+  write-changed-only path does) is at casacore parity — see "The write path"
+  below.
 
 ## The measured numbers
 
@@ -51,6 +56,51 @@ engines.
 Both engines stay at the ~350–430 MiB stack baseline; neither grows with the
 column size.
 
+## The write path (dask-ms write-changed-only)
+
+Read parity is not the whole contract: dask-ms opens the **output** MS
+writable before its first chunk and then patches FLAG chunk by chunk
+(skarabina `--write-changed-only`). Opening a table for update must therefore
+cost ~nothing.
+
+Peak RSS of a writable open with **no writes at all**:
+
+| MS opened writable | casacore | casacure before | casacure now |
+|---|---|---|---|
+| synthetic 100k rows × 5 cols (fixed [32,4] DATA) | 80.4 MiB | 162.0 MiB | **80.4 MiB** |
+| `bpcal.ms` (429 257 rows × 25 cols) | 80.3 MiB | **800.8 MiB** | **80.3 MiB** |
+
+`WritableTable` now keeps the row count and allocates a column's cell store
+only when that column is written; an unwritten row reads back as the column
+default and a flush writes that default out. Before, `addrows` cloned one
+buffered default cell per row per column — O(rows × columns) memory, 800 MiB
+on `bpcal.ms` before a single value was written — and a flushed column's
+per-row slots were blanked rather than released.
+
+End-to-end, the skarabina changed-only flag workload on `bpcal.ms` (VmHWM,
+this machine, same input state):
+
+| backend | wall | peak RSS | vs casacore |
+|---|---|---|---|
+| casacore 3.8.1 | 23.8 s | 565 MiB | 1.0 |
+| casacure before | 51.6 s | 2265 MiB | 4.01× |
+| casacure now | 49.4 s | 864 MiB | **1.53×** |
+
+And the memory suite's synthetic TSM MS (100k × [32,4], DATA+FLAG, dask-ms
+per-chunk flush):
+
+| flag write | casacore | casacure before | casacure now |
+|---|---|---|---|
+| 2000-row chunks | 127.5 MiB | 266.7 MiB (2.09×) | **125.7 MiB (0.98×)** |
+| 50 000-row chunks | 202.7 MiB | 401.8 MiB (1.98×) | 253.3 MiB (1.25×) |
+
+**Remaining gap: the large-chunk working set.** A whole 100 MiB column read in
+one chunk peaks 417 MiB in casacure vs 331 MiB in casacore (1.26×), and the
+50 000-row flag write likewise 1.25×; both are inside the suite's
+`1.5 × casacore + 15 MiB` bound. Wall time is untouched by this work
+(casacure is still ~2.1× casacore on the flag workload — the separate speed
+lead).
+
 ## History
 
 | stage | memory behaviour |
@@ -59,6 +109,7 @@ column size.
 | `memmap2` mapping | open is O(1); chunked reads touch only their pages; a *full* pass left the file resident (~1× column, 1.1 GiB floor) |
 | + `MADV_DONTNEED` on bulk reads | full pass streams at ~the working set (164 MiB), no whole-file floor |
 | **+ typed-buffer `getcolnp`** | SSM numeric cells decode straight from the map into the numpy buffer (no per-cell `Vec<RecordValue>`), so a single whole-column read holds ~1 full buffer + the read window (2.2 GiB, casacore parity) |
+| **+ lazy cell store** | a writable open allocates nothing (the row count is authoritative; a column's cells are allocated on first write), so the dask-ms changed-only write path reaches parity: 801 → 80 MiB to open `bpcal.ms` writable, and 4.0× → 1.5× peak RSS on the flag workload |
 
 ## How it works
 
@@ -84,6 +135,16 @@ in-memory / tests) or `Mapped(memmap2::Mmap)`.
   path.
 - A read handle stays an open snapshot (documented): a concurrent flush
   rewrites the file, so a stale handle reads its own captured state.
+- **Lazy write store:** `WritableTable` keeps the table's row count and a
+  per-column `Vec<Option<RecordValue>>` that starts EMPTY. `addrows` only
+  bumps the row count; the first `putcell`/`putcol` on a column allocates its
+  slots (filled with `None`), `putcell` records the row in that column's
+  `pending` bitset, and `flush` patches only the pending rows and then
+  releases both buffers. A read of a row with no buffered cell (never
+  written, or released by an earlier flush) answers with the column default or
+  the on-disk value, so nothing has to be pre-filled. That is what makes
+  `open_for_update` — dask-ms's writable open of the output MS — O(1) instead
+  of O(rows × columns).
 
 ## Trade-offs / caveats
 
@@ -101,6 +162,9 @@ in-memory / tests) or `Mapped(memmap2::Mmap)`.
   (2.2 GiB): the typed path holds ~1 full buffer plus a read window. The
   generic (non-raw) `getcol` still materialises per-cell values (~3.2 GiB
   for this column); dask-ms uses `getcolnp`, which is the typed path.
+- **Large chunks hold more than casacore** (1.14–1.28× on the synthetic MS;
+  see "Remaining gap" above). Small chunks — the skarabina setting — are at
+  parity or below.
 - The knob is a compile-time policy, not configurable at runtime.
 
 ## Reproduce
