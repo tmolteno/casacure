@@ -30,8 +30,8 @@ pub use ssm::{
 };
 pub use table::{
     build_table_dat, casa_value_type, create_table, default_cell_value, get_dminfo,
-    parse_table_dat, parse_table_header, slice_array_value, DmInfo, DmSpec, Table,
-    TableCreateError, TableDat, TableDatError, TableError, TableHeader, TableReadError,
+    parse_table_dat, parse_table_header, patch_copy_nrow, slice_array_value, DmInfo, DmSpec,
+    Table, TableCreateError, TableDat, TableDatError, TableError, TableHeader, TableReadError,
     WritableTable, WriteTableError, ROWS_PER_BUCKET,
 };
 pub use tabledesc::{

@@ -134,7 +134,12 @@ fn c32_of(d: &ArrayData, i: usize) -> Complex32 {
 }
 
 /// Fill an existing numpy buffer with a column's cells.
+///
+/// The per-element fill loop runs with the GIL released so that dask's
+/// threaded scheduler can overlap independent column reads (the decode itself
+/// only touches the numpy buffer and the cell data, never Python state).
 pub(crate) fn fill_buffer_by_dtype(
+    py: Python<'_>,
     buf: &Bound<'_, PyAny>,
     cells: &[RecordValue],
     cell: usize,
@@ -146,7 +151,7 @@ pub(crate) fn fill_buffer_by_dtype(
                 let s = b
                     .as_slice_mut()
                     .map_err(|_| PyValueError::new_err("getcolnp: non-contiguous buffer"))?;
-                return fill_flat(s, cells, cell, $f, $s);
+                return py.allow_threads(|| fill_flat(s, cells, cell, $f, $s));
             }
         }};
     }

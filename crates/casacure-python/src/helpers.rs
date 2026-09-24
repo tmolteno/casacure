@@ -328,6 +328,18 @@ fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> PyResult<()> {
                 .map_err(|e| PyRuntimeError::new_err(format!("cannot copy to {dst_p:?}: {e}")))?;
         }
     }
+    // Normalise the copied row count in `dst/table.dat` (see
+    // `casacure::patch_copy_nrow`).  A table written by a legacy writer can
+    // carry a stale `0` header row count with the real count only in the
+    // lock file's sync record; a byte copy that skips the lock would then
+    // reopen the copy as an empty table.  Real casacore's `table.copy`
+    // re-writes the row count, so we do the same so the copy is
+    // self-consistent.
+    if src.join("table.dat").is_file() {
+        if let Ok(t) = ::casacure::Table::open(src, true) {
+            let _ = ::casacure::patch_copy_nrow(dst, t.nrows());
+        }
+    }
     Ok(())
 }
 

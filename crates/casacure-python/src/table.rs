@@ -417,6 +417,7 @@ fn record_fits_column(col: &core::tabledesc::ColumnDesc, v: &RecordValue) -> boo
 /// `buf` is not a compatible, C-contiguous array of the column's type, so the
 /// caller falls back to the generic path.
 fn fill_numpy_raw(
+    py: Python<'_>,
     t: &::casacure::Table,
     col_idx: usize,
     startrow: u64,
@@ -466,16 +467,20 @@ fn fill_numpy_raw(
                     return Ok(false);
                 }
                 let mut row = 0usize;
-                t.getcol_raw(col_idx, startrow, nrow, |_, bytes| {
-                    let dst = &mut slice[row * count..(row + 1) * count];
-                    let sz = std::mem::size_of::<$ty>();
-                    for (i, b) in bytes.chunks_exact(sz).enumerate() {
-                        dst[i] = $from(b, le);
-                    }
-                    row += 1;
-                    Ok(())
-                })
-                .map_err(err)?;
+                // Decode straight from the mapped file into the caller's
+                // buffer with the GIL released (see fill_buffer_by_dtype).
+                py.allow_threads(|| {
+                    t.getcol_raw(col_idx, startrow, nrow, |_, bytes| {
+                        let dst = &mut slice[row * count..(row + 1) * count];
+                        let sz = std::mem::size_of::<$ty>();
+                        for (i, b) in bytes.chunks_exact(sz).enumerate() {
+                            dst[i] = $from(b, le);
+                        }
+                        row += 1;
+                        Ok(())
+                    })
+                    .map_err(err)
+                })?;
                 return Ok(true);
             } else {
                 return Ok(false); // buffer dtype/contiguity mismatch -> fallback
@@ -494,15 +499,17 @@ fn fill_numpy_raw(
                 return Ok(false);
             }
             let mut row = 0usize;
-            t.getcol_raw(col_idx, startrow, nrow, |_, bytes| {
-                let dst = &mut slice[row * count..(row + 1) * count];
-                for i in 0..count {
-                    dst[i] = (bytes[i / 8] >> (i % 8)) & 1 != 0;
-                }
-                row += 1;
-                Ok(())
-            })
-            .map_err(err)?;
+            py.allow_threads(|| {
+                t.getcol_raw(col_idx, startrow, nrow, |_, bytes| {
+                    let dst = &mut slice[row * count..(row + 1) * count];
+                    for i in 0..count {
+                        dst[i] = (bytes[i / 8] >> (i % 8)) & 1 != 0;
+                    }
+                    row += 1;
+                    Ok(())
+                })
+                .map_err(err)
+            })?;
             return Ok(true);
         }
         return Ok(false);
@@ -738,7 +745,14 @@ impl Table {
     fn read_col(&self, col_idx: usize, startrow: u64, nrow: u64) -> PyResult<Vec<RecordValue>> {
         let inner = self.inner.lock().unwrap();
         match &*inner {
-            Inner::Read(t) => column_cells(t, col_idx, startrow, nrow),
+            Inner::Read(t) => {
+                // Clone the Arc out and drop the lock before the decode, so
+                // concurrent reads through this handle are not serialised by
+                // the inner mutex (reads on the core table are pure &-reads).
+                let t = std::sync::Arc::clone(t);
+                drop(inner);
+                column_cells(&t, col_idx, startrow, nrow)
+            }
             Inner::Write { shared, .. } => {
                 let s = shared.lock().unwrap();
                 merged_col_cells(&s, col_idx, startrow, nrow)
@@ -1100,7 +1114,7 @@ impl Table {
             nrow as u64
         };
         let col_idx = self.col_index(column)?;
-        let cells = self.read_col(col_idx, startrow, nrow)?;
+        let cells = py.allow_threads(|| self.read_col(col_idx, startrow, nrow))?;
         self.column_to_python(py, col_idx, &cells)
     }
 
@@ -1258,7 +1272,7 @@ impl Table {
     #[pyo3(signature = (column, buf, startrow = 0, nrow = -1))]
     fn getcolnp(
         &self,
-        _py: Python<'_>,
+        py: Python<'_>,
         column: &str,
         buf: &Bound<'_, PyAny>,
         startrow: i64,
@@ -1282,16 +1296,28 @@ impl Table {
         // holds only the numpy result buffer plus a small read window
         // (mapped pages are dropped as the scan progresses) instead of the
         // result buffer + a full per-cell copy + the whole mapped file.
-        let inner = self.inner.lock().unwrap();
-        if let Inner::Read(t) = &*inner {
-            if t.raw_column_supported(col_idx) && fill_numpy_raw(t, col_idx, startrow, nrow, buf)? {
+        // Clone the Arc out of the lock before the (GIL-released) decode so
+        // that concurrent reads through this handle are not serialised by the
+        // inner mutex.
+        let read_table = {
+            let inner = self.inner.lock().unwrap();
+            match &*inner {
+                Inner::Read(t) => Some(std::sync::Arc::clone(t)),
+                Inner::Write { .. } => None,
+            }
+        };
+        if let Some(t) = &read_table {
+            if t.raw_column_supported(col_idx)
+                && fill_numpy_raw(py, t, col_idx, startrow, nrow, buf)?
+            {
                 return Ok(());
             }
         }
-        drop(inner);
-        let cells = self.read_col(col_idx, startrow, nrow)?;
+        // The per-cell decode is pure Rust; release the GIL so the dask
+        // scheduler can overlap this read with independent work.
+        let cells = py.allow_threads(|| self.read_col(col_idx, startrow, nrow))?;
         let cell = cell_shape_of(&cells).iter().product::<usize>().max(1);
-        convert::fill_buffer_by_dtype(buf, &cells, cell)
+        convert::fill_buffer_by_dtype(py, buf, &cells, cell)
     }
 
     /// `getcolslice(column, blc, trc, startrow, nrow)`.
@@ -1313,7 +1339,7 @@ impl Table {
             nrow as u64
         };
         let col_idx = self.col_index(column)?;
-        let cells = self.read_colslice(col_idx, &blc, &trc, startrow, nrow)?;
+        let cells = py.allow_threads(|| self.read_colslice(col_idx, &blc, &trc, startrow, nrow))?;
         self.column_to_python(py, col_idx, &cells)
     }
 
@@ -1322,7 +1348,7 @@ impl Table {
     #[pyo3(signature = (column, buf, blc, trc, startrow = 0, nrow = -1))]
     fn getcolslicenp(
         &self,
-        _py: Python<'_>,
+        py: Python<'_>,
         column: &str,
         buf: &Bound<'_, PyAny>,
         blc: Vec<i64>,
@@ -1338,9 +1364,9 @@ impl Table {
             nrow as u64
         };
         let col_idx = self.col_index(column)?;
-        let cells = self.read_colslice(col_idx, &blc, &trc, startrow, nrow)?;
+        let cells = py.allow_threads(|| self.read_colslice(col_idx, &blc, &trc, startrow, nrow))?;
         let cell = cell_shape_of(&cells).iter().product::<usize>().max(1);
-        convert::fill_buffer_by_dtype(buf, &cells, cell)
+        convert::fill_buffer_by_dtype(py, buf, &cells, cell)
     }
 
     /// `getcell(column, row)` -> numpy array (or scalar/list).
@@ -1516,9 +1542,11 @@ impl Table {
             core::tabledesc::ColumnKind::Array
         );
         let values = self.value_to_cells(py, col_idx, value, nrow, is_array_col, false)?;
-        for (i, v) in values.into_iter().enumerate() {
-            self.put_cell(col_idx, startrow + i as u64, v)?;
-        }
+        // Whole-batch store: lock the shared writable store once and reuse
+        // the core table's column write (no per-cell re-locking / re-checks).
+        // Runs with the GIL released so the dask scheduler can overlap
+        // independent work.
+        self.put_cells_batch(py, col_idx, startrow, values)?;
         let _ = full;
         Ok(())
     }
@@ -1942,6 +1970,38 @@ impl Table {
                     }
                 }
                 s.wt.putcell(col_idx, row, value).map_err(err)?;
+                s.dirty = true;
+                Ok(())
+            }
+            _ => Err(PyValueError::new_err("table is not writable")),
+        }
+    }
+
+    /// Store a whole `putcol` batch of cells (one `RecordValue` per row).
+    ///
+    /// `value_to_cells` has already produced cells of exactly the column's
+    /// type and shape, so the per-cell sanity checks are skipped here —
+    /// unlike [`Table::put_cell`], which re-checks on every cell. The shared
+    /// store lock is taken once for the whole batch instead of once per cell,
+    /// and the store loop runs with the GIL released.
+    fn put_cells_batch(
+        &self,
+        py: Python<'_>,
+        col_idx: usize,
+        startrow: u64,
+        values: Vec<RecordValue>,
+    ) -> PyResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        match &mut *inner {
+            Inner::Write { shared, .. } => {
+                let mut s = shared.lock().unwrap();
+                let wt = &mut s.wt;
+                py.allow_threads(|| -> PyResult<()> {
+                    for (i, v) in values.into_iter().enumerate() {
+                        wt.putcell(col_idx, startrow + i as u64, v).map_err(err)?;
+                    }
+                    Ok(())
+                })?;
                 s.dirty = true;
                 Ok(())
             }

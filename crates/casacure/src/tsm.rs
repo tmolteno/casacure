@@ -521,9 +521,16 @@ pub fn parse_header(data: &[u8]) -> Result<TsmHeader, TsmError> {
     for _ in 0..nrfile {
         let exists = r.read_bool()?;
         if exists {
-            let _fver = r.read_u32()?;
+            // TSMFile::putObject (casacore TSMFile.cc): its own object
+            // version determines the length width -- version 1 stores the
+            // length as u32, version 2 (files >= 2 GiB) as u64. The outer
+            // TiledStMan header version must NOT be used here: a v2 header
+            // can still hold a >2 GiB tile file, and misreading the length
+            // as u32 misaligns every field that follows (nrcube, cubes, and
+            // the TiledShapeStMan maps), producing absurd allocations.
+            let fver = r.read_u32()?;
             let sequence_nr = r.read_u32()?;
-            let length = if version >= 3 {
+            let length = if fver >= 2 {
                 r.read_u64()?
             } else {
                 u64::from(r.read_u32()?)

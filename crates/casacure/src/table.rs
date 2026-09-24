@@ -113,6 +113,45 @@ pub(crate) fn read_table_header(r: &mut Reader<'_>) -> Result<TableHeader, Table
     })
 }
 
+/// Rewrite the row count in a copied table's `table.dat` header, in place.
+///
+/// casacore (and casacure) read the row count from the table's lock-file
+/// `sync` record in preference to the header, so a legacy table can carry a
+/// stale `0` header nrow with the real count stored only in the lock.  A
+/// byte-level directory copy (which intentionally skips `table.lock`) would
+/// then open the copy as an empty table.  Real casacore's `table.copy`
+/// re-writes the row count in the copy; patch the header so the copy is
+/// self-consistent without relying on the lock.  The header keeps its
+/// original object version, so the field width (v2 = u32, v3 = u64) is
+/// preserved.
+pub fn patch_copy_nrow(dir: &std::path::Path, nrow: u64) -> Result<(), TableDatError> {
+    let path = dir.join("table.dat");
+    let mut bytes = std::fs::read(&path)?;
+    let mut r = Reader::new(&bytes);
+    let obj = r.read_object_start(true)?;
+    if obj.type_name != "Table" {
+        return Err(TableError::NotATable {
+            found: obj.type_name,
+        }
+        .into());
+    }
+    let off = r.position();
+    let width: usize = match obj.version {
+        2 => 4,
+        3 => 8,
+        v => return Err(TableError::UnsupportedVersion(v).into()),
+    };
+    if off + width > bytes.len() {
+        return Err(std::io::Error::other(format!(
+            "table.dat too short to hold its row count at {path:?}"
+        ))
+        .into());
+    }
+    bytes[off..off + width].copy_from_slice(&nrow.to_be_bytes()[8 - width..]);
+    std::fs::write(&path, bytes)?;
+    Ok(())
+}
+
 /// Errors from creating a CASA table.
 #[derive(Debug, Error)]
 pub enum TableCreateError {

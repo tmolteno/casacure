@@ -274,6 +274,42 @@ pub enum RecordValue {
     Array(ArrayValue),
 }
 
+impl ArrayData {
+    /// The byte layout of a fixed-size numeric array, as stored in memory.
+    ///
+    /// Every fixed-size element type above is a plain `Vec` of a unit-sized
+    /// (no-padding) primitive, so the allocation is byte-contiguous. Returns
+    /// `None` for `Bool` (bit-packed in the storage managers) and `String`.
+    /// Used by the SSM writer to bulk-copy matching-endian cells instead of
+    /// encoding element by element.
+    pub fn as_contiguous_bytes(&self) -> Option<&[u8]> {
+        use std::slice::from_raw_parts;
+        macro_rules! bytes {
+            ($v:expr) => {
+                Some(unsafe {
+                    from_raw_parts(
+                        $v.as_ptr() as *const u8,
+                        $v.len().checked_mul(std::mem::size_of_val(&$v[0]))?,
+                    )
+                })
+            };
+        }
+        match self {
+            ArrayData::UChar(v) => Some(v),
+            ArrayData::Short(v) => bytes!(v),
+            ArrayData::UShort(v) => bytes!(v),
+            ArrayData::Int(v) => bytes!(v),
+            ArrayData::UInt(v) => bytes!(v),
+            ArrayData::Int64(v) => bytes!(v),
+            ArrayData::Float(v) => bytes!(v),
+            ArrayData::Double(v) => bytes!(v),
+            ArrayData::Complex(v) => bytes!(v),
+            ArrayData::DComplex(v) => bytes!(v),
+            ArrayData::Bool(_) | ArrayData::String(_) => None,
+        }
+    }
+}
+
 /// A decoded TableRecord: description, record type, and values aligned with
 /// `desc.fields`.
 #[derive(Debug, Clone, PartialEq)]

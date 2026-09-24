@@ -1370,6 +1370,16 @@ pub fn encode_array_data(
 ) -> Result<Vec<u8>, SsmError> {
     use crate::record::ArrayData;
     let mut body: Vec<u8> = Vec::new();
+    // Fast path: when the target endianness matches the host, bulk-copy the
+    // contiguous byte layout of a fixed-size numeric array instead of
+    // encoding element by element (the dominant cost for large MS array
+    // columns, e.g. complex visibilities).
+    if big_endian == cfg!(target_endian = "big") {
+        if let Some(bytes) = data.as_contiguous_bytes() {
+            body.extend_from_slice(bytes);
+            return Ok(body);
+        }
+    }
     let mut push = |bytes: &[u8]| body.extend_from_slice(bytes);
     match data {
         ArrayData::Bool(bits) => {
