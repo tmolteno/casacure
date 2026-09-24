@@ -411,11 +411,10 @@ fn record_fits_column(col: &core::tabledesc::ColumnDesc, v: &RecordValue) -> boo
     }
 }
 
-/// Typed-buffer `getcolnp` fill: decode a StandardStMan numeric column range
-/// straight from the mapped data file into the caller's numpy buffer — no
-/// per-cell `RecordValue`/`ArrayData` intermediate. Returns `Ok(false)` when
-/// `buf` is not a compatible, C-contiguous array of the column's type, so the
-/// caller falls back to the generic path.
+/// Fill a caller's numpy buffer straight from the mapped data files (the
+/// [`::casacure::Table::getcol_raw`] path), for a column
+/// `raw_column_supported` accepts. `Ok(false)` means the buffer's dtype,
+/// size or layout does not fit and the caller must take the generic path.
 fn fill_numpy_raw(
     t: &::casacure::Table,
     col_idx: usize,
@@ -424,26 +423,6 @@ fn fill_numpy_raw(
     buf: &Bound<'_, PyAny>,
 ) -> PyResult<bool> {
     let desc = &t.dat.desc.columns[col_idx];
-    // The raw borrowed-buffer path reads a column's bytes straight from the
-    // StandardStMan data file; any other storage manager (TiledShapeStMan
-    // scalar columns, ISM, ...) has no byte-addressable raw layout and must
-    // fall back to the generic path instead of erroring.
-    let is_ssm = t
-        .dat
-        .column_set
-        .columns
-        .get(col_idx)
-        .and_then(|c| {
-            t.dat
-                .column_set
-                .data_managers
-                .iter()
-                .find(|d| d.sequence_nr == c.data_manager_seq)
-        })
-        .is_some_and(|d| d.type_name == "StandardStMan");
-    if !is_ssm {
-        return Ok(false);
-    }
     let is_array = matches!(desc.kind, core::tabledesc::ColumnKind::Array);
     let count = if is_array {
         match &desc.shape {
@@ -454,6 +433,11 @@ fn fill_numpy_raw(
         1
     };
     let le = !t.dat.header.big_endian;
+    let native = le == cfg!(target_endian = "little");
+    let short = |got: usize, want: usize| core::table::TableReadError::UnsupportedRaw {
+        name: desc.name.clone(),
+        reason: format!("stored cell has {got} bytes, expected {want}"),
+    };
 
     macro_rules! typed {
         ($ty:ty, $from:expr) => {{
@@ -465,12 +449,32 @@ fn fill_numpy_raw(
                 if slice.len() as u64 != nrow * count as u64 {
                     return Ok(false);
                 }
+                let sz = std::mem::size_of::<$ty>();
                 let mut row = 0usize;
                 t.getcol_raw(col_idx, startrow, nrow, |_, bytes| {
                     let dst = &mut slice[row * count..(row + 1) * count];
-                    let sz = std::mem::size_of::<$ty>();
-                    for (i, b) in bytes.chunks_exact(sz).enumerate() {
-                        dst[i] = $from(b, le);
+                    if bytes.len() < count * sz {
+                        return Err(short(bytes.len(), count * sz));
+                    }
+                    if native {
+                        // Same byte order as the host: the stored cell is the
+                        // numpy element layout, one memcpy per row.
+                        // SAFETY: `dst` is `count` plain numeric elements
+                        // (`sz` bytes each, no padding, any bit pattern
+                        // valid), so viewing it as `count * sz` bytes is
+                        // sound; the ranges cannot overlap (`bytes` borrows
+                        // the mapped file, `dst` the numpy buffer).
+                        let out = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                dst.as_mut_ptr().cast::<u8>(),
+                                count * sz,
+                            )
+                        };
+                        out.copy_from_slice(&bytes[..count * sz]);
+                    } else {
+                        for (d, b) in dst.iter_mut().zip(bytes.chunks_exact(sz)) {
+                            *d = $from(b, le);
+                        }
                     }
                     row += 1;
                     Ok(())
@@ -483,8 +487,34 @@ fn fill_numpy_raw(
         }};
     }
 
+    if desc.data_type == DataType::Bool && !is_array {
+        // IncrementalStMan Bool scalars: one byte per cell. Converted, not
+        // copied: a stored byte other than 0/1 is not a valid `bool`.
+        if let Ok(arr) = buf.cast::<numpy::PyArrayDyn<bool>>() {
+            let mut rw = arr.readwrite();
+            let Ok(slice) = rw.as_slice_mut() else {
+                return Ok(false);
+            };
+            if slice.len() as u64 != nrow {
+                return Ok(false);
+            }
+            let mut row = 0usize;
+            t.getcol_raw(col_idx, startrow, nrow, |_, bytes| {
+                let Some(&b) = bytes.first() else {
+                    return Err(short(0, 1));
+                };
+                slice[row] = b != 0;
+                row += 1;
+                Ok(())
+            })
+            .map_err(err)?;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+
     if desc.data_type == DataType::Bool && is_array {
-        // Array bool cells are bit-packed in the array index file.
+        // Tiled Bool cells are bit-packed (LSB-first) in the tile file.
         if let Ok(arr) = buf.cast::<numpy::PyArrayDyn<bool>>() {
             let mut rw = arr.readwrite();
             let Ok(slice) = rw.as_slice_mut() else {
@@ -494,11 +524,12 @@ fn fill_numpy_raw(
                 return Ok(false);
             }
             let mut row = 0usize;
-            t.getcol_raw(col_idx, startrow, nrow, |_, bytes| {
-                let dst = &mut slice[row * count..(row + 1) * count];
-                for i in 0..count {
-                    dst[i] = (bytes[i / 8] >> (i % 8)) & 1 != 0;
+            t.getcol_raw_bits(col_idx, startrow, nrow, |bytes, skip, nelem| {
+                if nelem != count || (skip + nelem).div_ceil(8) > bytes.len() {
+                    return Err(short(bytes.len(), (skip + count).div_ceil(8)));
                 }
+                let dst = &mut slice[row * count..(row + 1) * count];
+                ::casacure::tsm::decode_bits_into(bytes, skip, dst);
                 row += 1;
                 Ok(())
             })
@@ -509,7 +540,6 @@ fn fill_numpy_raw(
     }
 
     match desc.data_type {
-        DataType::Bool => typed!(bool, |b: &[u8], _le: bool| b[0] != 0),
         DataType::UChar => typed!(u8, |b: &[u8], _le: bool| b[0]),
         DataType::Short => typed!(i16, |b: &[u8], le: bool| if le {
             i16::from_le_bytes(b.try_into().unwrap())
@@ -767,6 +797,37 @@ impl Table {
             }
         }
     }
+}
+
+/// A zero-filled numpy array of `dims` with the numpy dtype of a numeric or
+/// Bool column (`None` for strings, records and other non-numeric types).
+fn zeros_for_column(
+    py: Python<'_>,
+    desc: &core::tabledesc::ColumnDesc,
+    dims: &[usize],
+) -> PyResult<Option<Py<PyAny>>> {
+    use numpy::PyArrayDyn;
+    macro_rules! z {
+        ($ty:ty) => {
+            PyArrayDyn::<$ty>::zeros(py, dims, false)
+                .into_any()
+                .unbind()
+        };
+    }
+    Ok(Some(match desc.data_type {
+        DataType::Bool => z!(bool),
+        DataType::UChar => z!(u8),
+        DataType::Short => z!(i16),
+        DataType::UShort => z!(u16),
+        DataType::Int => z!(i32),
+        DataType::UInt => z!(u32),
+        DataType::Int64 => z!(i64),
+        DataType::Float => z!(f32),
+        DataType::Double => z!(f64),
+        DataType::Complex => z!(numpy::Complex32),
+        DataType::DComplex => z!(numpy::Complex64),
+        _ => return Ok(None),
+    }))
 }
 
 fn zero_elements(dt: DataType, n: usize) -> core::record::ArrayData {
@@ -1100,6 +1161,33 @@ impl Table {
             nrow as u64
         };
         let col_idx = self.col_index(column)?;
+        {
+            let inner = self.inner.lock().unwrap();
+            if let Inner::Read(t) = &*inner {
+                if nrow == 0 {
+                    // casacore returns an empty 1-D array of the column type.
+                    if let Some(arr) = zeros_for_column(py, &t.dat.desc.columns[col_idx], &[0])? {
+                        return Ok(arr);
+                    }
+                }
+                // Typed fast path: allocate the result array and fill it
+                // straight from the data files (see `getcolnp`).
+                if startrow.saturating_add(nrow) <= t.nrows() && t.raw_column_supported(col_idx) {
+                    let desc = &t.dat.desc.columns[col_idx];
+                    let mut dims = vec![nrow as usize];
+                    if matches!(desc.kind, core::tabledesc::ColumnKind::Array) {
+                        if let Some(s) = &desc.shape {
+                            dims.extend(s.iter().rev().map(|&d| d.max(0) as usize));
+                        }
+                    }
+                    if let Some(arr) = zeros_for_column(py, desc, &dims)? {
+                        if fill_numpy_raw(t, col_idx, startrow, nrow, arr.bind(py))? {
+                            return Ok(arr);
+                        }
+                    }
+                }
+            }
+        }
         let cells = self.read_col(col_idx, startrow, nrow)?;
         self.column_to_python(py, col_idx, &cells)
     }
@@ -1516,9 +1604,7 @@ impl Table {
             core::tabledesc::ColumnKind::Array
         );
         let values = self.value_to_cells(py, col_idx, value, nrow, is_array_col, false)?;
-        for (i, v) in values.into_iter().enumerate() {
-            self.put_cell(col_idx, startrow + i as u64, v)?;
-        }
+        self.put_cells(col_idx, startrow, values)?;
         let _ = full;
         Ok(())
     }
@@ -1906,47 +1992,60 @@ impl Table {
     }
 
     fn put_cell(&self, col_idx: usize, row: u64, value: RecordValue) -> PyResult<()> {
+        self.put_cells(col_idx, row, std::iter::once(value))
+    }
+
+    /// Write consecutive cells from `startrow`, taking the handle and store
+    /// locks once for the whole batch (a `putcol` chunk), not per cell.
+    fn put_cells(
+        &self,
+        col_idx: usize,
+        startrow: u64,
+        values: impl IntoIterator<Item = RecordValue>,
+    ) -> PyResult<()> {
         let mut inner = self.inner.lock().unwrap();
-        match &mut *inner {
-            Inner::Write { shared, .. } => {
-                let mut s = shared.lock().unwrap();
-                // Validate before writing: the putcol coercion has already
-                // produced the column's exact type, so a mismatch here is an
-                // incompatible write (e.g. a string into a double column)
-                // that casacore rejects rather than silently storing — and a
-                // fixed-shape array column must receive exactly its declared
-                // cell shape. The desc is borrowed inside the shared lock (no
-                // per-cell clone on the hot putcol path).
-                if let Some(col) = s.wt.desc().columns.get(col_idx) {
-                    if !record_fits_column(col, &value) {
-                        return Err(PyTypeError::new_err(format!(
-                            "putcol/putcell: {} cannot be stored in column {} (valueType {})",
-                            value_name(&value),
-                            col.name,
-                            ::casacure::casa_value_type(col.data_type)
+        let Inner::Write { shared, .. } = &mut *inner else {
+            return Err(PyValueError::new_err("table is not writable"));
+        };
+        let mut s = shared.lock().unwrap();
+        for (row, value) in (startrow..).zip(values) {
+            // Validate before writing: the putcol coercion has already
+            // produced the column's exact type, so a mismatch here is an
+            // incompatible write (e.g. a string into a double column) that
+            // casacore rejects rather than silently storing — and a
+            // fixed-shape array column must receive exactly its declared
+            // cell shape. The desc is borrowed inside the shared lock (no
+            // per-cell clone on the hot putcol path).
+            if let Some(col) = s.wt.desc().columns.get(col_idx) {
+                if !record_fits_column(col, &value) {
+                    return Err(PyTypeError::new_err(format!(
+                        "putcol/putcell: {} cannot be stored in column {} (valueType {})",
+                        value_name(&value),
+                        col.name,
+                        ::casacure::casa_value_type(col.data_type)
+                    )));
+                }
+                if let (Some(fixed), RecordValue::Array(a)) = (&col.shape, &value) {
+                    // Logical cell shape = the reversed stored shape.
+                    let matches = a.shape.len() == fixed.len()
+                        && a.shape
+                            .iter()
+                            .zip(fixed.iter().rev())
+                            .all(|(&got, &want)| got == want.max(0) as u32);
+                    if !fixed.is_empty() && !matches {
+                        let logical: Vec<u32> =
+                            fixed.iter().rev().map(|&d| d.max(0) as u32).collect();
+                        return Err(PyValueError::new_err(format!(
+                            "putcol: cell shape {:?} does not match column {} fixed shape {:?}",
+                            a.shape, col.name, logical
                         )));
                     }
-                    if let Some(fixed) = &col.shape {
-                        if !fixed.is_empty() {
-                            if let RecordValue::Array(a) = &value {
-                                let logical: Vec<u32> =
-                                    fixed.iter().rev().map(|&d| d.max(0) as u32).collect();
-                                if a.shape != logical {
-                                    return Err(PyValueError::new_err(format!(
-                                        "putcol: cell shape {:?} does not match column {} fixed shape {:?}",
-                                        a.shape, col.name, logical
-                                    )));
-                                }
-                            }
-                        }
-                    }
                 }
-                s.wt.putcell(col_idx, row, value).map_err(err)?;
-                s.dirty = true;
-                Ok(())
             }
-            _ => Err(PyValueError::new_err("table is not writable")),
+            s.wt.putcell(col_idx, row, value).map_err(err)?;
+            s.dirty = true;
         }
+        Ok(())
     }
 
     /// Convert user `putcol` data into one `RecordValue` per row.
@@ -2279,7 +2378,20 @@ fn ndarray_cells_typed<T: numpy::Element + Copy>(
     // dim; `putvarcol` values are full per-row cells (keep the whole shape).
     let cell_shape: &[usize] = if varcol { &shape } else { &shape[1..] };
     let cell = cell_shape.iter().product::<usize>().max(1);
-    let flat = arr.as_array();
+    let view = arr.as_array();
+    // Row-major element order. A C-contiguous array (the usual numpy input)
+    // is borrowed as one slice; anything else is copied once into logical
+    // order. Rows are then plain sub-slices: re-walking the ndarray iterator
+    // from element 0 for every row (`iter().skip(start)`) made a putcol
+    // quadratic in the chunk size.
+    let owned: Vec<T>;
+    let flat: &[T] = match arr.as_slice() {
+        Ok(s) => s,
+        Err(_) => {
+            owned = view.iter().copied().collect();
+            &owned
+        }
+    };
     let casa_shape: Vec<u32> = cell_shape.iter().map(|&s| s as u32).collect();
     let mut out = Vec::with_capacity(nrow.min(flat.len() as u64) as usize);
     for r in 0..nrow as usize {
@@ -2289,11 +2401,8 @@ fn ndarray_cells_typed<T: numpy::Element + Copy>(
         }
         let stop = ((r + 1) * cell).min(flat.len());
         // Build each row's typed element buffer directly from the borrowed
-        // numpy view (one pass, no intermediate per-element `RecordValue`).
-        let mut elems: Vec<T> = Vec::with_capacity(stop - start);
-        for e in flat.iter().skip(start).take(stop - start) {
-            elems.push(*e);
-        }
+        // numpy data (one copy, no intermediate per-element `RecordValue`).
+        let elems: Vec<T> = flat[start..stop].to_vec();
         // Array columns always store `RecordValue::Array` cells, even for a
         // 1-element cell (e.g. an ncorr=1 CORR_TYPE column in an MS): the
         // storage managers and readers expect an Array value there.

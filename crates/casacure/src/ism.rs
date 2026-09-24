@@ -247,35 +247,76 @@ impl IsmFile {
         desc: &ColumnDesc,
         row: u64,
     ) -> Result<RecordValue, IsmError> {
+        let mut out = None;
+        self.for_each_cell_raw(column, desc, row, 1, |cell| {
+            out = Some(crate::ssm::decode_scalar(
+                cell,
+                desc,
+                self.header.big_endian,
+            )?);
+            Ok::<(), IsmError>(())
+        })?;
+        out.ok_or(IsmError::RowOutOfRange { row })
+    }
+
+    /// Visit the raw stored bytes (data-file byte order, [`ism_cell_size`]
+    /// long) of `column` for rows `start .. start + nrow`, borrowed from the
+    /// mapped file.
+    ///
+    /// Each bucket's interval index is parsed once and walked forward with
+    /// the rows, so a range read is linear in the rows plus the intervals
+    /// it spans. (Resolving every row on its own re-parses the whole bucket
+    /// index per row: quadratic for a column that changes every row, like
+    /// an MS `ANTENNA1`.)
+    pub fn for_each_cell_raw<'a, E: From<IsmError>>(
+        &'a self,
+        column: usize,
+        desc: &ColumnDesc,
+        start: u64,
+        nrow: u64,
+        mut visit: impl FnMut(&'a [u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
         if desc.data_type == DataType::String {
-            return Err(IsmError::StringUnsupported);
+            return Err(IsmError::StringUnsupported.into());
         }
-        let (bucket, intra_row, _bucket_rows) = self
-            .index
-            .bucket_for(row)
-            .ok_or(IsmError::RowOutOfRange { row })?;
-        let ci = self.column_index(bucket, column)?;
-        // Interval containing the intra-bucket row.
-        let lb = ci.rows.partition_point(|&r| r < intra_row);
-        let inx = if lb < ci.rows.len() && ci.rows[lb] == intra_row {
-            lb
-        } else {
-            lb.checked_sub(1)
-                .ok_or(IsmError::ColumnEmpty { column, row })?
-        };
-        let offset = ci.offsets[inx] as usize;
-        let b = self.bucket_bytes(bucket)?;
-        let data_off = 4usize; // data area starts after the index-offset u32
-        let cell = b
-            .get(data_off + offset..data_off + offset + 32)
-            .ok_or(IsmError::ColumnEmpty { column, row })?;
         let want = ism_cell_size(desc) as usize;
-        let cell = &cell[..want];
-        Ok(crate::ssm::decode_scalar(
-            cell,
-            desc,
-            self.header.big_endian,
-        )?)
+        let data_off = 4usize; // data area starts after the index-offset u32
+        let end = start.saturating_add(nrow);
+        let mut row = start;
+        while row < end {
+            let (bucket, intra_row, bucket_rows) = self
+                .index
+                .bucket_for(row)
+                .ok_or(IsmError::RowOutOfRange { row })?;
+            if intra_row >= bucket_rows {
+                return Err(IsmError::RowOutOfRange { row }.into());
+            }
+            let ci = self.column_index(bucket, column)?;
+            let b = self.bucket_bytes(bucket)?;
+            // Interval containing the first intra-bucket row.
+            let lb = ci.rows.partition_point(|&r| r < intra_row);
+            let mut inx = if lb < ci.rows.len() && ci.rows[lb] == intra_row {
+                lb
+            } else {
+                lb.checked_sub(1)
+                    .ok_or(IsmError::ColumnEmpty { column, row })?
+            };
+            let stop = (bucket_rows - intra_row).min(end - row);
+            for k in 0..stop {
+                let ir = intra_row + k;
+                while inx + 1 < ci.rows.len() && ci.rows[inx + 1] <= ir {
+                    inx += 1;
+                }
+                let offset = data_off + ci.offsets[inx] as usize;
+                let cell = b.get(offset..offset + want).ok_or(IsmError::ColumnEmpty {
+                    column,
+                    row: row + k,
+                })?;
+                visit(cell)?;
+            }
+            row += stop;
+        }
+        Ok(())
     }
 }
 

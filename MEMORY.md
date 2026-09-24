@@ -135,12 +135,14 @@ in-memory / tests) or `Mapped(memmap2::Mmap)`.
   path.
 - A read handle stays an open snapshot (documented): a concurrent flush
   rewrites the file, so a stale handle reads its own captured state.
-- **Lazy write store:** `WritableTable` keeps the table's row count and a
-  per-column `Vec<Option<RecordValue>>` that starts EMPTY. `addrows` only
-  bumps the row count; the first `putcell`/`putcol` on a column allocates its
-  slots (filled with `None`), `putcell` records the row in that column's
-  `pending` bitset, and `flush` patches only the pending rows and then
-  releases both buffers. A read of a row with no buffered cell (never
+- **Lazy, sparse write store:** `WritableTable` keeps the table's row count
+  and, per column, a map from row to buffered cell that holds ONLY the rows
+  written (or loaded) — never one slot per table row. `addrows` only bumps
+  the row count; `putcell` buffers the cell flagged as pending, and `flush`
+  patches only the pending rows and then releases the column's buffer. (A
+  per-table-row slot vector, re-allocated after every flush, made each
+  one-row dask-ms chunk flush O(table rows); `tests/flush_cost.rs` pins the
+  allocation per one-row flush as independent of the table size.) A read of a row with no buffered cell (never
   written, or released by an earlier flush) answers with the column default or
   the on-disk value, so nothing has to be pre-filled. That is what makes
   `open_for_update` — dask-ms's writable open of the output MS — O(1) instead
