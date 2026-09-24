@@ -5,7 +5,9 @@ subtasks are moved here.
 
 ## [Unreleased]
 
-### Fixed
+## [3.8.5] - 2026-09-24
+
+### Performance
 
 - **A writable open no longer materialises the table** (`WritableTable`): the
   row count is now authoritative and a column's cell store is allocated only
@@ -23,6 +25,8 @@ subtasks are moved here.
   end-to-end workload on `bpcal.ms` (VmHWM) fell from ~2.2 GiB to 0.86 GiB
   against casacore's 0.55 GiB. New regression test
   `tests/test_memory_chunking.py::test_writable_open_does_not_materialize_the_table`.
+
+### Fixed
 
 - **Writable-handle reads merge disk, pending writes and defaults.** A read on
   a write handle sent the whole row range to the on-disk snapshot, so rows
@@ -76,7 +80,6 @@ subtasks are moved here.
   `getcell`; python-casacore 3.8.1 returns `(1, 3)` — commit 8a241a7 stopped
   the leading-singleton trim on purpose (trimming broke skarabina's CHAN_FREQ
   read) — so the test pins `(1, 3)`.
-
 - **StandardStMan flushes are now incremental** (`patch_ssm_column`): a
   per-chunk dask-ms write no longer rebuilds the whole SSM column — only
   the buckets holding the written rows are patched in place (numeric and
