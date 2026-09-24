@@ -700,3 +700,36 @@ Verification after the fix: Python **137 passed, 1 skipped**; Rust 151 + 15 + 6;
 MEMORY.md (new "The write path" section + TL;DR + history row), CHANGELOG.md
 [Unreleased], and the test module docstring now states the write-side contract.
 
+### Released: v3.8.5 (2026-09-24)
+
+Both session commits (`e31470e` suite green, `0ebbfae` lazy write cell store)
+plus the release commit `363a44b` are on `main`; `Cargo.toml`, `Cargo.lock`
+and `pyproject.toml` bumped 3.8.4 → 3.8.5 and the CHANGELOG's Unreleased
+section became `[3.8.5] - 2026-09-24` (Performance: lazy write cell store;
+Fixed: the seven suite failures + the array/ISM/drop_rows/keyword fixes).
+Tagged `v3.8.5` (annotated) and pushed.
+
+CI/CD — all three tag workflows green:
+
+- **CI** success. The v3.8.4 CI run had failed on exactly the seven tests this
+  session fixed (`test_check_putdata`, `test_tableascii`, `test_removecols`,
+  `test_getcell_keeps_singleton_dims`, `test_relative_path_ms_links_…`,
+  `test_scalar_roundtrip_incremental[boolean]`,
+  `test_error_paths[out-of-range_getcell]`; CI has no dask-ms, so the
+  memory-chunking module skips there). v3.8.5 is the first green CI run.
+- **Publish Rust crate** success — crates.io `casacure 3.8.5`; the tag matches
+  the crate version, so the workflow published (a tag that does not match is a
+  wheel-only release and skips crates.io).
+- **Publish Python package** success — PyPI `casacure 3.8.5`, 27 artifacts
+  (CPython 3.9–3.14 + 3.14 free-threaded, PyPy 3.11; manylinux x86_64/aarch64,
+  macOS arm64, win_amd64, sdist).
+
+Machine notes for the next session: `git push` needs
+`GIT_SSH_COMMAND="ssh -F /dev/null"` here (the system
+`/etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf` is owned by `nobody:nogroup`
+and ssh refuses it with "Bad owner or permissions"), and `gh` needs
+`XDG_CACHE_HOME=<writable dir>` because `~/.cache` is read-only. Pushing to
+`main` does not trigger CI — the workflows are `tags: ["v*"]` only, so tag to
+release.
+
+
