@@ -38,6 +38,8 @@ pub enum IsmError {
     AipsIo(#[from] AipsIoError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    FileIo(#[from] crate::datafile::FileIoError),
     #[error("unexpected object type {found:?}, expected {expected:?}")]
     UnexpectedType { expected: String, found: String },
     #[error("data file endian flag {flag} does not match table flag {expected}")]
@@ -130,8 +132,11 @@ impl IsmFile {
         seq_nr: u32,
         table_big_endian: bool,
     ) -> Result<IsmFile, IsmError> {
-        let file = std::fs::File::open(table_dir.as_ref().join(format!("table.f{seq_nr}")))?;
-        let data = crate::datafile::Buffer::from_file(file)?;
+        let path = table_dir.as_ref().join(format!("table.f{seq_nr}"));
+        let file = std::fs::File::open(&path)
+            .map_err(|e| IsmError::FileIo(crate::datafile::FileIoError::new(&path, e)))?;
+        let data = crate::datafile::Buffer::from_file(file)
+            .map_err(|e| IsmError::FileIo(crate::datafile::FileIoError::new(&path, e)))?;
         let (header, index) = Self::parse_meta(&data, table_big_endian)?;
         Ok(IsmFile {
             header,

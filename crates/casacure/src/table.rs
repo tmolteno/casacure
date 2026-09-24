@@ -1648,6 +1648,18 @@ pub enum WriteTableError {
     Storage(String),
 }
 
+/// Name the file a storage error came from, the way casacore does.
+///
+/// casacore renders these as `RegularFileIO: error in open or create of file
+/// <path>: <cause>`; casacure reported only the cause, so a failure surfacing
+/// through dask-ms (`ndarray_putcol` -> `table.flush()`) named neither the
+/// table nor the block at fault.  The sites that know the path pass it here;
+/// the storage managers' own opens do it themselves, see
+/// [`crate::datafile::FileIoError`].
+fn storage_error(path: impl AsRef<std::path::Path>, err: impl std::fmt::Display) -> String {
+    format!("{}: {err}", path.as_ref().display())
+}
+
 impl WritableTable {
     /// Start a new table with the given schema and no rows.
     pub fn create(
@@ -2145,7 +2157,7 @@ impl WritableTable {
         let disk = if file_exists {
             Some(
                 crate::Table::open(&self.dir, false)
-                    .map_err(|e| WriteTableError::Storage(e.to_string()))?,
+                    .map_err(|e| WriteTableError::Storage(storage_error(&self.dir, e)))?,
             )
         } else {
             None
@@ -2179,7 +2191,7 @@ impl WritableTable {
                 let disk_rows = t.nrows().min(nrow);
                 let mut l = t
                     .getcol(di, 0, disk_rows)
-                    .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                    .map_err(|e| WriteTableError::Storage(storage_error(&self.dir, e)))?;
                 // Rows past the on-disk row count (fresh addrows) default-fill.
                 while (l.len() as u64) < nrow {
                     l.push(default.clone());
@@ -2282,9 +2294,11 @@ impl WritableTable {
     /// rebuild from on-disk + pending.  After a successful flush the column
     /// releases its buffered cells.
     fn flush_preserving(&mut self, dir: &std::path::Path) -> Result<(), WriteTableError> {
-        let buf = std::fs::read(dir.join("table.dat"))
-            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
-        let dat = parse_table_dat(&buf).map_err(|e| WriteTableError::Storage(e.to_string()))?;
+        let dat_path = dir.join("table.dat");
+        let buf = std::fs::read(&dat_path)
+            .map_err(|e| WriteTableError::Storage(storage_error(&dat_path, e)))?;
+        let dat = parse_table_dat(&buf)
+            .map_err(|e| WriteTableError::Storage(storage_error(&dat_path, e)))?;
         let nrow = self.rows;
         let dm_of: Vec<u32> = (0..self.desc.columns.len())
             .map(|c| {
@@ -2356,11 +2370,14 @@ impl WritableTable {
                                 &cols,
                             )
                             .map_err(storage)?;
-                            std::fs::write(dir.join(format!("table.f{seq}")), f0)
-                                .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                            let path = dir.join(format!("table.f{seq}"));
+                            std::fs::write(&path, f0)
+                                .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
                             if let Some(i) = f0i {
-                                std::fs::write(dir.join(format!("table.f{seq}i")), i)
-                                    .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                                let index_path = dir.join(format!("table.f{seq}i"));
+                                std::fs::write(&index_path, i).map_err(|e| {
+                                    WriteTableError::Storage(storage_error(&index_path, e))
+                                })?;
                             }
                         } else {
                             let f0 = build_ism_data(
@@ -2372,8 +2389,9 @@ impl WritableTable {
                                 &cols,
                             )
                             .map_err(storage)?;
-                            std::fs::write(dir.join(format!("table.f{seq}")), f0)
-                                .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                            let path = dir.join(format!("table.f{seq}"));
+                            std::fs::write(&path, f0)
+                                .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
                         }
                     }
                     for &col in &cols {
@@ -2402,10 +2420,12 @@ impl WritableTable {
                             &[col],
                         )
                         .map_err(storage)?;
-                        std::fs::write(dir.join(format!("table.f{seq}")), hdr)
-                            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
-                        std::fs::write(dir.join(format!("table.f{seq}_TSM{file_seq}")), tile)
-                            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                        let path = dir.join(format!("table.f{seq}"));
+                        std::fs::write(&path, hdr)
+                            .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
+                        let tile_path = dir.join(format!("table.f{seq}_TSM{file_seq}"));
+                        std::fs::write(&tile_path, tile)
+                            .map_err(|e| WriteTableError::Storage(storage_error(&tile_path, e)))?;
                     }
                     self.clear_pending(col);
                 }
@@ -2465,11 +2485,12 @@ impl WritableTable {
         let parsed = StandardStManFile::open(dir, seq, big_endian)
             .map_err(|e| WriteTableError::Storage(e.to_string()))?;
         let bucket_size = parsed.header.bucket_size as usize;
+        let path = dir.join(format!("table.f{seq}"));
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(dir.join(format!("table.f{seq}")))
-            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+            .open(&path)
+            .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
 
         // Per touched bucket: bit set/clear ops (byte -> (set, clear) mask;
         // several pending Bool rows share a byte, so masks must accumulate)
@@ -2524,9 +2545,9 @@ impl WritableTable {
             let base = DATA_START + number as usize * bucket_size;
             let mut buf = vec![0u8; bucket_size];
             file.seek(SeekFrom::Start(base as u64))
-                .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
             file.read_exact(&mut buf)
-                .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
             if let Some(ops) = bit_ops.get(&number) {
                 for (&byte, &(set, clear)) in ops {
                     if let Some(b) = buf.get_mut(byte) {
@@ -2543,9 +2564,9 @@ impl WritableTable {
                 }
             }
             file.seek(SeekFrom::Start(base as u64))
-                .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
             file.write_all(&buf)
-                .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
         }
         Ok(true)
     }
@@ -2559,10 +2580,10 @@ impl WritableTable {
         nrow: u64,
     ) -> Result<Vec<RecordValue>, WriteTableError> {
         let t = crate::Table::open(&self.dir, false)
-            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+            .map_err(|e| WriteTableError::Storage(storage_error(&self.dir, e)))?;
         let mut vals = t
             .getcol(col, 0, nrow)
-            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+            .map_err(|e| WriteTableError::Storage(storage_error(&self.dir, e)))?;
         for r in self.pending_rows(col) {
             if let Some(Some(v)) = self.cells[col].get(r as usize) {
                 vals[r as usize] = v.clone();
@@ -2674,7 +2695,8 @@ impl WritableTable {
                 }
             }
         }
-        std::fs::write(&tile_path, tile).map_err(|e| WriteTableError::Storage(e.to_string()))?;
+        std::fs::write(&tile_path, tile)
+            .map_err(|e| WriteTableError::Storage(storage_error(&tile_path, e)))?;
         Ok(Some(()))
     }
 }
@@ -3963,6 +3985,64 @@ mod tests {
         assert_eq!(
             t.getcolkeywords(0).unwrap(),
             format!("{{\"SUBREF\":\"Table: {sub_abs}\"}}")
+        );
+    }
+
+    /// A write to a read-only block must say *which* file refused it (#12).
+    ///
+    /// The failure this pins down is the one that reaches users: a flag write
+    /// through dask-ms dies with `storage error: Permission denied`, and
+    /// without the path in the message there is nothing to say which block of
+    /// which measurement set was at fault.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_block_is_named_in_the_storage_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("readonly-block-error");
+        let mut desc = typed_desc();
+        // Two SSM scalar columns, so the second flush is the incremental
+        // (preserving) path: one column pending, the other already on disk.
+        desc.columns = vec![
+            scalar_col("FLAG", DataType::Bool, 0),
+            scalar_col("KEEP", DataType::Int, 0),
+        ];
+        let mut wt = WritableTable::create(&dir, desc);
+        wt.addrows(2);
+        wt.putcol(0, 0, &[RecordValue::Bool(false), RecordValue::Bool(false)])
+            .unwrap();
+        wt.putcol(1, 0, &[RecordValue::Int(7), RecordValue::Int(8)])
+            .unwrap();
+        wt.flush().unwrap();
+
+        let blocks: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("table.f"))
+            })
+            .collect();
+        assert!(!blocks.is_empty(), "the first flush wrote no block");
+        for path in &blocks {
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o444);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+
+        wt.putcell(0, 0, RecordValue::Bool(true)).unwrap();
+        let err = wt
+            .flush()
+            .expect_err("writing a read-only block has to fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&dir.display().to_string()),
+            "the table directory is not named in: {msg}"
+        );
+        assert!(msg.contains("table.f"), "no block named in: {msg}");
+        assert!(
+            msg.contains("Permission denied"),
+            "the cause is missing from: {msg}"
         );
     }
 

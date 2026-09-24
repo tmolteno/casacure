@@ -31,6 +31,8 @@ pub enum TsmError {
     AipsIo(#[from] AipsIoError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    FileIo(#[from] crate::datafile::FileIoError),
     #[error("unexpected object type {found:?}, expected {expected:?}")]
     UnexpectedType { expected: String, found: String },
     #[error("row {row} outside the {nrow} rows of the tiled data")]
@@ -115,7 +117,9 @@ impl TsmFile {
         table_big_endian: bool,
     ) -> Result<TsmFile, TsmError> {
         let dir = table_dir.as_ref();
-        let data = std::fs::read(dir.join(format!("table.f{seq_nr}")))?;
+        let header_path = dir.join(format!("table.f{seq_nr}"));
+        let data = std::fs::read(&header_path)
+            .map_err(|e| TsmError::FileIo(crate::datafile::FileIoError::new(&header_path, e)))?;
         let header = parse_header(&data)?;
         // The first cube holding data names the tile file (a shape-stman
         // placeholder cube for not-yet-set cells carries -1); a column with
@@ -130,8 +134,9 @@ impl TsmFile {
             Some(file_seq) => {
                 let path = dir.join(format!("table.f{seq_nr}_TSM{file_seq}"));
                 let tile_file = std::fs::File::open(&path)
-                    .map_err(|_| TsmError::MissingTileFile(path.display().to_string()))?;
-                crate::datafile::Buffer::from_file(tile_file)?
+                    .map_err(|e| TsmError::FileIo(crate::datafile::FileIoError::new(&path, e)))?;
+                crate::datafile::Buffer::from_file(tile_file)
+                    .map_err(|e| TsmError::FileIo(crate::datafile::FileIoError::new(&path, e)))?
             }
             None => crate::datafile::Buffer::from(Vec::new()),
         };

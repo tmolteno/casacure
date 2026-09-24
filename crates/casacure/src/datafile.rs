@@ -8,6 +8,36 @@
 
 use std::ops::Deref;
 
+use thiserror::Error;
+
+/// An I/O failure together with the file it happened on: `<path>: <cause>`.
+///
+/// casacore names the file in these failures — `RegularFileIO: error in open or
+/// create of file <path>: <cause>` — while casacure used to report only the
+/// cause, so a failure surfacing through dask-ms (`ndarray_putcol` ->
+/// `table.flush()`) named neither the table nor the block at fault.  Every open
+/// in the storage managers knows its own file name, so they report it here and
+/// every caller inherits it.
+#[derive(Debug, Error)]
+#[error("{path}: {source}")]
+pub struct FileIoError {
+    /// The file the operation failed on.
+    pub path: std::path::PathBuf,
+    /// What the filesystem said.
+    #[source]
+    pub source: std::io::Error,
+}
+
+impl FileIoError {
+    /// Wrap `source`, naming the file it failed on.
+    pub fn new(path: impl Into<std::path::PathBuf>, source: std::io::Error) -> Self {
+        Self {
+            path: path.into(),
+            source,
+        }
+    }
+}
+
 /// A data file's bytes.
 #[derive(Debug)]
 pub enum Buffer {

@@ -5,6 +5,23 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Storage errors name the file they came from.**  `storage error: Permission
+  denied (os error 13)` used to be the whole message, so a failure reaching a
+  user through dask-ms (`ndarray_putcol` -> `table.flush()`) named neither the
+  table nor the block at fault — while casacore names the file
+  (`RegularFileIO: error in open or create of file <path>: <cause>`).  Every
+  open in the storage managers now reports through `datafile::FileIoError`
+  (`<path>: <cause>`), and the write path's own `table.dat` / `table.fN` reads
+  and writes do the same, so the message reads
+
+      storage error: /data/out.ms/table.f0: Permission denied (os error 13)
+
+  The tiled storage manager's tile-file open also reports its real cause now:
+  it was mapped to `MissingTileFile` whatever had gone wrong, so a permission
+  error was reported as a missing file.  Reported as issue #12.
+
 ## [3.8.6] - 2026-09-24
 
 ### Benchmarks
