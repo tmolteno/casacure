@@ -5,6 +5,8 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.7] - 2026-09-25
+
 ### Performance
 
 Measured on an MS-shaped table built by real python-casacore (100k rows;
