@@ -6,44 +6,49 @@ not every unimplemented feature or gap (those are tracked in
 `ARE_WE_CURED.md`). Each entry is asserted by the ported python-casacore
 tests.
 
-## Unset cells: casacure raises instead of returning a default
+Ground truth for every entry below was probed against real
+python-casacore 3.8.1 on this machine.
 
-**casacore behaviour.** Reading a cell of a freshly created column that was
-never written returns the column's *default value*: `0` for integer columns,
-`0.0` for float/double/complex, `""` for strings, `False` for booleans.
-python-casacore inherits this: `t.addrows(2)` followed by `t.getcol("cold")`
-yields `[0.0, 0.0]`.
+## Out-of-range `getcell` raises `ValueError`
 
-**casacure behaviour.** `getcol` (and cell reads generally) raise
-`ValueError: column <i> row <r> has not been set` for any cell never written.
+**casacore behaviour.** `t.getcell("C", 99)` on a 3-row table fails inside
+the storage manager with `RuntimeError: TableProxy::getCell: no such row`.
+
+**casacure behaviour.** The row bounds are checked before the storage
+manager is consulted, raising
+`ValueError: row 99 is out of range (table has 3 rows)`.
 
 ### Why
 
-1. **Silent zeros are a bug-masker.** A fresh table that reads like it
-   contains real zero-valued data destroys the difference between
-   "the column genuinely holds zeros" and "the column was never touched".
-   The most common cause of touching unwritten cells is a read-before-write
-   bug (wrong table, wrong column, wrong rows). Returning plausible data
-   makes that bug undetectable, and the fabricated zeros then flow unchanged
-   into downstream analysis, silently corrupting results — worst possible
-   failure mode in a science stack.
-2. **Absence is cheap to check, costly to fake.** casacure's write backends
-   store cells as vectors that are *empty* where nothing was written;
-   honoring a default would allocate and invent a value on every read. The
-   cheap, honest representation is a missing cell, and the honest reaction
-   to a read of a missing cell is an error.
-3. **Correctness first.** casacure's stance throughout is strictness over
-   convenience: fail loudly at the first read of an unwritten cell rather
-   than turn a latent bug into a plausible wrong answer.
+`ValueError` is the contract used throughout the binding for *invalid
+arguments* (a bad shape, a read-only handle, a row that does not exist),
+while `RuntimeError` is reserved for storage-layer failures the caller
+cannot have caused. A negative or out-of-range row index is an argument
+error, and it is the same class of mistake regardless of which storage
+manager the column happens to use — routing it through the manager made the
+exception type depend on the column's data manager. Raising up front also
+avoids the misleading `row 0 not covered by any indexed bucket` message an
+unwritten-but-valid row used to produce.
 
-### Impact on ported tests
+Arithmetic on the result is unaffected: both `ValueError` and
+`RuntimeError` derive from `Exception`, and dask-ms never reads a row it did
+not just write.
 
-The python-casacore test `test_check_putdata` reads unset cells expecting
-zeros; the casacure port asserts the exception instead
-(`with pytest.raises(ValueError): t.getcol("coli")`). Everything else in
-that test (put/get roundtrips) is unchanged. Impenetrable to normal use:
-dask-ms writes every cell before reading it (its 219-test suite is green
-against casacure), so the strict contract costs nothing there.
+## Reads of rows that are not on disk return defaults (parity)
+
+Not a divergence, but recorded here because it used to be one: a read of a
+row the table does not have yet — `addrows` on a freshly created table, or a
+column added this session — returns the column's default value (`0`, `0.0`,
+`""`, `False`; a zeroed array of the declared shape), exactly like
+casacore's `ColumnSet` defaults. `test_check_putdata` asserts
+`getcol("coli") == [0, 0]` after `addrows(2)`, matching python-casacore.
+
+A writable handle merges three sources for every read: the pending
+(unflushed) writes, the on-disk values for rows the snapshot actually has,
+and the buffered `addrows` default for everything newer. The earlier
+"unset cells raise" contract (documented here until 2026-09-24, commit
+0ea3db6) was superseded by ad0b510 and is gone: no read path raises for an
+unwritten cell anymore.
 
 ## Other intentional divergences
 

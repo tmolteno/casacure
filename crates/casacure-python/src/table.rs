@@ -215,6 +215,119 @@ fn column_cells(
     t.getcol(col_idx, startrow, nrow).map_err(err)
 }
 
+/// The on-disk twin of a write handle's column `col_idx`, matched by
+/// name+type: `addcols`/`removecols` shift the indices within a session, so a
+/// positional lookup would read the wrong column (or none).
+fn disk_col_index(s: &WriteData, col_idx: usize) -> Option<usize> {
+    let cd = s.wt.desc().columns.get(col_idx)?;
+    let disk = &s.read.dat.desc.columns;
+    if disk
+        .get(col_idx)
+        .is_some_and(|c| c.name == cd.name && c.data_type == cd.data_type)
+    {
+        return Some(col_idx);
+    }
+    disk.iter()
+        .position(|c| c.name == cd.name && c.data_type == cd.data_type)
+}
+
+/// The value of a row that is not on disk (added since the last flush): the
+/// `addrows` default buffered in the cell store — or, for a column the store
+/// has no cell for, the schema default.
+fn buffered_default_cell(s: &WriteData, col_idx: usize, row: u64) -> RecordValue {
+    if let Some(v) = s.wt.cell(col_idx, row) {
+        return v.clone();
+    }
+    s.wt.desc()
+        .columns
+        .get(col_idx)
+        .and_then(::casacure::default_cell_value)
+        // Unreachable: every column kind has a default.
+        .unwrap_or(RecordValue::Bool(false))
+}
+
+/// One cell of a merged write-handle read: a pending write, else the on-disk
+/// value when the snapshot has the row, else the `addrows` default.
+fn merged_cell(s: &WriteData, col_idx: usize, row: u64) -> PyResult<RecordValue> {
+    if let Some(v) = s.wt.pending_cell(col_idx, row) {
+        return Ok(v.clone());
+    }
+    if row < s.read.nrows() {
+        if let Some(di) = disk_col_index(s, col_idx) {
+            return s.read.getcell(di, row).map_err(err);
+        }
+    }
+    Ok(buffered_default_cell(s, col_idx, row))
+}
+
+/// `ValueError` for a row the table does not have (the casacure contract for
+/// read violations; casacore raises its own "no such row" `RuntimeError`).
+fn row_out_of_range(row: u64, nrow: u64) -> PyErr {
+    PyValueError::new_err(format!("row {row} is out of range (table has {nrow} rows)"))
+}
+
+/// `ValueError` for a row range that runs past the end of the table.
+fn range_out_of_range(startrow: u64, end: u64, nrow: u64) -> PyErr {
+    PyValueError::new_err(format!(
+        "row range {startrow}..{end} is outside the table ({nrow} rows)"
+    ))
+}
+
+/// Apply a cell sub-array slice (0-based inclusive corners; scalar cells are
+/// returned unchanged).
+fn slice_cell(cell: RecordValue, blc: &[i64], trc: &[i64]) -> PyResult<RecordValue> {
+    if blc.is_empty() && trc.is_empty() {
+        return Ok(cell);
+    }
+    Ok(match cell {
+        RecordValue::Array(a) => {
+            RecordValue::Array(::casacure::slice_array_value(&a, blc, trc).map_err(err)?)
+        }
+        other => other,
+    })
+}
+
+/// A write-handle column range.
+///
+/// The read snapshot only covers the rows the table had at the last flush:
+/// rows added since — and columns added this session — have no on-disk value,
+/// so handing the whole range to the snapshot raises `row N not covered by
+/// any indexed bucket` (python `test_check_putdata` / `test_tableascii`).
+/// Rows the disk does have are read in one range; every other row comes from
+/// the buffer; pending writes overlay both.
+fn merged_col_cells(
+    s: &WriteData,
+    col_idx: usize,
+    startrow: u64,
+    nrow: u64,
+) -> PyResult<Vec<RecordValue>> {
+    let total = s.wt.col_len(col_idx) as u64;
+    let end = startrow.saturating_add(nrow);
+    if end > total {
+        return Err(range_out_of_range(startrow, end, total));
+    }
+    let mut out: Vec<RecordValue> = Vec::with_capacity(nrow as usize);
+    // Rows the read snapshot covers — none when the column is not on disk
+    // (it was added this session).
+    let mut row = startrow;
+    if let Some(di) = disk_col_index(s, col_idx) {
+        let disk_hi = end.min(s.read.nrows());
+        if disk_hi > startrow {
+            out.extend(column_cells(&s.read, di, startrow, disk_hi - startrow)?);
+            row = disk_hi;
+        }
+    }
+    for r in row..end {
+        out.push(buffered_default_cell(s, col_idx, r));
+    }
+    for (i, r) in (startrow..end).enumerate() {
+        if let Some(v) = s.wt.pending_cell(col_idx, r) {
+            out[i] = v.clone();
+        }
+    }
+    Ok(out)
+}
+
 /// The stored (CASA) shape of array cells in a column: from fixed shape in
 /// the descriptor, else from the first cell with a value.
 /// The per-cell shape as stored (the first array cell's own shape; for
@@ -618,19 +731,17 @@ impl Table {
     }
 
     /// Read cells for a column range from whichever backing is current.
+    ///
+    /// A write handle merges its unflushed writes over the on-disk state;
+    /// rows the table did not have at the last flush read back as their
+    /// `addrows` default (see [`merged_col_cells`]).
     fn read_col(&self, col_idx: usize, startrow: u64, nrow: u64) -> PyResult<Vec<RecordValue>> {
         let inner = self.inner.lock().unwrap();
         match &*inner {
             Inner::Read(t) => column_cells(t, col_idx, startrow, nrow),
             Inner::Write { shared, .. } => {
                 let s = shared.lock().unwrap();
-                let mut out = column_cells(&s.read, col_idx, startrow, nrow)?;
-                for (i, r) in (startrow..startrow + nrow).enumerate() {
-                    if let Some(v) = s.wt.pending_cell(col_idx, r) {
-                        out[i] = v.clone();
-                    }
-                }
-                Ok(out)
+                merged_col_cells(&s, col_idx, startrow, nrow)
             }
         }
     }
@@ -775,10 +886,8 @@ impl Table {
                 Inner::Write { shared, .. } => shared.lock().unwrap().wt.desc().keywords.clone(),
             }
         };
-        let base = std::path::Path::new(&self.path)
-            .parent()
-            .map(|p| p.to_path_buf());
-        let d = convert::table_record_to_dict_ctx(py, &rec, base.as_deref())?;
+        let base = self.dir_of();
+        let d = convert::table_record_to_dict_ctx(py, &rec, Some(&base))?;
         match d.get_item(name)? {
             Some(v) => Ok(v.unbind()),
             None => Ok(py.None()),
@@ -792,26 +901,20 @@ impl Table {
             Inner::Read(t) => t.dat.desc.keywords.clone(),
             Inner::Write { shared, .. } => shared.lock().unwrap().wt.desc().keywords.clone(),
         };
-        let base = std::path::Path::new(&self.path)
-            .parent()
-            .map(|p| p.to_path_buf());
-        Ok(
-            convert::table_record_to_dict_ctx(py, &rec, base.as_deref())?
-                .into_any()
-                .unbind(),
-        )
+        let base = self.dir_of();
+        Ok(convert::table_record_to_dict_ctx(py, &rec, Some(&base))?
+            .into_any()
+            .unbind())
     }
 
     /// `getcolkeywords(column)` -> dict.
     fn getcolkeywords(&self, py: Python<'_>, column: &str) -> PyResult<Py<PyAny>> {
         let d = PyDict::new(py);
         let desc = self.desc();
-        let base = std::path::Path::new(&self.path)
-            .parent()
-            .map(|p| p.to_path_buf());
+        let base = self.dir_of();
         if let Some(col) = desc.columns.iter().find(|c| c.name == column) {
             return Ok(
-                convert::table_record_to_dict_ctx(py, &col.keywords, base.as_deref())?
+                convert::table_record_to_dict_ctx(py, &col.keywords, Some(&base))?
                     .into_any()
                     .unbind(),
             );
@@ -1693,12 +1796,8 @@ impl Table {
     fn _getdesc(&self, py: Python<'_>, actual: bool) -> PyResult<Py<PyAny>> {
         let _ = actual;
         let desc = self.desc();
-        let base = std::path::Path::new(&self.path)
-            .parent()
-            .map(|p| p.to_path_buf());
-        Ok(desc_to_pydict(py, &desc, base.as_deref())?
-            .into_any()
-            .unbind())
+        let base = self.dir_of();
+        Ok(desc_to_pydict(py, &desc, Some(&base))?.into_any().unbind())
     }
 
     fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
@@ -1718,13 +1817,24 @@ impl Table {
     fn read_cell(&self, col_idx: usize, row: u64) -> PyResult<RecordValue> {
         let inner = self.inner.lock().unwrap();
         match &*inner {
-            Inner::Read(t) => t.getcell(col_idx, row).map_err(err),
+            Inner::Read(t) => {
+                let n = t.nrows();
+                // Row bounds are checked here so an out-of-range row is the
+                // documented ValueError, not whatever the storage manager
+                // happens to raise (python-casacore raises "no such row";
+                // casacure's contract is ValueError for read violations).
+                if row >= n {
+                    return Err(row_out_of_range(row, n));
+                }
+                t.getcell(col_idx, row).map_err(err)
+            }
             Inner::Write { shared, .. } => {
                 let s = shared.lock().unwrap();
-                match s.wt.pending_cell(col_idx, row) {
-                    Some(v) => Ok(v.clone()),
-                    None => s.read.getcell(col_idx, row).map_err(err),
+                let n = s.wt.col_len(col_idx) as u64;
+                if row >= n {
+                    return Err(row_out_of_range(row, n));
                 }
+                merged_cell(&s, col_idx, row)
             }
         }
     }
@@ -1749,10 +1859,12 @@ impl Table {
             Inner::Read(t) => t.getcellslice(col_idx, row, blc, trc).map_err(err),
             Inner::Write { shared, .. } => {
                 let s = shared.lock().unwrap();
-                match s.wt.pending_cell(col_idx, row) {
-                    Some(v) => Ok(v.clone()),
-                    None => s.read.getcellslice(col_idx, row, blc, trc).map_err(err),
+                let n = s.wt.col_len(col_idx) as u64;
+                if row >= n {
+                    return Err(row_out_of_range(row, n));
                 }
+                let cell = merged_cell(&s, col_idx, row)?;
+                slice_cell(cell, blc, trc)
             }
         }
     }
@@ -1775,15 +1887,18 @@ impl Table {
                 .getcolslice(col_idx, blc, trc, startrow, nrow)
                 .map_err(err),
             Inner::Write { shared, .. } => {
+                // Per-row merged read (the on-disk snapshot does not have the
+                // rows added since the last flush), then the sub-array slice.
                 let s = shared.lock().unwrap();
-                let mut out = s
-                    .read
-                    .getcolslice(col_idx, blc, trc, startrow, nrow)
-                    .map_err(err)?;
-                for (i, r) in (startrow..startrow + nrow).enumerate() {
-                    if let Some(v) = s.wt.pending_cell(col_idx, r) {
-                        out[i] = v.clone();
-                    }
+                let total = s.wt.col_len(col_idx) as u64;
+                let end = startrow.saturating_add(nrow);
+                if end > total {
+                    return Err(range_out_of_range(startrow, end, total));
+                }
+                let mut out = Vec::with_capacity(nrow as usize);
+                for r in startrow..end {
+                    let cell = merged_cell(&s, col_idx, r)?;
+                    out.push(slice_cell(cell, blc, trc)?);
                 }
                 Ok(out)
             }

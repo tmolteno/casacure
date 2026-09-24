@@ -7,6 +7,59 @@ subtasks are moved here.
 
 ### Fixed
 
+- **Writable-handle reads merge disk, pending writes and defaults.** A read on
+  a write handle sent the whole row range to the on-disk snapshot, so rows
+  added since the last flush (a freshly created table's `addrows`, or a column
+  added this session) raised `row N not covered by any indexed bucket`.
+  `getcol`/`getcell`/`getcellslice`/`getcolslice` now read the disk snapshot
+  only for the rows it actually has (resolving the column by name+type, since
+  `addcols`/`removecols` shift indices), take every other row from the cell
+  store, and overlay the pending writes — matching python-casacore's
+  `[0, 0]`-for-unset-rows behaviour (`test_check_putdata`, `test_tableascii`).
+  An out-of-range row now raises `ValueError` before the storage manager is
+  asked (casacore raises its own `RuntimeError: no such row`).
+- **`drop_rows` renumbers the pending bitsets.** Row removal compacted the
+  cell store in place but left each written-row bit at its old index, so a
+  merged read answered with the pre-delete on-disk value
+  (`test_taql_delete_insert_persist`: deleting row 1 of `[5, 2, 9]` read back
+  `[5, 2]`). Regression test `drop_rows_renumbers_pending_bits`.
+- **IncrementalStMan Bool cells are one byte.** ISM stores whole cells back to
+  back (casacore writes `01 00 01` for three rows), not the StandardStMan
+  bit-packed representation, but the bucket was sized with
+  `scalar_cell_size(Bool) == 0`: three Bool cells stored no data at all and
+  every read failed with `buffer too short: need 1 bytes at offset 0, have 0`
+  (`test_scalar_roundtrip_incremental[boolean]`). Cross-checked byte-for-byte
+  against python-casacore 3.8.1 in both directions. Regression test
+  `ism_bool_column_stores_one_byte_per_cell`.
+- **Subtable keyword paths keep the table-directory component.**
+  `getkeyword`/`getkeywords`/`getcolkeywords`/`_getdesc` resolved a stored
+  `Table:` link against the table's *parent* instead of the table directory
+  (also used by dask-ms's keyword reads), so a relatively created MS reported
+  `.../ANTENNA` where python-casacore reports `.../t.ms/ANTENNA`. They now use
+  the core `resolve_subtable`, the same resolver as `getsubtables`.
+  `test_relative_path_ms_links_resolve_from_any_cwd`.
+- **Empty-shape array cells decode as empty.** An array-index record with
+  `ndim == 0` — a variable-shape array column created with rows and not yet
+  written — was decoded with `product()` over no dimensions, which is 1, so the
+  reader claimed a single element and the last row's record ran past the end of
+  `table.f0i` (`array reference 36 falls outside the array index file (len 40)`,
+  hit by the dask-ms smoke's `WEIGHT` column and by a regrowth over such a
+  table). Regression test `empty_variable_shape_array_cells_read_back_empty`.
+- **A regrowth skips the disk for whole-column writes.** `materialize_all`
+  reads the on-disk columns for rows that are not pending; when *every* row of a
+  column was written in the session the buffer is the truth and the on-disk
+  column (which may hold never-written array cells) is not consulted at all.
+- **`test_memory_chunking` under a relative `PYTHONPATH`:** `_strip_shim`
+  compared raw entries to the absolute `tests/shim`, so the CI-relative
+  `PYTHONPATH=tests/shim` survived into the "real casacore" workers and every
+  casacore measurement failed its backend assertion. Entries are now compared
+  by `os.path.realpath`.
+- **Stale test expectation corrected** (`test_getcell_keeps_singleton_dims`):
+  a variable-shape `(1, 3)` cell was expected to be trimmed to `(3,)` on
+  `getcell`; python-casacore 3.8.1 returns `(1, 3)` — commit 8a241a7 stopped
+  the leading-singleton trim on purpose (trimming broke skarabina's CHAN_FREQ
+  read) — so the test pins `(1, 3)`.
+
 - **StandardStMan flushes are now incremental** (`patch_ssm_column`): a
   per-chunk dask-ms write no longer rebuilds the whole SSM column — only
   the buckets holding the written rows are patched in place (numeric and

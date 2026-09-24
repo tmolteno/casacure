@@ -214,8 +214,19 @@ def _run(script, args, env_extra):
 
 
 def _strip_shim(pythonpath):
+    """Drop every PYTHONPATH entry that resolves to ``tests/shim``.
+
+    Entries are compared by ``os.path.realpath`` against ``SHIM`` so the
+    CI-relative ``PYTHONPATH=tests/shim`` is stripped too — a raw string
+    compare against the absolute ``SHIM`` left the relative entry in, the
+    "real casacore" workers silently got the shim, and every casacore
+    measurement failed the backend-mismatch assertion.
+    """
+    shim_real = os.path.realpath(SHIM)
     return os.pathsep.join(
-        p for p in pythonpath.split(os.pathsep) if p and p != SHIM
+        p
+        for p in pythonpath.split(os.pathsep)
+        if p and os.path.realpath(p) != shim_real
     )
 
 

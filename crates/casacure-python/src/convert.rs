@@ -658,22 +658,28 @@ pub(crate) fn table_record_to_dict<'py>(
 }
 
 /// Like `table_record_to_dict`, but `TpTable` keyword fields are resolved to
-/// the `"Table: <path>"` string python-casacore exposes, with `base` the
-/// directory containing the parent table.
+/// the `"Table: <path>"` string python-casacore exposes.
+///
+/// `table_dir` is the directory of the table that owns `rec` — the base
+/// casacore resolves stored subtable links against (`./X` is a sibling, `././X`
+/// lives inside the table directory, a bare `X` is relative to the directory
+/// itself). Passing the table's *parent* instead loses the table-directory
+/// component of an MS subtable link (`<ms>/ANTENNA` read back as
+/// `<parent>/ANTENNA`).
 pub(crate) fn table_record_to_dict_ctx<'py>(
     py: Python<'py>,
     rec: &TableRecord,
-    base: Option<&std::path::Path>,
+    table_dir: Option<&std::path::Path>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     for (field, value) in rec.desc.fields.iter().zip(rec.values.iter()) {
         let v = match value {
-            RecordValue::Record(sub) => {
-                table_record_to_dict_ctx(py, sub, base)?.into_any().unbind()
-            }
+            RecordValue::Record(sub) => table_record_to_dict_ctx(py, sub, table_dir)?
+                .into_any()
+                .unbind(),
             RecordValue::Array(a) => array_to_dict(py, a)?.into_any().unbind(),
             RecordValue::Table(name) => {
-                let resolved = resolve_subtable_py(name, base);
+                let resolved = resolve_subtable_py(name, table_dir);
                 PyString::new(py, &resolved).into_any().unbind()
             }
             other => element_to_py(py, other)?,
@@ -683,29 +689,11 @@ pub(crate) fn table_record_to_dict_ctx<'py>(
     Ok(d)
 }
 
-fn resolve_subtable_py(name: &str, base: Option<&std::path::Path>) -> String {
-    match base {
-        Some(b) => {
-            // A legacy `.//absolute` stored link keeps its absolute tail.
-            if let Some(rest) = name.strip_prefix("./") {
-                if rest.starts_with('/') {
-                    return format!(
-                        "Table: {}",
-                        casacure::record::lexical_normalize(std::path::Path::new(rest)).display()
-                    );
-                }
-            }
-            let path = std::path::Path::new(name);
-            let joined = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                b.join(path)
-            };
-            format!(
-                "Table: {}",
-                casacure::record::lexical_normalize(&joined).display()
-            )
-        }
+fn resolve_subtable_py(name: &str, table_dir: Option<&std::path::Path>) -> String {
+    match table_dir {
+        // The core resolver implements casacore's `Path::addDirectory`
+        // convention, shared with `getsubtables`.
+        Some(dir) => format!("Table: {}", casacure::record::resolve_subtable(name, dir)),
         None => name.to_string(),
     }
 }

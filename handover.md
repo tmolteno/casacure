@@ -440,3 +440,196 @@ test_getcell_keeps_singleton_dims, test_relative_path_ms_links_resolve_from_any_
 `test_core_tables_e2e.py::test_error_paths[out-of-range_getcell]` (7 total,
 122 pass). The dask-ms smoke "TIME clobbered" was #2 above and is fixed.
 Rust: 148 lib + 15 integration tests pass.
+
+## Session 2026-09-24: make the whole Python suite pass
+
+Environment: no `python` on PATH; the test interpreter is
+`/home/tim/github/skarabina/.venv-bench/bin/python` (CPython 3.14, pytest 9.1.1,
+dask-ms present, python-casacore 3.8.1 visible). Canonical command (same as CI):
+
+```sh
+PYTHONPATH=tests/shim /home/tim/github/skarabina/.venv-bench/bin/python -m pytest tests/ -q
+```
+
+**Baseline (before this session's work): 11 failed, 124 passed, 1 skipped (~36 s).**
+
+- 7 pre-existing (already listed above): `test_check_putdata`,
+  `test_tableascii`, `test_removecols`, `test_getcell_keeps_singleton_dims`,
+  `test_relative_path_ms_links_resolve_from_any_cwd`,
+  `test_scalar_roundtrip_incremental[boolean]`,
+  `test_error_paths[out-of-range_getcell]`.
+- 4 NEW in `test_memory_chunking.py` when the suite is invoked with the
+  CI-relative `PYTHONPATH=tests/shim`: `_strip_shim()` compares each PYTHONPATH
+  entry to the *absolute* `SHIM` path, so the relative entry is not stripped,
+  the "real casacore" workers actually get the shim, and the worker's backend
+  assertion fails ("wanted casacure=False but casacore resolved to
+  tests/shim/casacore/__init__.py").  Passing PYTHONPATH=tests/shim
+  absolute (or unset) hides it — CI never sees it because dask-ms is absent
+  there and the module skips.  Fix: normalize paths in `_strip_shim`.
+- NOTE: the baseline above ran against the INSTALLED casacure 3.8.3 wheel
+  (site-packages, built 2026-09-23 13:28) which PREDATES commit 02d3197
+  (2026-09-24).  Step 1 below rebuilds from current source and re-baselines.
+
+Failure signatures captured (for resume):
+- `test_check_putdata` / `test_tableascii`: `RuntimeError: row 0 not covered
+  by any indexed bucket` on getcol of never-written rows (unset cells must
+  read back as column defaults).
+- `test_error_paths[out-of-range_getcell]`: `t.getcell("C", 99)` on a 3-row
+  table must raise **ValueError**, gets the same bucket RuntimeError (missing
+  row-bounds check before bucket lookup).
+- `test_removecols`: after `removecols(["b"])` the surviving column `a`
+  reads back 0 instead of 1 (removecols clobbers other columns' data).
+- `test_getcell_keeps_singleton_dims`: fixed-shape (1,1) cell OK; a
+  *variable*-shape cell stored (1,3) must getcell as (3,) (leading row
+  singleton trimmed) — comes back (1,3).
+- `test_relative_path_ms_links_resolve_from_any_cwd`: `getkeyword("ANTENNA")`
+  on a relatively-created `t.ms` stores/returns `.../re0/ANTENNA` instead of
+  `.../re0/t.ms/ANTENNA` (subtable keyword path loses the ms dir component;
+  `getsubtables()` itself is correct).
+- `test_scalar_roundtrip_incremental[boolean]`: IncrementalStMan bool scalar
+  putcol→getcol: `RuntimeError: buffer too short: need 1 bytes at offset 0,
+  have 0` (ISM bool cell never written / wrong offset).
+
+### Diagnosis (ground truth probed against real python-casacore 3.8.1)
+
+Probes (real casacore, str paths) settled each ambiguous contract:
+- unset cells after addrows -> `[0, 0]` (defaults) — matches the test; commit
+  ad0b510 already declared this parity contract but the read paths still raise
+  (DIFFERENCES.md "unset cells raise" section is STALE — written 0ea3db6,
+  predates ad0b510; must be rewritten).
+- out-of-range getcell: real casacore raises RuntimeError('no such row'); the
+  test pins casacure's own ValueError contract (ad0b510: "ValueError for
+  shape/read-only violations") -> casacure needs a row-bounds check that raises
+  ValueError (currently falls through to the SSM bucket error = RuntimeError).
+- getcell shapes: real casacore returns (1,1) for fixed [1,1] AND (1,3) for a
+  variable (1,3) cell — NO leading-singleton trim. tests/...::test_getcell_
+  keeps_singleton_dims' second assertion (expects (3,)) contradicts real
+  casacore AND current casacure (both (1,3)); it is stale after commit 8a241a7
+  ("Keep (1,1) cells 2-D on getcell", which deliberately stopped trimming —
+  trimming broke skarabina's CHAN_FREQ read). FIX THE TEST to (1,3).
+- ISM bool: real casacore stores 1 byte/cell (bucket offsets 0,1,2; data
+  `01 00 01`). casacure's ISM write+read use `scalar_cell_size(Bool)==0` (the
+  SSM bit-packing convention) -> write stores no data, read does
+  `&cell[..0]` then decodes -> "buffer too short: need 1 bytes at offset 0,
+  have 0". Fix: ISM-specific cell size (Bool -> 1) in ism.rs read + the
+  build_ism_data write path (table.rs ~line 695).
+- subtable keyword: real returns 'Table: <ms>/ANTENNA'. casacure's
+  getkeyword resolves bare stored links ("ANTENNA") against the PARENT dir
+  (resolve_subtable_py with base=parent-of-table) -> '<parent>/ANTENNA'
+  (missing the ms dir), while getsubtables uses core `resolve_subtable(name,
+  table_dir)` which is correct. Fix: getkeyword/getkeywords must resolve via
+  core resolve_subtable against the table dir (canonicalized self.path).
+
+Root causes of the 7 failures:
+1. test_check_putdata / test_tableascii ("row 0 not covered by any indexed
+   bucket"): python `read_col` on a write handle reads the DISK snapshot
+   FIRST (column_cells -> Table::getcol) for rows the disk does not have yet
+   (never flushed), before overlaying pending cells. Write-handle merged read
+   must: pending first -> disk rows the disk actually has -> wt cell/default;
+   and row >= row_count must raise ValueError (bounds check).
+2. test_removecols (a reads 0 not 1): reopening writable (open_for_update
+   fills cells with Some(default), NOT pending) + removecols changes the
+   schema -> flush takes materialize_all, whose "!has_none => trust memory"
+   shortcut takes the addrows DEFAULTS as truth and never reads disk ->
+   clobbers every column to defaults. Fix: when table.dat exists, materialize
+   must read on-disk columns BY NAME (indices shift after removecol!) for all
+   non-pending rows and overlay only pending cells.
+3. test_getcell_keeps_singleton_dims: stale test expectation (see above).
+4. test_relative_path_ms_links...: getkeyword resolver (see above).
+5. test_scalar_roundtrip_incremental[boolean]: ISM bool cell size (above).
+6. test_error_paths[out-of-range_getcell]: missing ValueError bounds check.
+7. test_memory_chunking x4 (only under CI-relative PYTHONPATH=tests/shim):
+   `_strip_shim` compares raw PYTHONPATH entries to the ABSOLUTE $SHIM path,
+   so the relative entry survives -> "real casacore" workers get the shim ->
+   backend-mismatch assertion. Fix: compare os.path.realpath(entry) ==
+   realpath(SHIM). (CI never sees it: no dask-ms there -> module skips.)
+
+Environment note: the venv's installed casacure is 3.8.3 (built 09-23) and
+PREDATES HEAD; the canonical run for this session builds a fresh wheel and
+runs with PYTHONPATH=target/devpkg:tests/shim (both in-workspace, no writes
+to the external venv):
+  maturin build --release -o target/wheels  (maturin from .venv-bench)
+  rm -rf target/devpkg && python3 -m zipfile -e target/wheels/<new>.whl target/devpkg/
+  PYTHONPATH=target/devpkg:tests/shim .../python -m pytest tests/ -q
+
+### Result: suite GREEN — 136 passed, 1 skipped, 0 failed (~1:43)
+
+All 7 failures fixed, plus a regression the fixes exposed. Fixes (all in the
+working tree, not yet committed):
+
+1. **`materialize_all` reads the disk by column name** (crates/casacure/src/
+   table.rs): a regrowth over an existing table.dat takes non-pending rows from
+   the on-disk column matched by name+type (indices shift after
+   removecols/addcols) and overlays only the pending rows. Fixes
+   `test_removecols`.
+2. **Merged write-handle reads** (crates/casacure-python/src/table.rs:
+   `merged_col_cells`/`merged_cell`/`buffered_default_cell`/`disk_col_index`):
+   disk snapshot only for the rows it has, buffer/default for the rest, pending
+   overlay last; `read_colslice`/`read_cellslice` slice the merged cell.
+   Fixes `test_check_putdata`, `test_tableascii`. Verified identical to real
+   python-casacore 3.8.1 on a 3-row table: pending write, untouched column
+   from disk, `addrows(2)` → `[10, 20, 30, 0, 0]` / `[1.5, 2.5, 3.5, 0.0, 0.0]`,
+   same after reopen (probe `target/probe/probe_merge.py`, run with both
+   backends).
+3. **`ValueError` row/range bounds checks** in `read_cell`/`read_cellslice`/
+   `read_colslice`/`merged_col_cells` (both handle kinds). Fixes
+   `test_error_paths[out-of-range_getcell]` (casacore itself raises
+   `RuntimeError: no such row`; the ValueError contract is documented in the
+   rewritten DIFFERENCES.md).
+4. **ISM Bool cells are one byte** (`ism::ism_cell_size`, used by
+   `build_ism_data` + `IsmFile::read_scalar_cell`). Fixes
+   `test_scalar_roundtrip_incremental[boolean]`; cross-checked with real
+   python-casacore both directions (its file and casacure's read each other;
+   only header byte 41 — `persCacheSize` — differs, payload is the casacore
+   `01 00 01` layout). Rust test `ism_bool_column_stores_one_byte_per_cell`.
+5. **`drop_rows` renumbers the pending bitsets** (NEW regression found while
+   testing #2: `test_taql_delete_insert_persist` read `[5, 2]` after deleting
+   row 1 of `[5, 2, 9]` — the bitset kept old indices while cells were
+   compacted). Rust test `drop_rows_renumbers_pending_bits`.
+6. **Subtable keyword resolution** (crates/casacure-python/src/convert.rs
+   `resolve_subtable_py` → core `resolve_subtable`, callers pass `dir_of()`):
+   `getkeyword`/`getkeywords`/`getcolkeywords`/`_getdesc` resolve stored
+   `Table:` links against the TABLE dir, not its parent. Fixes
+   `test_relative_path_ms_links_resolve_from_any_cwd`; also used by dask-ms's
+   keyword reads.
+7. **`_strip_shim` uses `os.path.realpath`** (tests/test_memory_chunking.py) so
+   the CI-relative `PYTHONPATH=tests/shim` is stripped. Fixes the 4 memory
+   tests under that invocation.
+8. **Stale expectation corrected**: `test_getcell_keeps_singleton_dims` now
+   pins `(1, 3)` for a variable-shape `(1,3)` cell (real casacore 3.8.1 returns
+   `(1,3)`; the old `(3,)` came from the trim commit 8a241a7 removed).
+9. **Two more bugs the pytest suite does not reach, found via
+   `tests/daskms_smoke.py`** (it regressed on the #1 change and is GREEN again):
+   - `ssm::array_cell_region` decoded an empty-shape array record (`ndim 0`)
+     with `product()`-over-no-dims == 1 → claimed one element → the LAST row's
+     record ran past `table.f0i` (`array reference 36 falls outside the array
+     index file (len 40)`; the smoke's `WEIGHT` column, i.e. any variable-shape
+     array column created with rows and not yet written). Now `nelem = 0` for
+     an empty shape. Rust test
+     `empty_variable_shape_array_cells_read_back_empty`.
+   - `materialize_all` now skips the disk entirely for a column whose every row
+     was written this session (`pending_count >= nrow`): the buffer is the
+     truth, and reading a never-written on-disk array column was what tripped
+     the record bug during the smoke's creation flush.
+
+Rust: 151 lib + 15 integration + 6 python-crate tests pass; `cargo fmt` +
+`cargo clippy --workspace --all-targets` clean. Python adds
+`test_writable_read_merges_disk_pending_and_defaults` (test_casacore_helpers.py)
+pinning the #2 semantics against a real-casacore probe; the dask-ms smoke
+(`tests/daskms_smoke.py`, run with `PYTHONPATH=target/devpkg:tests/shim`) is
+green end to end including the casacore cross-checks.
+
+Known cosmetic leftover (not a test failure, no casacore parity target): a
+*read-only* `getcol` of a variable-shape array column whose cells are all empty
+returns `(nrow,)` zeros (via `cell_shape.iter().product().max(1)` in
+convert.rs) rather than `(nrow, 0)`; real casacore raises
+`SSMIndColumn::getShape: no array in row N` for that state.
+
+Docs updated: DIFFERENCES.md (the stale "unset cells raise" section is gone;
+now documents the ValueError bounds contract + the defaults parity) and
+CHANGELOG.md [Unreleased].
+
+Re-run after any change:
+  maturin build --release -o target/wheels && rm -rf target/devpkg &&
+  python3 -m zipfile -e target/wheels/casacure-3.8.4-*.whl target/devpkg/ &&
+  PYTHONPATH=target/devpkg:tests/shim $VENV/bin/python -m pytest tests/ -q

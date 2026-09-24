@@ -264,7 +264,7 @@ impl IsmFile {
         let cell = b
             .get(data_off + offset..data_off + offset + 32)
             .ok_or(IsmError::ColumnEmpty { column, row })?;
-        let want = crate::ssm::scalar_cell_size(desc) as usize;
+        let want = ism_cell_size(desc) as usize;
         let cell = &cell[..want];
         Ok(crate::ssm::decode_scalar(
             cell,
@@ -354,6 +354,20 @@ fn read_index_bytes(
         rows,
         bucket_numbers,
     })
+}
+
+/// Bytes stored per row cell of a scalar column in an ISM bucket.
+///
+/// Unlike StandardStMan — which bit-packs Bool rows into a shared byte, so
+/// `scalar_cell_size` reports 0 — an IncrementalStMan bucket stores whole
+/// cells back to back, and casacore writes one byte per Bool cell (three rows
+/// are `01 00 01`). Decoding with the SSM size would slice the (empty) cell
+/// down to zero bytes and fail with "buffer too short: need 1 bytes".
+pub fn ism_cell_size(desc: &ColumnDesc) -> u32 {
+    match desc.data_type {
+        DataType::Bool => 1,
+        _ => crate::ssm::scalar_cell_size(desc),
+    }
 }
 
 /// Per-column raw cell bytes handed to `write_ism_file`.

@@ -310,6 +310,43 @@ def test_putcol_numpy_unicode_strings(tmp_path):
     t.close()
 
 
+def test_writable_read_merges_disk_pending_and_defaults(tmp_path):
+    """A writable handle answers reads from three sources: the unflushed
+    writes, the on-disk values of the columns/rows it did not touch, and the
+    column default for rows added since the last flush.
+
+    Regression: the read went to the disk snapshot first for the whole range,
+    so a row the table had not flushed yet (`addrows` on a freshly created
+    table) raised `row N not covered by any indexed bucket` (python-casacore
+    returns the column default).
+    """
+    p = tmp_path / "t.tab"
+    td = maketabdesc([makescacoldesc("a", 1), makescacoldesc("b", 0.0)])
+    t = table(p, td, 3, ack=False)
+    t.putcol("a", [1, 2, 3])
+    t.putcol("b", [1.5, 2.5, 3.5])
+    t.close()
+
+    t = table(p, readonly=False, ack=False)
+    t.putcol("a", [10, 20, 30])   # pending, not flushed
+    np.testing.assert_array_equal(t.getcol("a"), [10, 20, 30])
+    # `b` was never written on this handle: its on-disk values must survive.
+    np.testing.assert_array_equal(t.getcol("b"), [1.5, 2.5, 3.5])
+    assert t.getcell("b", 2) == 3.5
+    # Rows added since the last flush have no on-disk value: read back as the
+    # column default instead of erroring.
+    t.addrows(2)
+    np.testing.assert_array_equal(t.getcol("a"), [10, 20, 30, 0, 0])
+    np.testing.assert_array_equal(t.getcol("b"), [1.5, 2.5, 3.5, 0.0, 0.0])
+    assert t.getcell("a", 4) == 0
+    t.close()
+    # The flushed table keeps both columns' real values.
+    t = table(p, ack=False)
+    np.testing.assert_array_equal(t.getcol("a"), [10, 20, 30, 0, 0])
+    np.testing.assert_array_equal(t.getcol("b"), [1.5, 2.5, 3.5, 0.0, 0.0])
+    t.close()
+
+
 def test_removecols(tmp_path):
     """removecols drops columns and their data; remaining columns survive."""
     with table(tmp_path / "t.tab",
@@ -361,9 +398,15 @@ def test_tiledshapestman_created_as_standard(tmp_path):
 
 
 def test_getcell_keeps_singleton_dims(tmp_path):
-    """A (1,1) array cell from an nchan=1/ncorr=1 MS stays 2-D on getcell
-    (no leading-row-singleton trim), so dask-ms's exemplar read sees a shape
-    matching the ndim=2 descriptor."""
+    """Array cells keep their stored shape on getcell — fixed (1,1) and
+    variable (1, nchan) alike — so dask-ms's exemplar read sees a shape
+    matching the ndim=2 descriptor.
+
+    Ground truth (python-casacore 3.8.1): `getcell` on a variable-shape column
+    holding a (1, 3) array returns (1, 3); the earlier (3,) expectation came
+    from the leading-row-singleton trim that commit 8a241a7 removed (it broke
+    skarabina's CHAN_FREQ read, which is why getcol keeps (1, 79) too).
+    """
     td = maketabdesc([makearrcoldesc("arr", 1, 0, [1, 1])])
     with table(tmp_path / "t.tab", td, ack=False) as t:
         t.addrows(1)
@@ -373,16 +416,15 @@ def test_getcell_keeps_singleton_dims(tmp_path):
     assert np.shape(got) == (1, 1)
     np.testing.assert_array_equal(np.asarray(got), [[7]])
     t.close()
-    # a variable-shape (1, nchan>1) cell still trims the leading row
-    # singleton
+    # A variable-shape (1, nchan>1) cell keeps every stored dimension too.
     td = maketabdesc([makearrcoldesc("arr2", 1, ndim=2)])
     with table(tmp_path / "t2.tab", td, ack=False) as t:
         t.addrows(1)
         t.putcol("arr2", np.array([[[1, 2, 3]]], dtype=np.int64))
     t = table(tmp_path / "t2.tab", ack=False)
     got = t.getcell("arr2", 0)
-    assert np.shape(got) == (3,)
-    np.testing.assert_array_equal(np.asarray(got), [1, 2, 3])
+    assert np.shape(got) == (1, 3)
+    np.testing.assert_array_equal(np.asarray(got), [[1, 2, 3]])
     t.close()
 
 

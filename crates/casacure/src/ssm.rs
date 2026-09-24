@@ -494,7 +494,17 @@ impl StandardStManFile {
             casa_dims.push(d);
         }
         let logical: Vec<u32> = casa_dims.iter().rev().copied().collect();
-        let nelem: usize = casa_dims.iter().map(|&d| d as usize).product();
+        // ndim == 0 is an EMPTY array (a variable-shape cell that holds
+        // nothing yet, e.g. an array column created with `addrows` and never
+        // written): `product()` over no dims is 1, which made the reader claim
+        // one element and run off the end of the index file on the last
+        // record ("array reference 36 falls outside the array index file
+        // (len 40)").
+        let nelem: usize = if casa_dims.is_empty() {
+            0
+        } else {
+            casa_dims.iter().map(|&d| d as usize).product()
+        };
         let region_size = if desc.data_type == DataType::Bool {
             nelem.div_ceil(8)
         } else {

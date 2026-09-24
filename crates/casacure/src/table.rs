@@ -692,7 +692,10 @@ fn build_ism_data(
                 cd.name
             ))));
         }
-        let size = crate::ssm::scalar_cell_size(cd);
+        // ISM stores whole cells: a Bool cell is one byte, not the
+        // StandardStMan bit-packed 0 (`encode_scalar_cell` already emits that
+        // one byte for Bool, so the cell size must match it).
+        let size = crate::ism::ism_cell_size(cd);
         let mut buf = Vec::with_capacity(values[col].len() * size as usize);
         for value in &values[col] {
             buf.extend_from_slice(
@@ -1847,6 +1850,22 @@ impl WritableTable {
                 *slot = true;
             }
         }
+        // Old row index -> surviving index (u64::MAX for a dropped row). The
+        // pending bitsets must be RENUMBERED, not just filtered: `cells` are
+        // compacted in place, so a bit left at its old position would mark the
+        // wrong row as written and a merged read would answer with the
+        // pre-delete on-disk value (python `test_taql_delete_insert_persist`:
+        // deleting row 1 of [5, 2, 9] read back [5, 2]).
+        let mut new_row: Vec<u64> = Vec::with_capacity(drop.len());
+        let mut next = 0u64;
+        for &dropped in &drop {
+            if dropped {
+                new_row.push(u64::MAX);
+            } else {
+                new_row.push(next);
+                next += 1;
+            }
+        }
         for col in &mut self.cells {
             let mut j = 0;
             col.retain(|_| {
@@ -1855,17 +1874,20 @@ impl WritableTable {
                 keep
             });
         }
+        let words = (next as usize).div_ceil(64);
         for pend in &mut self.pending {
-            let mut out = Vec::with_capacity(pend.len());
-            for (j, w) in pend.drain(..).enumerate() {
-                let mut kept = 0u64;
-                for bit in 0..64 {
-                    let row = j * 64 + bit;
-                    if row < drop.len() && !drop[row] && w & (1 << bit) != 0 {
-                        kept |= 1 << bit;
+            let mut out = vec![0u64; words];
+            for (j, w) in pend.iter().enumerate() {
+                let mut w = *w;
+                while w != 0 {
+                    let old = j * 64 + w.trailing_zeros() as usize;
+                    if let Some(&nr) = new_row.get(old) {
+                        if nr != u64::MAX {
+                            out[(nr / 64) as usize] |= 1u64 << (nr % 64);
+                        }
                     }
+                    w &= w - 1;
                 }
-                out.push(kept);
             }
             *pend = out;
         }
@@ -2044,66 +2066,75 @@ impl WritableTable {
     }
 
     /// The whole cell store as per-column value lists — the input for a
-    /// whole-table regrowth.  A column with every cell buffered (a full
-    /// session write) is taken straight from memory; only columns with
-    /// unreleased `None` cells read their on-disk values for those rows (a
-    /// regrowth must never default-fill rows whose values were released by
-    /// an earlier flush, or a later partial write would clobber the
-    /// untouched rows to defaults).  Rows beyond the on-disk row count
-    /// (fresh `addrows`) default-fill; a table that does not exist on disk
-    /// yet (first flush of a new table) defaults the whole column.
+    /// whole-table regrowth.
+    ///
+    /// Rows written since the last flush (`pending`) come from the buffer;
+    /// every other row comes from the on-disk column — resolved BY NAME,
+    /// because `removecols`/`addcols` shift indices — or the column default
+    /// when neither the table nor this column is on disk yet (first flush of
+    /// a new table, or a column added this session).
+    ///
+    /// Buffered NON-pending cells are deliberately not trusted: a writable
+    /// open (`open_for_update`) fills every cell with an `addrows` default,
+    /// and treating those placeholders as truth clobbered real on-disk data
+    /// after `removecols` (python `test_removecols`: the surviving column
+    /// read back as its default).
     fn materialize_all(&self) -> Result<Vec<Vec<RecordValue>>, WriteTableError> {
         let nrow = self.cells.first().map_or(0, Vec::len) as u64;
         let file_exists = self.dir.join("table.dat").is_file();
+        // One on-disk snapshot for all columns (opened lazily).
+        let disk = if file_exists {
+            Some(
+                crate::Table::open(&self.dir, false)
+                    .map_err(|e| WriteTableError::Storage(e.to_string()))?,
+            )
+        } else {
+            None
+        };
         let mut values: Vec<Vec<RecordValue>> = Vec::with_capacity(self.cells.len());
         for (col_idx, cd) in self.desc.columns.iter().enumerate() {
             let col = &self.cells[col_idx];
-            let has_none = col.iter().any(Option::is_none);
-            let mut list: Vec<RecordValue> = if !has_none {
-                // Everything is buffered in memory: no disk involvement.
+            let default = default_cell_value(cd).ok_or_else(|| WriteTableError::NoDefault {
+                name: cd.name.clone(),
+            })?;
+            // The on-disk twin of this column, matched by name+type (indices
+            // shift after removecols/addcols in this session).
+            let disk_idx = disk.as_ref().and_then(|t| {
+                t.dat
+                    .desc
+                    .columns
+                    .iter()
+                    .position(|c| c.name == cd.name && c.data_type == cd.data_type)
+            });
+            // Every row written this session (a whole-column write): the
+            // buffer is the truth and the on-disk column — which may hold
+            // never-written array cells — is irrelevant.
+            let full_session_write = nrow > 0 && self.pending_count(col_idx) >= nrow;
+            let mut list: Vec<RecordValue> = if full_session_write {
                 col.iter()
-                    .cloned()
-                    .map(|v| v.expect("covered by has_none"))
+                    .map(|c| c.clone().unwrap_or_else(|| default.clone()))
                     .collect()
-            } else if file_exists {
-                let t = crate::Table::open(&self.dir, false)
+            } else if let (Some(t), Some(di)) = (&disk, disk_idx) {
+                let disk_rows = t.nrows().min(nrow);
+                let mut l = t
+                    .getcol(di, 0, disk_rows)
                     .map_err(|e| WriteTableError::Storage(e.to_string()))?;
-                // A column this session added (ALTER TABLE) does not exist
-                // in the on-disk table yet: default-fill it below.
-                let on_disk = col_idx < t.dat.desc.columns.len();
-                let disk_rows = if on_disk { t.nrows().min(nrow) } else { 0 };
-                let mut l: Vec<RecordValue> = if on_disk {
-                    t.getcol(col_idx, 0, disk_rows)
-                        .map_err(|e| WriteTableError::Storage(e.to_string()))?
-                } else {
-                    Vec::new()
-                };
-                // Rows added since the on-disk state default-fill.
-                while l.len() < nrow as usize {
-                    l.push(
-                        default_cell_value(cd).ok_or_else(|| WriteTableError::NoDefault {
-                            name: cd.name.clone(),
-                        })?,
-                    );
+                // Rows past the on-disk row count (fresh addrows) default-fill.
+                while (l.len() as u64) < nrow {
+                    l.push(default.clone());
                 }
                 l
             } else {
-                Vec::with_capacity(col.len())
+                // No on-disk column: buffered values, default where unset.
+                col.iter()
+                    .map(|c| c.clone().unwrap_or_else(|| default.clone()))
+                    .collect()
             };
-            if list.is_empty() {
-                for _ in 0..nrow {
-                    list.push(default_cell_value(cd).ok_or_else(|| {
-                        WriteTableError::NoDefault {
-                            name: cd.name.clone(),
-                        }
-                    })?);
-                }
-            }
-            for (r, cell) in col.iter().enumerate() {
-                if let Some(v) = cell {
-                    if let Some(slot) = list.get_mut(r) {
-                        *slot = v.clone();
-                    }
+            // Overlay the rows written THIS session (pending) — non-pending
+            // buffered cells (addrows defaults) must not clobber disk data.
+            for r in self.pending_rows(col_idx) {
+                if let Some(Some(v)) = col.get(r as usize) {
+                    list[r as usize] = v.clone();
                 }
             }
             values.push(list);
@@ -2116,6 +2147,13 @@ impl WritableTable {
         self.pending
             .get(col_idx)
             .is_some_and(|p| p.iter().any(|&w| w != 0))
+    }
+
+    /// How many rows of `col` were written since the last flush.
+    fn pending_count(&self, col_idx: usize) -> u64 {
+        self.pending
+            .get(col_idx)
+            .map_or(0, |p| p.iter().map(|w| u64::from(w.count_ones())).sum())
     }
 
     /// The rows of `col` written since the last flush, ascending.
@@ -2572,7 +2610,14 @@ impl WritableTable {
 /// The cell value casacore uses for an unwritten cell: scalar defaults, a
 /// zero-filled array for fixed-shape array columns, and an empty array for
 /// variable-shape array columns.
-fn default_cell_value(cd: &crate::tabledesc::ColumnDesc) -> Option<RecordValue> {
+/// The value a cell holds before it is written: a scalar column's declared
+/// default, a zeroed array of the declared (logical) shape (empty for a
+/// variable-shape column), or an empty record.
+///
+/// Public because a read of a row the table does not have yet — `addrows`
+/// before the first flush, or a column added this session — must answer with
+/// this default, exactly like casacore's `ColumnSet` defaults.
+pub fn default_cell_value(cd: &crate::tabledesc::ColumnDesc) -> Option<RecordValue> {
     use crate::record::{ArrayData, ArrayValue};
     match &cd.kind {
         crate::tabledesc::ColumnKind::Scalar(default) => Some(default.clone()),
@@ -4383,6 +4428,124 @@ mod tests {
                 RecordValue::Float(row as f32)
             );
         }
+    }
+
+    #[test]
+    fn ism_bool_column_stores_one_byte_per_cell() {
+        // An IncrementalStMan bucket stores whole cells back to back, so a
+        // Bool cell is one byte — casacore writes `01 00 01` for three rows —
+        // NOT the StandardStMan bit-packed representation (whose
+        // `scalar_cell_size` is 0).  Sizing the bucket with the SSM value
+        // stored no bytes at all and every read failed with
+        // "buffer too short: need 1 bytes at offset 0, have 0"
+        // (python `test_scalar_roundtrip_incremental[boolean]`).
+        let mut desc = typed_desc();
+        desc.columns = vec![ism_col("FLAG", DataType::Bool, 1)];
+        let values = vec![vec![
+            RecordValue::Bool(true),
+            RecordValue::Bool(false),
+            RecordValue::Bool(true),
+        ]];
+        let dir = temp_dir("ism-bool");
+        create_table(&dir, &desc, &values).unwrap();
+
+        let t = Table::open(&dir, false).unwrap();
+        assert_eq!(t.nrows(), 3);
+        assert_eq!(t.getcell(0, 0).unwrap(), RecordValue::Bool(true));
+        assert_eq!(t.getcell(0, 1).unwrap(), RecordValue::Bool(false));
+        assert_eq!(t.getcell(0, 2).unwrap(), RecordValue::Bool(true));
+        assert_eq!(
+            t.getcol(0, 0, 3).unwrap(),
+            vec![
+                RecordValue::Bool(true),
+                RecordValue::Bool(false),
+                RecordValue::Bool(true)
+            ]
+        );
+
+        let dat = parse_table_dat(&std::fs::read(dir.join("table.dat")).unwrap()).unwrap();
+        let data = std::fs::read(dir.join("table.f0")).unwrap();
+        assert!(
+            data.windows(3).any(|w| w == [1, 0, 1]),
+            "ISM bucket holds one byte per Bool cell (01 00 01)"
+        );
+        assert_eq!(
+            crate::ism::ism_cell_size(dat.desc.column("FLAG").unwrap()),
+            1
+        );
+    }
+
+    #[test]
+    fn empty_variable_shape_array_cells_read_back_empty() {
+        // A variable-shape (ndim=2, no fixed shape) array column whose cells
+        // hold an empty array — the state of an MS array column between
+        // `addrows` and the first write.  Its array-index record carries
+        // ndim 0; decoding that with `product()` over no dims (== 1) claimed a
+        // single element, so the LAST row's record ran past the end of
+        // table.f0i ("array reference 36 falls outside the array index file
+        // (len 40)" — the dask-ms smoke's WEIGHT column).
+        use crate::record::{ArrayData, ArrayValue};
+        let mut desc = typed_desc();
+        let mut cd = array_col("A", DataType::Complex, 0, Vec::new());
+        cd.ndim = 2;
+        cd.shape = None;
+        desc.columns = vec![cd];
+        let empty = RecordValue::Array(ArrayValue {
+            shape: Vec::new(),
+            data: ArrayData::Complex(Vec::new()),
+        });
+        let dir = temp_dir("empty-arr");
+        create_table(&dir, &desc, &[vec![empty.clone(), empty.clone(), empty]]).unwrap();
+
+        let t = Table::open(&dir, false).unwrap();
+        assert_eq!(t.nrows(), 3);
+        for row in 0..3u64 {
+            let RecordValue::Array(a) = t.getcell(0, row).unwrap() else {
+                panic!("row {row}: expected an array cell");
+            };
+            assert!(a.shape.is_empty(), "row {row} must read back empty");
+            match &a.data {
+                ArrayData::Complex(v) => assert!(v.is_empty(), "row {row} has no elements"),
+                other => panic!("row {row}: unexpected data {other:?}"),
+            }
+        }
+        assert_eq!(t.getcol(0, 0, 3).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn drop_rows_renumbers_pending_bits() {
+        // `drop_rows` compacts the cell store in place: the pending bitsets
+        // must be renumbered with it, or a merged read marks the wrong rows as
+        // written and answers with the pre-delete on-disk values (python
+        // `test_taql_delete_insert_persist` read [5, 2] after deleting row 1
+        // of [5, 2, 9]).
+        let mut desc = typed_desc();
+        desc.columns = vec![scalar_col("ID", DataType::Int64, 0)];
+        let values = vec![vec![
+            RecordValue::Int64(5),
+            RecordValue::Int64(2),
+            RecordValue::Int64(9),
+        ]];
+        let dir = temp_dir("droprows");
+        create_table(&dir, &desc, &values).unwrap();
+
+        let read = Table::open(&dir, false).unwrap();
+        let mut wt = WritableTable::from_table(dir.clone(), &read).unwrap();
+        wt.drop_rows(&[1]);
+        assert_eq!(wt.col_len(0), 2);
+        for row in 0..2u64 {
+            assert!(
+                wt.pending_cell(0, row).is_some(),
+                "row {row} must stay pending after drop_rows"
+            );
+        }
+        wt.flush().unwrap();
+        let t = Table::open(&dir, false).unwrap();
+        assert_eq!(t.nrows(), 2);
+        assert_eq!(
+            t.getcol(0, 0, 2).unwrap(),
+            vec![RecordValue::Int64(5), RecordValue::Int64(9)]
+        );
     }
 
     #[test]
