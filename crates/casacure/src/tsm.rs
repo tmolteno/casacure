@@ -31,6 +31,8 @@ pub enum TsmError {
     AipsIo(#[from] AipsIoError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    FileIo(#[from] crate::datafile::FileIoError),
     #[error("unexpected object type {found:?}, expected {expected:?}")]
     UnexpectedType { expected: String, found: String },
     #[error("row {row} outside the {nrow} rows of the tiled data")]
@@ -106,6 +108,32 @@ pub struct TsmFile {
     big_endian: bool,
 }
 
+/// A stored cell's position in the tile file (see
+/// [`TsmFile::cell_location`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellLocation {
+    /// Offset of the first byte covering the cell.
+    pub byte_off: usize,
+    /// Bytes covering the cell (for Bool, `ceil((skip + nelem) / 8)`).
+    pub nbytes: usize,
+    /// Bit offset of the cell within its first byte (Bool only; else 0).
+    pub skip: usize,
+    /// Elements in the cell.
+    pub nelem: usize,
+}
+
+/// A stored cell's bytes in the tile file (see [`TsmFile::cell_span`]).
+#[derive(Debug, Clone, Copy)]
+pub struct CellSpan<'a> {
+    /// The bytes covering the cell (whole bytes; a Bool cell's bits start
+    /// `skip` bits into the first byte).
+    pub bytes: &'a [u8],
+    /// Bit offset of the cell within `bytes[0]` (Bool cells only; else 0).
+    pub skip: usize,
+    /// Elements in the cell.
+    pub nelem: usize,
+}
+
 impl TsmFile {
     /// Read `<table_dir>/table.f{seq}` (header) plus its first tile data
     /// file, and parse the geometry.
@@ -115,7 +143,9 @@ impl TsmFile {
         table_big_endian: bool,
     ) -> Result<TsmFile, TsmError> {
         let dir = table_dir.as_ref();
-        let data = std::fs::read(dir.join(format!("table.f{seq_nr}")))?;
+        let header_path = dir.join(format!("table.f{seq_nr}"));
+        let data = std::fs::read(&header_path)
+            .map_err(|e| TsmError::FileIo(crate::datafile::FileIoError::new(&header_path, e)))?;
         let header = parse_header(&data)?;
         // The first cube holding data names the tile file (a shape-stman
         // placeholder cube for not-yet-set cells carries -1); a column with
@@ -130,8 +160,9 @@ impl TsmFile {
             Some(file_seq) => {
                 let path = dir.join(format!("table.f{seq_nr}_TSM{file_seq}"));
                 let tile_file = std::fs::File::open(&path)
-                    .map_err(|_| TsmError::MissingTileFile(path.display().to_string()))?;
-                crate::datafile::Buffer::from_file(tile_file)?
+                    .map_err(|e| TsmError::FileIo(crate::datafile::FileIoError::new(&path, e)))?;
+                crate::datafile::Buffer::from_file(tile_file)
+                    .map_err(|e| TsmError::FileIo(crate::datafile::FileIoError::new(&path, e)))?
             }
             None => crate::datafile::Buffer::from(Vec::new()),
         };
@@ -165,6 +196,67 @@ impl TsmFile {
     /// Read the fixed-shape array cell of `desc` (an array column of the
     /// hypercolumn) at `row`, returning the logical shape and values.
     pub fn read_cell(&self, desc: &ColumnDesc, row: u64) -> Result<RecordValue, TsmError> {
+        let Some((cube, span)) = self.cell_span(desc, row)? else {
+            return self.read_default_cell(desc);
+        };
+        let nrdim = cube.nrdim as usize;
+        // Logical shape = reverse of the on-disk (CASA) cell shape.
+        let logical: Vec<u32> = cube.cube_shape[..nrdim - 1]
+            .iter()
+            .rev()
+            .map(|&d| d as u32)
+            .collect();
+        let data = if desc.data_type == DataType::Bool {
+            decode_bits(span.bytes, span.skip, span.nelem)?
+        } else {
+            decode_tile_data(span.bytes, desc.data_type, span.nelem, self.big_endian)?
+        };
+        Ok(RecordValue::Array(ArrayValue {
+            shape: logical,
+            data,
+        }))
+    }
+
+    /// Where the stored cell of `desc` at `row` lives in the tile file,
+    /// borrowed from the mapped data (no decode, no allocation), with the
+    /// cube holding it. `None` is an unset cell (it reads as the column
+    /// default). Bool cells are bit-packed: the cell starts `skip` bits into
+    /// `bytes`; every other type is byte-aligned (`skip == 0`).
+    pub fn cell_span(
+        &self,
+        desc: &ColumnDesc,
+        row: u64,
+    ) -> Result<Option<(&TsmCube, CellSpan<'_>)>, TsmError> {
+        Ok(self.cell_location(desc, row)?.map(|(cube, loc)| {
+            (
+                cube,
+                CellSpan {
+                    bytes: &self.tile_data[loc.byte_off..loc.byte_off + loc.nbytes],
+                    skip: loc.skip,
+                    nelem: loc.nelem,
+                },
+            )
+        }))
+    }
+
+    /// The tile-file sequence number (`table.f{seq}_TSM{n}`) holding this
+    /// column's data, if any cube stores data.
+    pub fn tile_file_seq(&self) -> Option<i32> {
+        self.header
+            .cubes
+            .iter()
+            .map(|c| c.file_seq_nr)
+            .find(|&f| f >= 0)
+    }
+
+    /// Where the stored cell of `desc` at `row` sits in the tile file (see
+    /// [`TsmFile::cell_span`]) as byte offsets, so a writer can patch the
+    /// cell in place at exactly the position the reader reads it from.
+    pub fn cell_location(
+        &self,
+        desc: &ColumnDesc,
+        row: u64,
+    ) -> Result<Option<(&TsmCube, CellLocation)>, TsmError> {
         if row >= self.header.nrrow {
             return Err(TsmError::RowOutOfRange {
                 row,
@@ -186,7 +278,7 @@ impl TsmFile {
                     let back = u64::from(last_row) - row;
                     let pos = i64::from(self.header.pos_map[i]) - back as i64;
                     if pos < 0 {
-                        return self.read_default_cell(desc);
+                        return Ok(None);
                     }
                     self.header
                         .cubes
@@ -219,7 +311,7 @@ impl TsmFile {
         };
         let (cube, row_in_cube) = match located {
             Some((c, r)) => (c, r),
-            None => return self.read_default_cell(desc),
+            None => return Ok(None),
         };
         let nrdim = cube.nrdim as usize;
         if nrdim < 1 || cube.cube_shape.len() != nrdim || cube.tile_shape.len() != nrdim {
@@ -284,22 +376,15 @@ impl TsmFile {
                 nrow: self.header.nrrow,
             });
         }
-        let slice = &self.tile_data[byte_off..end];
-        // Logical shape = reverse of the on-disk (CASA) cell shape.
-        let logical: Vec<u32> = cube.cube_shape[..nrdim - 1]
-            .iter()
-            .rev()
-            .map(|&d| d as u32)
-            .collect();
-        let data = if is_bool {
-            decode_bits(slice, skip, cell_elems)?
-        } else {
-            decode_tile_data(slice, desc.data_type, cell_elems, self.big_endian)?
-        };
-        Ok(RecordValue::Array(ArrayValue {
-            shape: logical,
-            data,
-        }))
+        Ok(Some((
+            cube,
+            CellLocation {
+                byte_off,
+                nbytes,
+                skip,
+                nelem: cell_elems,
+            },
+        )))
     }
 
     /// An unset cell (no cube covers its row): the column's default, zeros
@@ -349,23 +434,40 @@ const fn build_bool_lut() -> [[bool; 8]; 256] {
 /// Decode `nbits` bits starting at bit `skip` of `bytes` (LSB-first within
 /// each byte, casacore `Conversion::bitToBool`) to one bool per bit.
 fn decode_bits(bytes: &[u8], skip: usize, nbits: usize) -> Result<ArrayData, TsmError> {
-    let mut v = Vec::with_capacity(nbits);
-    if skip.is_multiple_of(8) {
+    let mut v = vec![false; nbits];
+    decode_bits_into(bytes, skip, &mut v);
+    Ok(ArrayData::Bool(v))
+}
+
+/// Decode `dst.len()` bits starting at bit `skip` of `bytes` (LSB-first)
+/// into `dst` — the allocation-free core of [`decode_bits`], also used to
+/// fill a caller's numpy bool buffer directly.
+pub fn decode_bits_into(bytes: &[u8], skip: usize, dst: &mut [bool]) {
+    let nbits = dst.len();
+    let base = skip / 8;
+    let shift = skip % 8;
+    let (full, tail) = dst.as_chunks_mut::<8>();
+    if shift == 0 {
         // Byte-aligned fast path: one 256-entry table lookup writes eight
         // 0/1 bytes, matching casacore `bitToBool`'s conv_tab loop.
-        let base = skip / 8;
-        for k in 0..nbits.div_ceil(8) {
-            v.extend_from_slice(&BOOL_LUT[bytes[base + k] as usize]);
+        for (k, out) in full.iter_mut().enumerate() {
+            *out = BOOL_LUT[bytes[base + k] as usize];
         }
-        v.truncate(nbits);
     } else {
-        for i in 0..nbits {
-            let bit = (skip + i) % 8;
-            let byte = bytes[(skip + i) / 8];
-            v.push(byte & (1 << bit) != 0);
+        // Unaligned: splice each output byte from two input bytes, then the
+        // same table lookup (the tail below reads at most one past).
+        for (k, out) in full.iter_mut().enumerate() {
+            let lo = bytes[base + k] >> shift;
+            let hi = bytes.get(base + k + 1).map_or(0, |&h| h << (8 - shift));
+            *out = BOOL_LUT[(lo | hi) as usize];
         }
     }
-    Ok(ArrayData::Bool(v))
+    let done = full.len() * 8;
+    for (i, out) in tail.iter_mut().enumerate() {
+        let bit = skip + done + i;
+        *out = bytes[bit / 8] & (1 << (bit % 8)) != 0;
+    }
+    debug_assert_eq!(done + tail.len(), nbits);
 }
 
 /// Pack bools into bytes, LSB-first (the inverse of [`decode_bits`]).
@@ -416,51 +518,53 @@ fn decode_tile_data(
     nelem: usize,
     big_endian: bool,
 ) -> Result<ArrayData, TsmError> {
-    let mut r = if big_endian {
-        Reader::new(slice)
-    } else {
-        Reader::new_le(slice)
-    };
-    Ok(match dt {
+    if dt == DataType::Bool {
         // Tile Bools are bit-packed (LSB-first); `slice` is byte-aligned.
-        DataType::Bool => decode_bits(slice, 0, nelem)?,
-        DataType::Char | DataType::UChar => {
-            ArrayData::UChar((0..nelem).map(|_| r.read_u8()).collect::<Result<_, _>>()?)
-        }
-        DataType::Short => {
-            ArrayData::Short((0..nelem).map(|_| r.read_i16()).collect::<Result<_, _>>()?)
-        }
-        DataType::UShort => {
-            ArrayData::UShort((0..nelem).map(|_| r.read_u16()).collect::<Result<_, _>>()?)
-        }
-        DataType::Int => {
-            ArrayData::Int((0..nelem).map(|_| r.read_i32()).collect::<Result<_, _>>()?)
-        }
-        DataType::UInt => {
-            ArrayData::UInt((0..nelem).map(|_| r.read_u32()).collect::<Result<_, _>>()?)
-        }
-        DataType::Int64 => {
-            ArrayData::Int64((0..nelem).map(|_| r.read_i64()).collect::<Result<_, _>>()?)
-        }
-        DataType::Float => {
-            ArrayData::Float((0..nelem).map(|_| r.read_f32()).collect::<Result<_, _>>()?)
-        }
-        DataType::Double => {
-            ArrayData::Double((0..nelem).map(|_| r.read_f64()).collect::<Result<_, _>>()?)
-        }
+        return decode_bits(slice, 0, nelem);
+    }
+    let need = nelem * elem_size(dt)?;
+    if slice.len() < need {
+        return Err(TsmError::AipsIo(AipsIoError::Truncated {
+            needed: need,
+            offset: 0,
+            len: slice.len(),
+        }));
+    }
+    let slice = &slice[..need];
+    // One pass over fixed-size chunks (vectorises to a copy / byte swap)
+    // instead of a fallible reader call per element.
+    macro_rules! num {
+        ($ty:ty, $n:literal) => {
+            slice
+                .as_chunks::<$n>()
+                .0
+                .iter()
+                .map(|c| {
+                    if big_endian {
+                        <$ty>::from_be_bytes(*c)
+                    } else {
+                        <$ty>::from_le_bytes(*c)
+                    }
+                })
+                .collect()
+        };
+    }
+    Ok(match dt {
+        DataType::Char | DataType::UChar => ArrayData::UChar(slice.to_vec()),
+        DataType::Short => ArrayData::Short(num!(i16, 2)),
+        DataType::UShort => ArrayData::UShort(num!(u16, 2)),
+        DataType::Int => ArrayData::Int(num!(i32, 4)),
+        DataType::UInt => ArrayData::UInt(num!(u32, 4)),
+        DataType::Int64 => ArrayData::Int64(num!(i64, 8)),
+        DataType::Float => ArrayData::Float(num!(f32, 4)),
+        DataType::Double => ArrayData::Double(num!(f64, 8)),
         DataType::Complex => {
-            let mut v = Vec::with_capacity(nelem);
-            for _ in 0..nelem {
-                v.push((r.read_f32()?, r.read_f32()?));
-            }
-            ArrayData::Complex(v)
+            let v: Vec<f32> = num!(f32, 4);
+            ArrayData::Complex(v.as_chunks::<2>().0.iter().map(|c| (c[0], c[1])).collect())
         }
         DataType::DComplex => {
-            let mut v = Vec::with_capacity(nelem);
-            for _ in 0..nelem {
-                v.push((r.read_f64()?, r.read_f64()?));
-            }
-            ArrayData::DComplex(v)
+            let v: Vec<f64> = num!(f64, 8);
+            ArrayData::DComplex(v.as_chunks::<2>().0.iter().map(|c| (c[0], c[1])).collect())
         }
         other => return Err(TsmError::UnsupportedType(other)),
     })
@@ -712,7 +816,7 @@ fn or_bits_at(out: &mut [u8], src: &[bool], bit: usize) {
 /// Same as [`or_bits_at`] but the source is already a byte-aligned bit
 /// stream (`src[0]` holds bits 0..8, LSB-first) — the form the general cell
 /// writer keeps per row.
-pub(crate) fn or_bytes_at(out: &mut [u8], src: &[u8], bit: usize) {
+pub fn or_bytes_at(out: &mut [u8], src: &[u8], bit: usize) {
     for (i, byte) in src.iter().enumerate() {
         let o = (bit + i * 8) >> 3;
         let sh = (bit + i * 8) & 7;

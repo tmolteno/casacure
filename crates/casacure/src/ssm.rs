@@ -36,6 +36,8 @@ pub enum SsmError {
     AipsIo(#[from] AipsIoError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    FileIo(#[from] crate::datafile::FileIoError),
     #[error("unexpected object type {found:?}, expected {expected:?}")]
     UnexpectedType { expected: String, found: String },
     #[error("data file endian flag {flag} does not match table flag {expected}")]
@@ -158,8 +160,11 @@ impl StandardStManFile {
         table_big_endian: bool,
     ) -> Result<StandardStManFile, SsmError> {
         let dir = table_dir.as_ref();
-        let file = std::fs::File::open(dir.join(format!("table.f{seq_nr}")))?;
-        let data = crate::datafile::Buffer::from_file(file)?;
+        let path = dir.join(format!("table.f{seq_nr}"));
+        let file = std::fs::File::open(&path)
+            .map_err(|e| SsmError::FileIo(crate::datafile::FileIoError::new(&path, e)))?;
+        let data = crate::datafile::Buffer::from_file(file)
+            .map_err(|e| SsmError::FileIo(crate::datafile::FileIoError::new(&path, e)))?;
         let (header, indices) = parse_meta(&data, table_big_endian)?;
         let mut parsed = StandardStManFile {
             header,
@@ -171,8 +176,12 @@ impl StandardStManFile {
         // StandardStMan array columns.
         let f0i_path = dir.join(format!("table.f{seq_nr}i"));
         if f0i_path.is_file() {
-            let f0i = std::fs::File::open(&f0i_path)?;
-            parsed.f0i = Some(crate::datafile::Buffer::from_file(f0i)?);
+            let f0i = std::fs::File::open(&f0i_path)
+                .map_err(|e| SsmError::FileIo(crate::datafile::FileIoError::new(&f0i_path, e)))?;
+            parsed.f0i =
+                Some(crate::datafile::Buffer::from_file(f0i).map_err(|e| {
+                    SsmError::FileIo(crate::datafile::FileIoError::new(&f0i_path, e))
+                })?);
         }
         Ok(parsed)
     }

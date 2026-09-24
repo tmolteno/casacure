@@ -1187,6 +1187,22 @@ pub fn casa_value_type(dt: crate::record::DataType) -> &'static str {
     }
 }
 
+/// The storage manager serving one column (see `Table::column_source`).
+enum ColumnSource<'a> {
+    Ssm {
+        file: &'a crate::ssm::StandardStManFile,
+        spec: &'a crate::columnset::StandardStMan,
+        within: usize,
+    },
+    Ism {
+        file: &'a crate::ism::IsmFile,
+        within: usize,
+    },
+    Tsm {
+        file: &'a crate::tsm::TsmFile,
+    },
+}
+
 /// Errors from the column-access (§3) read API.
 #[derive(Debug, Error)]
 pub enum TableReadError {
@@ -1217,16 +1233,92 @@ impl Table {
     /// column description's own `dataManagerType` can disagree with it
     /// (real casacore MSs bind ISM columns whose description says
     /// StandardStMan).
-    fn column_storage_type(&self, col_idx: usize) -> String {
+    fn column_storage_type(&self, col_idx: usize) -> &str {
         let desc = &self.dat.desc.columns[col_idx];
-        let (seq, _) = self.column_manager(col_idx);
+        let seq = self.dat.column_set.columns[col_idx].data_manager_seq;
         self.dat
             .column_set
             .data_managers
             .iter()
             .find(|dm| dm.sequence_nr == seq)
-            .map(|dm| dm.type_name.clone())
-            .unwrap_or_else(|| desc.data_manager_type.clone())
+            .map(|dm| dm.type_name.as_str())
+            .unwrap_or(desc.data_manager_type.as_str())
+    }
+
+    /// The storage manager serving `col_idx`, resolved once so a ranged read
+    /// does not repeat the binding lookups for every row.
+    fn column_source(&self, col_idx: usize) -> Result<ColumnSource<'_>, TableReadError> {
+        let desc = &self.dat.desc.columns[col_idx];
+        let (seq, within) = self.column_manager(col_idx);
+        // The ColumnSet binding is authoritative: a real MS can bind a
+        // column to IncrementalStMan while its description still declares
+        // StandardStMan.
+        match self.column_storage_type(col_idx) {
+            "StandardStMan" => {
+                let file = self.ssm_file(seq).ok_or_else(|| {
+                    TableReadError::UnsupportedColumn(desc.name.clone(), "StandardStMan".into())
+                })?;
+                let spec = self.ssm_spec(seq).ok_or_else(|| {
+                    TableReadError::UnsupportedColumn(desc.name.clone(), "no spec".into())
+                })?;
+                Ok(ColumnSource::Ssm { file, spec, within })
+            }
+            "IncrementalStMan" => {
+                let file = self
+                    .ism_files
+                    .iter()
+                    .find(|(s, _)| *s == seq)
+                    .map(|(_, f)| f)
+                    .ok_or_else(|| {
+                        TableReadError::UnsupportedColumn(
+                            desc.name.clone(),
+                            "IncrementalStMan".into(),
+                        )
+                    })?;
+                Ok(ColumnSource::Ism { file, within })
+            }
+            "TiledColumnStMan" | "TiledShapeStMan" => {
+                let file = self
+                    .tsm_files
+                    .iter()
+                    .find(|(s, _)| *s == seq)
+                    .map(|(_, f)| f)
+                    .ok_or_else(|| {
+                        TableReadError::UnsupportedColumn(
+                            desc.name.clone(),
+                            "tiled storage manager".into(),
+                        )
+                    })?;
+                Ok(ColumnSource::Tsm { file })
+            }
+            other => Err(TableReadError::UnsupportedColumn(
+                desc.name.clone(),
+                other.to_string(),
+            )),
+        }
+    }
+
+    /// One cell from an already-resolved [`ColumnSource`].
+    fn read_cell_from(
+        &self,
+        src: &ColumnSource<'_>,
+        desc: &crate::tabledesc::ColumnDesc,
+        row: u64,
+    ) -> Result<RecordValue, TableReadError> {
+        match *src {
+            ColumnSource::Ssm { file, spec, within } => {
+                if matches!(desc.kind, crate::tabledesc::ColumnKind::Array) {
+                    crate::ssm::read_array_cell(file, spec, within, desc, row).map_err(Into::into)
+                } else {
+                    file.read_scalar_cell(spec, within, desc, row)
+                        .map_err(Into::into)
+                }
+            }
+            ColumnSource::Ism { file, within } => {
+                file.read_scalar_cell(within, desc, row).map_err(Into::into)
+            }
+            ColumnSource::Tsm { file } => file.read_cell(desc, row).map_err(Into::into),
+        }
     }
     pub fn column_manager(&self, col_idx: usize) -> (u32, usize) {
         let seq = self.dat.column_set.columns[col_idx].data_manager_seq;
@@ -1259,59 +1351,8 @@ impl Table {
 
     /// Read one cell (`table.getcell(col, row)`).
     pub fn getcell(&self, col_idx: usize, row: u64) -> Result<RecordValue, TableReadError> {
-        let desc = &self.dat.desc.columns[col_idx];
-        let (seq, within) = self.column_manager(col_idx);
-        // The ColumnSet binding is authoritative: a real MS can bind a
-        // column to IncrementalStMan while its description still declares
-        // StandardStMan.
-        match self.column_storage_type(col_idx).as_str() {
-            "StandardStMan" => {
-                let file = self.ssm_file(seq).ok_or_else(|| {
-                    TableReadError::UnsupportedColumn(desc.name.clone(), "StandardStMan".into())
-                })?;
-                let spec = self.ssm_spec(seq).ok_or_else(|| {
-                    TableReadError::UnsupportedColumn(desc.name.clone(), "no spec".into())
-                })?;
-                if matches!(desc.kind, crate::tabledesc::ColumnKind::Array) {
-                    crate::ssm::read_array_cell(file, spec, within, desc, row).map_err(Into::into)
-                } else {
-                    file.read_scalar_cell(spec, within, desc, row)
-                        .map_err(Into::into)
-                }
-            }
-            "IncrementalStMan" => {
-                let file = self
-                    .ism_files
-                    .iter()
-                    .find(|(s, _)| *s == seq)
-                    .map(|(_, f)| f)
-                    .ok_or_else(|| {
-                        TableReadError::UnsupportedColumn(
-                            desc.name.clone(),
-                            "IncrementalStMan".into(),
-                        )
-                    })?;
-                file.read_scalar_cell(within, desc, row).map_err(Into::into)
-            }
-            "TiledColumnStMan" | "TiledShapeStMan" => {
-                let file = self
-                    .tsm_files
-                    .iter()
-                    .find(|(s, _)| *s == seq)
-                    .map(|(_, f)| f)
-                    .ok_or_else(|| {
-                        TableReadError::UnsupportedColumn(
-                            desc.name.clone(),
-                            "tiled storage manager".into(),
-                        )
-                    })?;
-                file.read_cell(desc, row).map_err(Into::into)
-            }
-            other => Err(TableReadError::UnsupportedColumn(
-                desc.name.clone(),
-                other.to_string(),
-            )),
-        }
+        let src = self.column_source(col_idx)?;
+        self.read_cell_from(&src, &self.dat.desc.columns[col_idx], row)
     }
 
     /// Drop the data files' mapped pages (`MADV_DONTNEED`) after a bulk read
@@ -1337,23 +1378,26 @@ impl Table {
     const STREAMING_DROP_ROWS: u64 = 512;
 
     /// True when a `getcolnp` into a caller numpy buffer can be served by
-    /// [`Table::getcol_raw`]: a StandardStMan numeric column (scalar or
-    /// fixed-shape array). Strings/records, ISM and TSM, and variable-shape
-    /// arrays keep the generic `RecordValue` path.
+    /// [`Table::getcol_raw`] (or, for a tiled Bool array column,
+    /// [`Table::getcol_raw_bits`]): a numeric StandardStMan column (scalar or
+    /// fixed-shape array), an IncrementalStMan numeric/Bool scalar, or a
+    /// fixed-shape TiledColumnStMan/TiledShapeStMan numeric/Bool array.
+    /// Strings/records, StandardStMan Bools (bit-packed per row) and
+    /// variable-shape arrays keep the generic `RecordValue` path.
     pub fn raw_column_supported(&self, col_idx: usize) -> bool {
         use crate::record::DataType as DT;
+        use crate::tabledesc::ColumnKind;
         let Some(desc) = self.dat.desc.columns.get(col_idx) else {
             return false;
         };
         if matches!(
             desc.data_type,
-            DT::String | DT::Table | DT::Record | DT::Char | DT::Bool
+            DT::String | DT::Table | DT::Record | DT::Char
         ) {
-            // Bool cells are one bit per row in the storage managers, not
-            // one byte like the numpy bool buffer this path fills.
             return false;
         }
-        if matches!(desc.kind, crate::tabledesc::ColumnKind::Array) {
+        let is_array = matches!(desc.kind, ColumnKind::Array);
+        if is_array {
             // Variable-shape arrays: per-row element counts differ, so the
             // fixed-count precheck the caller needs cannot be satisfied.
             match &desc.shape {
@@ -1362,45 +1406,49 @@ impl Table {
                 _ => {}
             }
         }
-        desc.data_manager_type == "StandardStMan"
+        match self.column_storage_type(col_idx) {
+            // Bool cells are one bit per row in StandardStMan, not one byte
+            // like the numpy bool buffer this path fills.
+            "StandardStMan" => desc.data_type != DT::Bool,
+            // ISM stores a Bool cell as one byte.
+            "IncrementalStMan" => !is_array,
+            "TiledColumnStMan" | "TiledShapeStMan" => is_array,
+            _ => false,
+        }
     }
 
     /// Read `nrow` cells of `col_idx` starting at `startrow`, calling
     /// `visit(logical_shape, element_bytes)` once per row with the raw
     /// element bytes **borrowed from the mapped data file** (no per-cell
-    /// allocation). Numeric StandardStMan cells only (see
-    /// [`Table::raw_column_supported`]). Long reads drop the mapped data
-    /// pages as they go, so a whole-column read into a caller buffer stays
-    /// resident at ~a window of the file, not the whole file.
-    pub fn getcol_raw<'a, F>(
-        &'a self,
+    /// allocation), in the data file's byte order. Only columns
+    /// [`Table::raw_column_supported`] accepts, except tiled Bool arrays
+    /// (bit-packed: use [`Table::getcol_raw_bits`]). The shape is empty for
+    /// scalar and tiled cells. An unset tiled cell visits zeros. Long reads
+    /// drop the mapped data pages as they go, so a whole-column read into a
+    /// caller buffer stays resident at ~a window of the file, not the whole
+    /// file.
+    pub fn getcol_raw<F>(
+        &self,
         col_idx: usize,
         startrow: u64,
         nrow: u64,
         mut visit: F,
     ) -> Result<(), TableReadError>
     where
-        F: FnMut(&[u32], &'a [u8]) -> Result<(), TableReadError>,
+        F: FnMut(&[u32], &[u8]) -> Result<(), TableReadError>,
     {
         use crate::tabledesc::ColumnKind;
         let desc = &self.dat.desc.columns[col_idx];
-        let (seq, within) = self.column_manager(col_idx);
-        let mut done = 0u64;
-        for r in startrow..startrow + nrow {
-            match desc.data_manager_type.as_str() {
-                "StandardStMan" => {
-                    let file =
-                        self.ssm_file(seq)
-                            .ok_or_else(|| TableReadError::UnsupportedRaw {
-                                name: desc.name.clone(),
-                                reason: "no StandardStMan file".into(),
-                            })?;
-                    let spec =
-                        self.ssm_spec(seq)
-                            .ok_or_else(|| TableReadError::UnsupportedRaw {
-                                name: desc.name.clone(),
-                                reason: "no StandardStMan spec".into(),
-                            })?;
+        let src = self.column_source(col_idx).map_err(|e| match e {
+            TableReadError::UnsupportedColumn(name, reason) => {
+                TableReadError::UnsupportedRaw { name, reason }
+            }
+            other => other,
+        })?;
+        match src {
+            ColumnSource::Ssm { file, spec, within } => {
+                let mut done = 0u64;
+                for r in startrow..startrow + nrow {
                     if matches!(desc.kind, ColumnKind::Array) {
                         let (shape, _nelem, bytes) =
                             file.array_cell_region(spec, within, desc, r)?;
@@ -1409,13 +1457,73 @@ impl Table {
                         let bytes = file.scalar_cell_raw(spec, within, desc, r)?;
                         visit(&[], bytes)?;
                     }
+                    done += 1;
+                    if done.is_multiple_of(4096) {
+                        self.drop_data_file_pages();
+                    }
                 }
-                other => {
+            }
+            ColumnSource::Ism { file, within } => {
+                file.for_each_cell_raw(within, desc, startrow, nrow, |bytes| visit(&[], bytes))?;
+            }
+            ColumnSource::Tsm { file } => {
+                if desc.data_type == crate::record::DataType::Bool {
                     return Err(TableReadError::UnsupportedRaw {
                         name: desc.name.clone(),
-                        reason: format!("{other} data manager"),
-                    })
+                        reason: "bit-packed tiled Bool (use getcol_raw_bits)".into(),
+                    });
                 }
+                let zeros = self.tsm_default_bytes(desc)?;
+                let mut done = 0u64;
+                for r in startrow..startrow + nrow {
+                    match file.cell_span(desc, r)? {
+                        Some((_, span)) => visit(&[], span.bytes)?,
+                        None => visit(&[], &zeros[..])?,
+                    }
+                    done += 1;
+                    if done.is_multiple_of(4096) {
+                        self.drop_data_file_pages();
+                    }
+                }
+            }
+        }
+        if nrow >= Self::STREAMING_DROP_ROWS {
+            self.drop_data_file_pages();
+        }
+        Ok(())
+    }
+
+    /// The bit-packed twin of [`Table::getcol_raw`] for a tiled Bool array
+    /// column: `visit(bytes, skip, nelem)` per row, the cell's bits starting
+    /// `skip` bits into `bytes` (LSB-first, casacore `bitToBool` order). An
+    /// unset cell visits zero bits.
+    pub fn getcol_raw_bits<F>(
+        &self,
+        col_idx: usize,
+        startrow: u64,
+        nrow: u64,
+        mut visit: F,
+    ) -> Result<(), TableReadError>
+    where
+        F: FnMut(&[u8], usize, usize) -> Result<(), TableReadError>,
+    {
+        let desc = &self.dat.desc.columns[col_idx];
+        let ColumnSource::Tsm { file } = self.column_source(col_idx)? else {
+            return Err(TableReadError::UnsupportedRaw {
+                name: desc.name.clone(),
+                reason: "bit-packed raw reads are for tiled Bool columns".into(),
+            });
+        };
+        let zeros = self.tsm_default_bytes(desc)?;
+        let nelem_default = desc
+            .shape
+            .as_deref()
+            .map_or(0, |s| s.iter().product::<i64>().max(0) as usize);
+        let mut done = 0u64;
+        for r in startrow..startrow + nrow {
+            match file.cell_span(desc, r)? {
+                Some((_, span)) => visit(span.bytes, span.skip, span.nelem)?,
+                None => visit(&zeros[..], 0, nelem_default)?,
             }
             done += 1;
             if done.is_multiple_of(4096) {
@@ -1428,6 +1536,24 @@ impl Table {
         Ok(())
     }
 
+    /// Zero bytes for one unset cell of a fixed-shape tiled column (the
+    /// column default), sized from the column's declared shape.
+    fn tsm_default_bytes(
+        &self,
+        desc: &crate::tabledesc::ColumnDesc,
+    ) -> Result<Vec<u8>, TableReadError> {
+        let nelem = desc
+            .shape
+            .as_deref()
+            .map_or(0, |s| s.iter().product::<i64>().max(0) as usize);
+        let nbytes = if desc.data_type == crate::record::DataType::Bool {
+            nelem.div_ceil(8)
+        } else {
+            nelem * crate::tsm::elem_size(desc.data_type)?
+        };
+        Ok(vec![0u8; nbytes])
+    }
+
     /// Read `nrow` cells starting at `startrow` (`table.getcol` /
     /// `getcolnp`).
     pub fn getcol(
@@ -1436,16 +1562,33 @@ impl Table {
         startrow: u64,
         nrow: u64,
     ) -> Result<Vec<RecordValue>, TableReadError> {
-        let column = self.dat.desc.columns[col_idx].name.clone();
+        let desc = &self.dat.desc.columns[col_idx];
+        let src = self.column_source(col_idx)?;
         let mut out = Vec::with_capacity(nrow as usize);
-        for r in startrow..startrow + nrow {
-            out.push(self.getcell(col_idx, r).map_err(|e| match e {
-                TableReadError::RowOutOfRange { .. } => TableReadError::RowOutOfRange {
-                    row: r,
-                    column: column.clone(),
+        if let ColumnSource::Ism { file, within } = src {
+            // One linear walk of each bucket's interval index for the range.
+            let big_endian = file.header.big_endian;
+            file.for_each_cell_raw(within, desc, startrow, nrow, |cell| {
+                out.push(crate::ssm::decode_scalar(cell, desc, big_endian)?);
+                Ok::<(), crate::ism::IsmError>(())
+            })
+            .map_err(|e| match e {
+                crate::ism::IsmError::RowOutOfRange { row } => TableReadError::RowOutOfRange {
+                    row,
+                    column: desc.name.clone(),
                 },
-                other => other,
-            })?);
+                other => other.into(),
+            })?;
+        } else {
+            for r in startrow..startrow + nrow {
+                out.push(self.read_cell_from(&src, desc, r).map_err(|e| match e {
+                    TableReadError::RowOutOfRange { .. } => TableReadError::RowOutOfRange {
+                        row: r,
+                        column: desc.name.clone(),
+                    },
+                    other => other,
+                })?);
+            }
         }
         if nrow >= Self::STREAMING_DROP_ROWS {
             self.drop_data_file_pages();
@@ -1601,23 +1744,25 @@ pub fn slice_array_value(
 pub struct WritableTable {
     dir: std::path::PathBuf,
     desc: crate::tabledesc::TableDesc,
-    /// The table's row count. Authoritative: `cells[col]` may hold FEWER
-    /// entries — the unallocated tail has no buffered value (a read answers
-    /// with the column default, a flush with the on-disk value) — so that
-    /// opening a table for update costs no memory until a column is actually
-    /// written (see [`WritableTable::open_for_update`]).
+    /// The table's row count. Authoritative: a column buffers only the rows
+    /// written (or explicitly loaded) — every other row has no buffered
+    /// value (a read answers with the column default, a flush with the
+    /// on-disk value) — so opening a table for update costs no memory until
+    /// a column is actually written (see [`WritableTable::open_for_update`]).
     rows: u64,
-    /// `cells[col][row]`; only rows actually written (or explicitly loaded)
-    /// hold a value.
-    cells: Vec<Vec<Option<RecordValue>>>,
-    /// `pending[col]` is a bitset of rows WRITTEN since the last successful
-    /// `flush` (one bit per row, set by `putcell`/`putcol`, cleared by
-    /// `flush`).  Together with `cells` it makes a flush incremental: only
-    /// pending rows are overlaid onto the on-disk files, and after a flush
-    /// the column's `cells` values are dropped (reads fall back to the
-    /// refreshed on-disk state), so the resident write buffer tracks the
-    /// dask-ms chunks written since the last flush — not the whole column.
-    pending: Vec<Vec<u64>>,
+    /// `cells[col]`: the buffered cells of one column, keyed by row. Sparse
+    /// on purpose: the buffer tracks the rows written since the last flush,
+    /// never the table. (It used to hold one slot per TABLE row for every
+    /// written column, re-allocated after each flush, so a one-row dask-ms
+    /// chunk flush cost O(table rows) — see `tests/flush_cost.rs`.)
+    ///
+    /// A cell's `pending` flag marks a row WRITTEN since the last successful
+    /// `flush` (`putcell`/`putcol`; a `putcell_loaded` value is not pending).
+    /// Only pending rows are overlaid onto the on-disk files, and a flush
+    /// drops the column's buffer (reads fall back to the refreshed on-disk
+    /// state), so the resident write buffer tracks the dask-ms chunks written
+    /// since the last flush — not the whole column.
+    cells: Vec<std::collections::BTreeMap<u64, BufferedCell>>,
     /// Which columns were explicitly written (`putcell`/`putcol`).  A
     /// `flush()` on an existing table preserves the on-disk files of any
     /// column that was never written — casacore's in-place semantics, and
@@ -1687,6 +1832,26 @@ pub enum WriteTableError {
     Storage(String),
 }
 
+/// Name the file a storage error came from, the way casacore does.
+///
+/// casacore renders these as `RegularFileIO: error in open or create of file
+/// <path>: <cause>`; casacure reported only the cause, so a failure surfacing
+/// through dask-ms (`ndarray_putcol` -> `table.flush()`) named neither the
+/// table nor the block at fault.  The sites that know the path pass it here;
+/// the storage managers' own opens do it themselves, see
+/// [`crate::datafile::FileIoError`].
+fn storage_error(path: impl AsRef<std::path::Path>, err: impl std::fmt::Display) -> String {
+    format!("{}: {err}", path.as_ref().display())
+}
+
+/// One buffered cell of a [`WritableTable`] column.
+#[derive(Debug, Clone)]
+struct BufferedCell {
+    value: RecordValue,
+    /// Written since the last flush (vs loaded from the existing table).
+    pending: bool,
+}
+
 impl WritableTable {
     /// Start a new table with the given schema and no rows.
     pub fn create(
@@ -1694,15 +1859,13 @@ impl WritableTable {
         desc: crate::tabledesc::TableDesc,
     ) -> WritableTable {
         let dir: std::path::PathBuf = dir.into();
-        let cells = vec![Vec::new(); desc.columns.len()];
-        let pending = vec![Vec::new(); desc.columns.len()];
+        let cells = vec![std::collections::BTreeMap::new(); desc.columns.len()];
         let touched = vec![false; desc.columns.len()];
         WritableTable {
             dir: absolute_dir(&dir),
             desc,
             rows: 0,
             cells,
-            pending,
             touched,
             meta_dirty: false,
         }
@@ -1719,28 +1882,20 @@ impl WritableTable {
         self.rows += n;
     }
 
-    /// Grow one column's cell store to the table's row count (the entry
-    /// point of every write: a lazily opened column holds nothing).
-    fn grow_cells(&mut self, col_idx: usize) -> Result<(), WriteTableError> {
-        let name = self
-            .desc
-            .columns
-            .get(col_idx)
-            .map(|c| c.name.clone())
-            .unwrap_or_default();
-        let rows = self.rows as usize;
-        let col = self
-            .cells
-            .get_mut(col_idx)
-            .ok_or(WriteTableError::NoSuchColumn { name })?;
-        if col.len() < rows {
-            col.resize_with(rows, || None);
+    /// Reject a row or column the table does not have (the entry check of
+    /// every write). Nothing is allocated: a column buffers only the rows
+    /// actually written.
+    fn check_cell(&self, col_idx: usize, row: u64) -> Result<(), WriteTableError> {
+        if col_idx >= self.cells.len() {
+            return Err(WriteTableError::NoSuchColumn {
+                name: self.col_name(col_idx),
+            });
         }
-        let words = rows.div_ceil(64);
-        if let Some(pending) = self.pending.get_mut(col_idx) {
-            if pending.len() < words {
-                pending.resize(words, 0);
-            }
+        if row >= self.rows {
+            return Err(WriteTableError::RowOutOfRange {
+                row,
+                nrow: self.rows,
+            });
         }
         Ok(())
     }
@@ -1757,25 +1912,17 @@ impl WritableTable {
         row: u64,
         value: RecordValue,
     ) -> Result<(), WriteTableError> {
-        if row >= self.rows {
-            return Err(WriteTableError::RowOutOfRange {
-                row,
-                nrow: self.rows,
-            });
+        self.check_cell(col_idx, row)?;
+        // A loaded value never clears a pending write's flag.
+        match self.cells[col_idx].entry(row) {
+            std::collections::btree_map::Entry::Occupied(mut e) => e.get_mut().value = value,
+            std::collections::btree_map::Entry::Vacant(e) => {
+                e.insert(BufferedCell {
+                    value,
+                    pending: false,
+                });
+            }
         }
-        let name = self.col_name(col_idx);
-        self.grow_cells(col_idx)?;
-        let col = self
-            .cells
-            .get_mut(col_idx)
-            .ok_or(WriteTableError::NoSuchColumn { name })?;
-        let slot = col
-            .get_mut(row as usize)
-            .ok_or(WriteTableError::RowOutOfRange {
-                row,
-                nrow: self.rows,
-            })?;
-        *slot = Some(value);
         Ok(())
     }
 
@@ -1795,26 +1942,14 @@ impl WritableTable {
         row: u64,
         value: RecordValue,
     ) -> Result<(), WriteTableError> {
-        if row >= self.rows {
-            return Err(WriteTableError::RowOutOfRange {
-                row,
-                nrow: self.rows,
-            });
-        }
-        let name = self.col_name(col_idx);
-        self.grow_cells(col_idx)?;
-        let col = self
-            .cells
-            .get_mut(col_idx)
-            .ok_or(WriteTableError::NoSuchColumn { name })?;
-        let slot = col
-            .get_mut(row as usize)
-            .ok_or(WriteTableError::RowOutOfRange {
-                row,
-                nrow: self.rows,
-            })?;
-        *slot = Some(value);
-        self.pending[col_idx][(row as usize) / 64] |= 1u64 << ((row as usize) % 64);
+        self.check_cell(col_idx, row)?;
+        self.cells[col_idx].insert(
+            row,
+            BufferedCell {
+                value,
+                pending: true,
+            },
+        );
         if let Some(t) = self.touched.get_mut(col_idx) {
             *t = true;
         }
@@ -1839,8 +1974,7 @@ impl WritableTable {
     /// column's default value at flush.
     pub fn addcol(&mut self, cd: crate::tabledesc::ColumnDesc) {
         self.desc.columns.push(cd);
-        self.cells.push(Vec::new());
-        self.pending.push(Vec::new());
+        self.cells.push(std::collections::BTreeMap::new());
         self.touched.push(false);
     }
 
@@ -1852,9 +1986,6 @@ impl WritableTable {
         }
         if col_idx < self.cells.len() {
             self.cells.remove(col_idx);
-        }
-        if col_idx < self.pending.len() {
-            self.pending.remove(col_idx);
         }
         if col_idx < self.touched.len() {
             self.touched.remove(col_idx);
@@ -1931,56 +2062,23 @@ impl WritableTable {
         if rows.is_empty() || self.cells.is_empty() {
             return;
         }
-        let mut drop: Vec<bool> = vec![false; self.rows as usize];
-        for &r in rows {
-            if let Some(slot) = drop.get_mut(r as usize) {
-                *slot = true;
-            }
-        }
-        // Old row index -> surviving index (u64::MAX for a dropped row). The
-        // pending bitsets must be RENUMBERED, not just filtered: `cells` are
-        // compacted in place, so a bit left at its old position would mark the
+        let mut dropped: Vec<u64> = rows.iter().copied().filter(|&r| r < self.rows).collect();
+        dropped.sort_unstable();
+        dropped.dedup();
+        // Surviving rows are renumbered (row - the dropped rows before it),
+        // pending flags and all: a flag left at its old row would mark the
         // wrong row as written and a merged read would answer with the
         // pre-delete on-disk value (python `test_taql_delete_insert_persist`:
         // deleting row 1 of [5, 2, 9] read back [5, 2]).
-        let mut new_row: Vec<u64> = Vec::with_capacity(drop.len());
-        let mut next = 0u64;
-        for &dropped in &drop {
-            if dropped {
-                new_row.push(u64::MAX);
-            } else {
-                new_row.push(next);
-                next += 1;
-            }
-        }
         for col in &mut self.cells {
-            let mut j = 0;
-            col.retain(|_| {
-                let keep = !drop[j];
-                j += 1;
-                keep
-            });
+            let old = std::mem::take(col);
+            *col = old
+                .into_iter()
+                .filter(|(r, _)| dropped.binary_search(r).is_err())
+                .map(|(r, c)| (r - dropped.partition_point(|&d| d < r) as u64, c))
+                .collect();
         }
-        let words = (next as usize).div_ceil(64);
-        for pend in &mut self.pending {
-            let mut out = vec![0u64; words];
-            for (j, w) in pend.iter().enumerate() {
-                let mut w = *w;
-                while w != 0 {
-                    let old = j * 64 + w.trailing_zeros() as usize;
-                    if let Some(&nr) = new_row.get(old) {
-                        if nr != u64::MAX {
-                            out[(nr / 64) as usize] |= 1u64 << (nr % 64);
-                        }
-                    }
-                    w &= w - 1;
-                }
-            }
-            *pend = out;
-        }
-        // The surviving rows are the new row count (the materialised cells
-        // were compacted above; any unallocated tail stays unallocated).
-        self.rows = next;
+        self.rows -= dropped.len() as u64;
     }
 
     /// Rename a column (`ALTER TABLE ... RENAME COLUMN from TO to`).
@@ -2015,8 +2113,8 @@ impl WritableTable {
     pub fn cell(&self, col_idx: usize, row: u64) -> Option<&RecordValue> {
         self.cells
             .get(col_idx)
-            .and_then(|c| c.get(row as usize))
-            .and_then(|c| c.as_ref())
+            .and_then(|c| c.get(&row))
+            .map(|c| &c.value)
     }
 
     /// The value of one cell IF it was written since the last flush: the
@@ -2025,17 +2123,11 @@ impl WritableTable {
     /// overlay the on-disk values on a merged read — only rows actually
     /// `putcell`/`putcol`'d are pending.
     pub fn pending_cell(&self, col_idx: usize, row: u64) -> Option<&RecordValue> {
-        let bit = 1u64 << ((row as usize) % 64);
-        if self
-            .pending
+        self.cells
             .get(col_idx)?
-            .get((row as usize) / 64)
-            .is_some_and(|w| w & bit != 0)
-        {
-            self.cell(col_idx, row)
-        } else {
-            None
-        }
+            .get(&row)
+            .filter(|c| c.pending)
+            .map(|c| &c.value)
     }
 
     pub fn setmaxcachesize(&mut self, _col_idx: usize, _size: usize) {}
@@ -2125,34 +2217,39 @@ impl WritableTable {
         let nrow = self.rows;
         // Preservation is only possible when the on-disk table shares this
         // schema and row count (a full regrowth is otherwise required).
-        let preserving =
-            self.touched.len() == self.desc.columns.len()
-                && !self.meta_dirty
-                && self.touched.iter().any(|&t| t)
-                && self.touched.iter().any(|&t| !t)
-                && std::fs::read(dir.join("table.dat"))
-                    .ok()
-                    .and_then(|b| parse_table_dat(&b).ok())
-                    .is_some_and(|dat| {
-                        dat.desc.columns.len() == self.desc.columns.len()
-                            && dat.header.nrow == nrow
-                            && dat.desc.columns.iter().zip(self.desc.columns.iter()).all(
-                                |(a, b)| {
-                                    a.name == b.name
-                                        && a.data_manager_type == b.data_manager_type
-                                        && a.data_manager_group == b.data_manager_group
-                                },
-                            )
-                    });
-        if !preserving {
+        // `table.dat` is read and parsed once here (only when the cheap
+        // checks pass) and handed to the preserving path, which used to
+        // re-read it — as did every tiled column patch.
+        let on_disk = (self.touched.len() == self.desc.columns.len()
+            && !self.meta_dirty
+            && self.touched.iter().any(|&t| t)
+            && self.touched.iter().any(|&t| !t))
+        .then(|| std::fs::read(dir.join("table.dat")).ok())
+        .flatten()
+        .and_then(|b| parse_table_dat(&b).ok())
+        .filter(|dat| {
+            dat.desc.columns.len() == self.desc.columns.len()
+                && dat.header.nrow == nrow
+                && dat
+                    .desc
+                    .columns
+                    .iter()
+                    .zip(self.desc.columns.iter())
+                    .all(|(a, b)| {
+                        a.name == b.name
+                            && a.data_manager_type == b.data_manager_type
+                            && a.data_manager_group == b.data_manager_group
+                    })
+        });
+        let Some(dat) = on_disk else {
             let values = self.materialize_all()?;
             create_table(&dir, &self.desc, &values)?;
             // The regrowth wrote every cell: nothing is pending anymore.
             self.clear_all_pending();
             self.touched.fill(false);
             return Ok(dir);
-        }
-        self.flush_preserving(&dir)?;
+        };
+        self.flush_preserving(&dir, &dat)?;
         // `touched` is scoped to the un-flushed writes of one session: a
         // later write round (possibly on a reused handle) must be judged
         // against the flushed state, not forever keep every previously
@@ -2184,7 +2281,7 @@ impl WritableTable {
         let disk = if file_exists {
             Some(
                 crate::Table::open(&self.dir, false)
-                    .map_err(|e| WriteTableError::Storage(e.to_string()))?,
+                    .map_err(|e| WriteTableError::Storage(storage_error(&self.dir, e)))?,
             )
         } else {
             None
@@ -2207,43 +2304,43 @@ impl WritableTable {
             // Every row written this session (a whole-column write): the
             // buffer is the truth and the on-disk column — which may hold
             // never-written array cells — is irrelevant.
-            let full_session_write =
-                nrow > 0 && self.pending_count(col_idx) >= nrow && col.len() as u64 >= nrow;
-            let mut list: Vec<RecordValue> = if full_session_write {
-                col.iter()
-                    .take(nrow as usize)
-                    .map(|c| c.clone().unwrap_or_else(|| default.clone()))
+            // (Pending rows are always < nrow, so `nrow` pending rows means
+            // every row is buffered.)
+            let full_session_write = nrow > 0 && self.pending_count(col_idx) >= nrow;
+            // Buffered values, default where unset (the column default for
+            // every row the buffer does not hold).
+            let buffered = || -> Vec<RecordValue> {
+                (0..nrow)
+                    .map(|r| {
+                        col.get(&r)
+                            .map_or_else(|| default.clone(), |c| c.value.clone())
+                    })
                     .collect()
+            };
+            let mut list: Vec<RecordValue> = if full_session_write {
+                buffered()
             } else if let (Some(t), Some(di)) = (&disk, disk_idx) {
                 let disk_rows = t.nrows().min(nrow);
                 let mut l = t
                     .getcol(di, 0, disk_rows)
-                    .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                    .map_err(|e| WriteTableError::Storage(storage_error(&self.dir, e)))?;
                 // Rows past the on-disk row count (fresh addrows) default-fill.
                 while (l.len() as u64) < nrow {
                     l.push(default.clone());
                 }
                 l
             } else {
-                // No on-disk column: buffered values, default where unset —
-                // including the whole unallocated tail of a lazily opened
-                // column, which holds no cell at all.
-                let mut l: Vec<RecordValue> = col
-                    .iter()
-                    .take(nrow as usize)
-                    .map(|c| c.clone().unwrap_or_else(|| default.clone()))
-                    .collect();
-                l.resize(nrow as usize, default.clone());
-                l
+                // No on-disk column: buffered values, default where unset.
+                buffered()
             };
             // Every column must be represented for all `nrow` rows: the
-            // disk/buffer branches can come up short (rows added since the
-            // last flush, a column added this session).
+            // disk branch can come up short (rows added since the last
+            // flush, a column added this session).
             list.resize(nrow as usize, default.clone());
             // Overlay the rows written THIS session (pending) — non-pending
-            // buffered cells (addrows defaults) must not clobber disk data.
-            for r in self.pending_rows(col_idx) {
-                if let Some(Some(v)) = col.get(r as usize) {
+            // buffered cells (loaded values) must not clobber disk data.
+            if !full_session_write {
+                for (r, v) in self.pending_cells(col_idx) {
                     list[r as usize] = v.clone();
                 }
             }
@@ -2254,32 +2351,33 @@ impl WritableTable {
 
     /// Whether any rows of `col` were written since the last flush.
     fn has_pending(&self, col_idx: usize) -> bool {
-        self.pending
+        self.cells
             .get(col_idx)
-            .is_some_and(|p| p.iter().any(|&w| w != 0))
+            .is_some_and(|c| c.values().any(|c| c.pending))
     }
 
     /// How many rows of `col` were written since the last flush.
     fn pending_count(&self, col_idx: usize) -> u64 {
-        self.pending
+        self.cells
             .get(col_idx)
-            .map_or(0, |p| p.iter().map(|w| u64::from(w.count_ones())).sum())
+            .map_or(0, |c| c.values().filter(|c| c.pending).count() as u64)
+    }
+
+    /// The rows of `col` written since the last flush, ascending, with
+    /// their values.
+    fn pending_cells(&self, col_idx: usize) -> impl Iterator<Item = (u64, &RecordValue)> + '_ {
+        self.cells
+            .get(col_idx)
+            .into_iter()
+            .flat_map(|c| c.iter())
+            .filter(|(_, c)| c.pending)
+            .map(|(&r, c)| (r, &c.value))
     }
 
     /// The rows of `col` written since the last flush, ascending.
+    #[cfg(test)]
     fn pending_rows(&self, col_idx: usize) -> impl Iterator<Item = u64> + '_ {
-        self.pending.get(col_idx).into_iter().flat_map(|p| {
-            p.iter().enumerate().flat_map(move |(wi, &w)| {
-                let mut w = w;
-                let mut out = Vec::new();
-                while w != 0 {
-                    let b = w.trailing_zeros() as usize;
-                    out.push((wi * 64 + b) as u64);
-                    w &= w - 1;
-                }
-                out
-            })
-        })
+        self.pending_cells(col_idx).map(|(r, _)| r)
     }
 
     /// Drop the buffered values and dirty marks of one column: its rows now
@@ -2289,19 +2387,13 @@ impl WritableTable {
     /// per-row slots must go back to the allocator.
     fn clear_pending(&mut self, col_idx: usize) {
         if let Some(col) = self.cells.get_mut(col_idx) {
-            *col = Vec::new();
-        }
-        if let Some(p) = self.pending.get_mut(col_idx) {
-            *p = Vec::new();
+            *col = std::collections::BTreeMap::new();
         }
     }
 
     fn clear_all_pending(&mut self) {
         for col in &mut self.cells {
-            *col = Vec::new();
-        }
-        for p in &mut self.pending {
-            *p = Vec::new();
+            *col = std::collections::BTreeMap::new();
         }
     }
 
@@ -2320,10 +2412,11 @@ impl WritableTable {
     /// patched in place (row growth, missing files) falls back to the full
     /// rebuild from on-disk + pending.  After a successful flush the column
     /// releases its buffered cells.
-    fn flush_preserving(&mut self, dir: &std::path::Path) -> Result<(), WriteTableError> {
-        let buf = std::fs::read(dir.join("table.dat"))
-            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
-        let dat = parse_table_dat(&buf).map_err(|e| WriteTableError::Storage(e.to_string()))?;
+    fn flush_preserving(
+        &mut self,
+        dir: &std::path::Path,
+        dat: &TableDat,
+    ) -> Result<(), WriteTableError> {
         let nrow = self.rows;
         let dm_of: Vec<u32> = (0..self.desc.columns.len())
             .map(|c| {
@@ -2374,7 +2467,7 @@ impl WritableTable {
                     // full-column rebuild (their cells reference
                     // variable-size string / array buckets).
                     let patched = dm.type_name == "StandardStMan"
-                        && self.patch_ssm_column(dir, seq, &dat, &cols)?;
+                        && self.patch_ssm_column(dir, seq, dat, &cols)?;
                     if !patched {
                         // Full-column rebuild from the on-disk values
                         // overlaid with the pending rows (the fallback for
@@ -2395,11 +2488,14 @@ impl WritableTable {
                                 &cols,
                             )
                             .map_err(storage)?;
-                            std::fs::write(dir.join(format!("table.f{seq}")), f0)
-                                .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                            let path = dir.join(format!("table.f{seq}"));
+                            std::fs::write(&path, f0)
+                                .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
                             if let Some(i) = f0i {
-                                std::fs::write(dir.join(format!("table.f{seq}i")), i)
-                                    .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                                let index_path = dir.join(format!("table.f{seq}i"));
+                                std::fs::write(&index_path, i).map_err(|e| {
+                                    WriteTableError::Storage(storage_error(&index_path, e))
+                                })?;
                             }
                         } else {
                             let f0 = build_ism_data(
@@ -2411,8 +2507,9 @@ impl WritableTable {
                                 &cols,
                             )
                             .map_err(storage)?;
-                            std::fs::write(dir.join(format!("table.f{seq}")), f0)
-                                .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                            let path = dir.join(format!("table.f{seq}"));
+                            std::fs::write(&path, f0)
+                                .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
                         }
                     }
                     for &col in &cols {
@@ -2425,7 +2522,7 @@ impl WritableTable {
                     // possible, else rebuild it from on-disk + pending.
                     let col = cols[0];
                     if self
-                        .patch_tsm_column(dir, seq, &dm.type_name, col, nrow)?
+                        .patch_tsm_column(dir, seq, dat.header.big_endian, col, nrow)?
                         .is_none()
                     {
                         let mut all_vals: Vec<Vec<RecordValue>> =
@@ -2441,10 +2538,12 @@ impl WritableTable {
                             &[col],
                         )
                         .map_err(storage)?;
-                        std::fs::write(dir.join(format!("table.f{seq}")), hdr)
-                            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
-                        std::fs::write(dir.join(format!("table.f{seq}_TSM{file_seq}")), tile)
-                            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                        let path = dir.join(format!("table.f{seq}"));
+                        std::fs::write(&path, hdr)
+                            .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
+                        let tile_path = dir.join(format!("table.f{seq}_TSM{file_seq}"));
+                        std::fs::write(&tile_path, tile)
+                            .map_err(|e| WriteTableError::Storage(storage_error(&tile_path, e)))?;
                     }
                     self.clear_pending(col);
                 }
@@ -2467,9 +2566,9 @@ impl WritableTable {
     /// chunk), not the whole column.
     ///
     /// Only fixed-size scalar columns (numeric and bit-packed Bool) can be
-    /// patched in place; a DM containing string / record / array columns is
-    /// not (those cells reference variable-size string / array buckets).
-    /// Returns `Ok(false)` so the caller keeps the full-rebuild path.
+    /// patched in place; pending writes to a string / record / array column
+    /// are not (those cells reference variable-size string / array buckets),
+    /// and return `Ok(false)` so the caller keeps the full-rebuild path.
     fn patch_ssm_column(
         &self,
         dir: &std::path::Path,
@@ -2485,7 +2584,13 @@ impl WritableTable {
         use crate::ssm::{encode_scalar_cell, scalar_cell_size, StandardStManFile, DATA_START};
         use crate::tabledesc::ColumnKind;
 
-        if cols.iter().any(|&c| {
+        // Only the columns being written must be fixed-size scalars: an
+        // untouched string/array column sharing the DM keeps its bucket
+        // bytes (fixed-size references into the string/array files) as is.
+        // (A real MS keeps FLAG_ROW in one StandardStMan with UVW and other
+        // arrays; rejecting the DM for those forced a whole-file rebuild on
+        // every chunk flush.)
+        if cols.iter().filter(|&&c| self.has_pending(c)).any(|&c| {
             let cd = &self.desc.columns[c];
             !matches!(cd.kind, ColumnKind::Scalar(_)) || cd.data_type == DataType::String
         }) {
@@ -2504,11 +2609,12 @@ impl WritableTable {
         let parsed = StandardStManFile::open(dir, seq, big_endian)
             .map_err(|e| WriteTableError::Storage(e.to_string()))?;
         let bucket_size = parsed.header.bucket_size as usize;
+        let path = dir.join(format!("table.f{seq}"));
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(dir.join(format!("table.f{seq}")))
-            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+            .open(&path)
+            .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
 
         // Per touched bucket: bit set/clear ops (byte -> (set, clear) mask;
         // several pending Bool rows share a byte, so masks must accumulate)
@@ -2520,16 +2626,26 @@ impl WritableTable {
             let cell_size = u64::from(scalar_cell_size(&cd));
             let is_bit_cell = cd.data_type == DataType::Bool;
             let cell_bits = if is_bit_cell { 1 } else { cell_size * 8 };
-            let index_nr = *spec.col_index_map.get(col).unwrap_or(&0) as usize;
+            // The spec's per-column arrays are indexed by the column's
+            // position WITHIN this data manager (as the reader resolves it),
+            // not its table index: FLAG_ROW is table column N but, say, the
+            // 2nd StandardStMan column. Using the table index read another
+            // column's offset (or fell back to 0) and overwrote its cells.
+            let within = dat
+                .column_set
+                .columns
+                .iter()
+                .take(col)
+                .filter(|c| c.data_manager_seq == seq)
+                .count();
+            let missing = || WriteTableError::Storage(format!("SSM spec has no column {within}"));
+            let index_nr = *spec.col_index_map.get(within).ok_or_else(missing)? as usize;
             let index = parsed
                 .indices
                 .get(index_nr)
                 .ok_or_else(|| WriteTableError::Storage(format!("SSM index {index_nr} missing")))?;
-            let column_offset = u64::from(*spec.column_offset.get(col).unwrap_or(&0));
-            for r in self.pending_rows(col) {
-                let Some(Some(value)) = self.cells[col].get(r as usize) else {
-                    continue;
-                };
+            let column_offset = u64::from(*spec.column_offset.get(within).ok_or_else(missing)?);
+            for (r, value) in self.pending_cells(col) {
                 let bucket = index
                     .find(r)
                     .ok_or_else(|| WriteTableError::Storage(format!("SSM row {r} out of range")))?;
@@ -2563,9 +2679,9 @@ impl WritableTable {
             let base = DATA_START + number as usize * bucket_size;
             let mut buf = vec![0u8; bucket_size];
             file.seek(SeekFrom::Start(base as u64))
-                .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
             file.read_exact(&mut buf)
-                .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
             if let Some(ops) = bit_ops.get(&number) {
                 for (&byte, &(set, clear)) in ops {
                     if let Some(b) = buf.get_mut(byte) {
@@ -2582,9 +2698,9 @@ impl WritableTable {
                 }
             }
             file.seek(SeekFrom::Start(base as u64))
-                .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
             file.write_all(&buf)
-                .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
         }
         Ok(true)
     }
@@ -2598,123 +2714,144 @@ impl WritableTable {
         nrow: u64,
     ) -> Result<Vec<RecordValue>, WriteTableError> {
         let t = crate::Table::open(&self.dir, false)
-            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+            .map_err(|e| WriteTableError::Storage(storage_error(&self.dir, e)))?;
         let mut vals = t
             .getcol(col, 0, nrow)
-            .map_err(|e| WriteTableError::Storage(e.to_string()))?;
-        for r in self.pending_rows(col) {
-            if let Some(Some(v)) = self.cells[col].get(r as usize) {
-                vals[r as usize] = v.clone();
-            }
+            .map_err(|e| WriteTableError::Storage(storage_error(&self.dir, e)))?;
+        for (r, v) in self.pending_cells(col) {
+            vals[r as usize] = v.clone();
         }
         Ok(vals)
     }
 
     /// Byte-patch the on-disk TSM tile file of column `col` (one array
-    /// column per TSM DM) with the pending rows, leaving every other row
-    /// untouched.  Returns `None` when the file cannot be patched in place
-    /// (row growth, missing header/tile, multi-cube headers) so the caller
-    /// falls back to a full rebuild.
+    /// column per TSM DM) with the pending rows, in place: only the bytes
+    /// covering the pending cells are read (Bool: the partial edge bytes)
+    /// and written, so a chunked write stream costs I/O proportional to the
+    /// chunk, not the column.  Cells are located with the reader's own
+    /// geometry and row maps ([`crate::tsm::TsmFile::cell_location`]), so a
+    /// patch lands exactly where a read looks.  Returns `None` — before
+    /// anything is written — when the file cannot be patched in place (row
+    /// growth, a missing header/tile file, a pending row with no stored
+    /// cell or a cell of a different size), so the caller falls back to a
+    /// full rebuild.
     fn patch_tsm_column(
         &self,
         dir: &std::path::Path,
         seq: u32,
-        stman_type: &str,
+        big_endian: bool,
         col: usize,
         nrow: u64,
     ) -> Result<Option<()>, WriteTableError> {
         use crate::record::DataType;
-        let file_seq = if stman_type == "TiledShapeStMan" {
-            1
-        } else {
-            0
-        };
-        let hdr_path = dir.join(format!("table.f{seq}"));
-        let tile_path = dir.join(format!("table.f{seq}_TSM{file_seq}"));
-        let (Ok(hdr_bytes), Ok(mut tile)) = (std::fs::read(&hdr_path), std::fs::read(&tile_path))
-        else {
-            return Ok(None);
-        };
-        let header = match crate::tsm::parse_header(&hdr_bytes) {
-            Ok(h) => h,
-            Err(_) => return Ok(None),
-        };
-        let nrdim = header.nrdim as usize;
-        let Some(cube) = header
-            .cubes
-            .iter()
-            .find(|c| !c.cube_shape.is_empty() && c.cube_shape.len() == nrdim)
-        else {
-            return Ok(None);
-        };
-        if header.nrrow != nrow {
-            return Ok(None); // row growth: needs a full rebuild
-        }
+        use std::io::{Read, Seek, SeekFrom, Write};
+
         let Some(cd) = self.desc.columns.get(col) else {
             return Ok(None);
         };
-        // Tile geometry from the parsed header's real data cube — never
-        // recomputed from the descriptor.  The reader (`TsmFile::read_cell`)
-        // groups rows by the cube's tile shape and places each tile at a
-        // byte-aligned bucket of `ceil(tile_bits/8)`, so the patch must use
-        // the SAME rows-per-tile and bucket bytes or every tile >= 1 of a
-        // table whose tile shape differs from the default (e.g. a casacore-
-        // written MS with 829-row tiles) is mis-placed.  Equivalent to
-        // `tsm_layout` when the header was written by this crate, which keeps
-        // the two self-consistent.
-        let rows_per_tile = cube.tile_shape[nrdim - 1] as u64;
-        let cell_shape: Vec<i64> = cube.cube_shape[..nrdim - 1].to_vec();
-        let cell_elems = cell_shape.iter().product::<i64>().max(0) as usize;
-        let bucket_bytes = match cd.data_type {
-            crate::record::DataType::Bool => (cell_elems * rows_per_tile as usize).div_ceil(8),
-            _ => {
-                let elem = crate::tsm::elem_size(cd.data_type)
-                    .map_err(|e| WriteTableError::Storage(e.to_string()))?;
-                cell_elems * elem * rows_per_tile as usize
-            }
+        let Ok(tsm) = crate::tsm::TsmFile::open(dir, seq, big_endian) else {
+            return Ok(None);
         };
+        if tsm.header.nrrow != nrow {
+            return Ok(None); // row growth: needs a full rebuild
+        }
+        let Some(file_seq) = tsm.tile_file_seq() else {
+            return Ok(None);
+        };
+        let is_bool = cd.data_type == DataType::Bool;
 
-        // Encode the pending rows' cells.
-        let mut pending: Vec<(u64, Vec<u8>)> = Vec::new();
-        for r in self.pending_rows(col) {
+        // Locate and encode every pending cell first: nothing is written
+        // unless the whole patch can be applied.
+        let mut pending: Vec<(crate::tsm::CellLocation, Vec<u8>)> = Vec::new();
+        for (r, value) in self.pending_cells(col) {
             if r >= nrow {
                 return Ok(None);
             }
-            let Some(RecordValue::Array(arr)) =
-                self.cells[col].get(r as usize).and_then(|c| c.as_ref())
-            else {
+            let RecordValue::Array(arr) = value else {
                 return Ok(None);
             };
-            let cell = crate::tsm::tsm_encode_cell(false, cd.data_type, &arr.data)
+            let Ok(Some((_, loc))) = tsm.cell_location(cd, r) else {
+                return Ok(None); // unset cell / out of range: rebuild
+            };
+            let cell = crate::tsm::tsm_encode_cell(big_endian, cd.data_type, &arr.data)
                 .map_err(|e| WriteTableError::Storage(e.to_string()))?;
-            pending.push((r, cell));
+            let fits = if is_bool {
+                cell.len() == loc.nelem.div_ceil(8)
+            } else {
+                cell.len() == loc.nbytes
+            };
+            if !fits {
+                return Ok(None);
+            }
+            pending.push((loc, cell));
         }
+        drop(tsm); // release the mapping before writing the file
         if pending.is_empty() {
             return Ok(Some(())); // nothing to patch
         }
-        // Overlay each pending row onto its tile bucket.
-        for (r, cell) in &pending {
-            let tile_nr = r / rows_per_tile;
-            let in_tile = (r % rows_per_tile) as usize;
-            let bucket = tile_nr as usize * bucket_bytes;
-            if cd.data_type == DataType::Bool {
-                let bit = in_tile * cell_elems;
-                // Clear the row's old bits, then place the new ones.
-                for g in bit..bit + cell_elems {
-                    tile[bucket + g / 8] &= !(1 << (g % 8));
+        pending.sort_by_key(|(loc, _)| (loc.byte_off, loc.skip));
+
+        let tile_path = dir.join(format!("table.f{seq}_TSM{file_seq}"));
+        let io = |e: std::io::Error| WriteTableError::Storage(storage_error(&tile_path, e));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&tile_path)
+            .map_err(io)?;
+        // Coalesce cells whose byte ranges touch into runs, one read-modify-
+        // write (Bool) or one write (byte-aligned types) per run.
+        let mut i = 0;
+        while i < pending.len() {
+            let start = pending[i].0.byte_off;
+            let mut end = start + pending[i].0.nbytes;
+            let mut j = i + 1;
+            while j < pending.len() && pending[j].0.byte_off <= end {
+                end = end.max(pending[j].0.byte_off + pending[j].0.nbytes);
+                j += 1;
+            }
+            // One slack byte: `or_bytes_at` may OR (zero) padding bits one
+            // byte past a straddling cell.
+            let mut buf = vec![0u8; end - start + 1];
+            if is_bool {
+                // Bool cells share edge bytes with neighbouring rows: read
+                // the run, clear each cell's bits, OR in the new bits.
+                file.seek(SeekFrom::Start(start as u64)).map_err(io)?;
+                file.read_exact(&mut buf[..end - start]).map_err(io)?;
+                for (loc, cell) in &pending[i..j] {
+                    let bit = (loc.byte_off - start) * 8 + loc.skip;
+                    clear_bits(&mut buf, bit, loc.nelem);
+                    crate::tsm::or_bytes_at(&mut buf, cell, bit);
                 }
-                crate::tsm::or_bytes_at(&mut tile[bucket..], cell, bit);
             } else {
-                let off = bucket + in_tile * cell.len();
-                if off + cell.len() <= tile.len() {
-                    tile[off..off + cell.len()].copy_from_slice(cell);
-                } else {
-                    return Ok(None);
+                for (loc, cell) in &pending[i..j] {
+                    let off = loc.byte_off - start;
+                    buf[off..off + cell.len()].copy_from_slice(cell);
                 }
             }
+            file.seek(SeekFrom::Start(start as u64)).map_err(io)?;
+            file.write_all(&buf[..end - start]).map_err(io)?;
+            i = j;
         }
-        std::fs::write(&tile_path, tile).map_err(|e| WriteTableError::Storage(e.to_string()))?;
         Ok(Some(()))
+    }
+}
+
+/// Clear `n` bits of `buf` starting at bit `bit` (LSB-first): partial edge
+/// bytes by mask, whole bytes in between by fill.
+fn clear_bits(buf: &mut [u8], bit: usize, n: usize) {
+    if n == 0 {
+        return;
+    }
+    let end = bit + n; // exclusive
+    let (first, last) = (bit / 8, (end - 1) / 8);
+    let lo_mask = 0xffu8 << (bit % 8); // bits >= bit within `first`
+    let hi_mask = 0xffu8 >> (7 - (end - 1) % 8); // bits < end within `last`
+    if first == last {
+        buf[first] &= !(lo_mask & hi_mask);
+    } else {
+        buf[first] &= !lo_mask;
+        buf[first + 1..last].fill(0);
+        buf[last] &= !hi_mask;
     }
 }
 
@@ -3164,6 +3301,21 @@ fn json_ilist(items: &[i64]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_bits_matches_per_bit_loop() {
+        for bit in 0..24 {
+            for n in 0..40 {
+                let mut got = vec![0xffu8; 10];
+                let mut want = got.clone();
+                clear_bits(&mut got, bit, n);
+                for g in bit..bit + n {
+                    want[g / 8] &= !(1 << (g % 8));
+                }
+                assert_eq!(got, want, "bit {bit} n {n}");
+            }
+        }
+    }
 
     fn table_dat(version: u32, nrow: u64, endian_flag: u32, kind: &str) -> Vec<u8> {
         let mut payload = Vec::new();
@@ -4005,6 +4157,64 @@ mod tests {
         );
     }
 
+    /// A write to a read-only block must say *which* file refused it (#12).
+    ///
+    /// The failure this pins down is the one that reaches users: a flag write
+    /// through dask-ms dies with `storage error: Permission denied`, and
+    /// without the path in the message there is nothing to say which block of
+    /// which measurement set was at fault.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_block_is_named_in_the_storage_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("readonly-block-error");
+        let mut desc = typed_desc();
+        // Two SSM scalar columns, so the second flush is the incremental
+        // (preserving) path: one column pending, the other already on disk.
+        desc.columns = vec![
+            scalar_col("FLAG", DataType::Bool, 0),
+            scalar_col("KEEP", DataType::Int, 0),
+        ];
+        let mut wt = WritableTable::create(&dir, desc);
+        wt.addrows(2);
+        wt.putcol(0, 0, &[RecordValue::Bool(false), RecordValue::Bool(false)])
+            .unwrap();
+        wt.putcol(1, 0, &[RecordValue::Int(7), RecordValue::Int(8)])
+            .unwrap();
+        wt.flush().unwrap();
+
+        let blocks: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("table.f"))
+            })
+            .collect();
+        assert!(!blocks.is_empty(), "the first flush wrote no block");
+        for path in &blocks {
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o444);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+
+        wt.putcell(0, 0, RecordValue::Bool(true)).unwrap();
+        let err = wt
+            .flush()
+            .expect_err("writing a read-only block has to fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&dir.display().to_string()),
+            "the table directory is not named in: {msg}"
+        );
+        assert!(msg.contains("table.f"), "no block named in: {msg}");
+        assert!(
+            msg.contains("Permission denied"),
+            "the cause is missing from: {msg}"
+        );
+    }
+
     #[test]
     fn writable_table_addrows_putcol_flush() {
         use crate::record::{ArrayData, ArrayValue};
@@ -4304,6 +4514,71 @@ mod tests {
     /// (header, index chain, unmodified rows) never change.  Exercises
     /// mixed bit + int columns in one SSM DM with rows spanning several
     /// buckets, plus a second flush re-overwriting the same rows.
+    #[test]
+    fn ssm_patch_uses_within_dm_column_index() {
+        // The MS layout: an IncrementalStMan column first, then one
+        // StandardStMan group holding a scalar Int, the FLAG_ROW Bool and a
+        // fixed-shape array (UVW). Patching FLAG_ROW must address its cells
+        // by its position WITHIN the StandardStMan (1), not its table index
+        // (2) -- the table index read another column's offset and
+        // overwrote ANTENNA2 -- and the untouched array in the same DM must
+        // not block the in-place patch.
+        use crate::record::{ArrayData, ArrayValue, RecordValue};
+        let mut time = scalar_col("TIME", DataType::Double, 0);
+        time.data_manager_type = "IncrementalStMan".into();
+        time.data_manager_group = "IncrementalStMan".into();
+        let mut desc = typed_desc();
+        desc.columns = vec![
+            time,
+            scalar_col("ANTENNA2", DataType::Int, 0),
+            scalar_col("FLAG_ROW", DataType::Bool, 0),
+            array_col("UVW", DataType::Double, 4, vec![3]),
+        ];
+        let nrows = 200u64;
+        let uvw = |r: u64| {
+            RecordValue::Array(ArrayValue {
+                shape: vec![3],
+                data: ArrayData::Double(vec![r as f64, -(r as f64), 0.5]),
+            })
+        };
+        let flag0 = |r: u64| r.is_multiple_of(3);
+        let flag1 = |r: u64| if r % 4 == 1 { !flag0(r) } else { flag0(r) };
+        let dir = temp_dir("ssmwithin");
+        {
+            let mut wt = WritableTable::create(&dir, desc.clone());
+            wt.addrows(nrows);
+            for r in 0..nrows {
+                wt.putcell(0, r, RecordValue::Double(r as f64 / 10.0))
+                    .unwrap();
+                wt.putcell(1, r, RecordValue::Int(1000 + r as i32)).unwrap();
+                wt.putcell(2, r, RecordValue::Bool(flag0(r))).unwrap();
+                wt.putcell(3, r, uvw(r)).unwrap();
+            }
+            wt.flush().unwrap();
+        }
+        {
+            let (_snap, mut wt) = WritableTable::open_for_update(&dir).unwrap();
+            for r in (0..nrows).filter(|r| r % 4 == 1) {
+                wt.putcell(2, r, RecordValue::Bool(flag1(r))).unwrap();
+            }
+            wt.flush().unwrap();
+        }
+        let t = Table::open(&dir, false).unwrap();
+        for r in 0..nrows {
+            assert_eq!(
+                t.getcell(0, r).unwrap(),
+                RecordValue::Double(r as f64 / 10.0)
+            );
+            assert_eq!(t.getcell(1, r).unwrap(), RecordValue::Int(1000 + r as i32));
+            assert_eq!(
+                t.getcell(2, r).unwrap(),
+                RecordValue::Bool(flag1(r)),
+                "row {r}"
+            );
+            assert_eq!(t.getcell(3, r).unwrap(), uvw(r));
+        }
+    }
+
     #[test]
     fn ssm_incremental_flush_matches_full_rebuild() {
         use crate::record::RecordValue;
@@ -4627,8 +4902,8 @@ mod tests {
 
     #[test]
     fn drop_rows_renumbers_pending_bits() {
-        // `drop_rows` compacts the cell store in place: the pending bitsets
-        // must be renumbered with it, or a merged read marks the wrong rows as
+        // `drop_rows` renumbers the surviving rows: their pending flags
+        // must move with them, or a merged read marks the wrong rows as
         // written and answers with the pre-delete on-disk values (python
         // `test_taql_delete_insert_persist` read [5, 2] after deleting row 1
         // of [5, 2, 9]).

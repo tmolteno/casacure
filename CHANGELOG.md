@@ -5,6 +5,101 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.7] - 2026-09-25
+
+### Performance
+
+Measured on an MS-shaped table built by real python-casacore (100k rows;
+DATA complex [64,4], FLAG bool [64,4], WEIGHT float [4] on TiledShapeStMan;
+TIME/ANTENNA1 on IncrementalStMan; ANTENNA2/FLAG_ROW/UVW on StandardStMan),
+dask-ms-style 10k-row chunks, best of 3. Every value was verified
+bit-identical against real casacore (reads), and casacure-written outputs
+were read back by real casacore (writes, including untouched columns).
+
+- **Typed `getcolnp`/`getcol` for tiled and incremental columns.** The
+  borrowed-buffer read path (`Table::getcol_raw`, previously StandardStMan
+  only) now serves IncrementalStMan scalars and fixed-shape
+  TiledColumnStMan/TiledShapeStMan arrays, with a bit-packed variant
+  (`getcol_raw_bits`) for tiled Bool; cells whose file byte order matches the
+  host are one `memcpy` per row. `getcol` allocates its result array and uses
+  the same path. The columns that matter in a real MS all qualify, so dask-ms
+  reads no longer build one `RecordValue` per cell. getcolnp, casacure before
+  → after (casacore): DATA 114 → 27 ms (45), FLAG 34 → 2.4 (3.0), WEIGHT
+  20 → 1.1 (1.0), TIME 11.7 → 0.7 (0.7), ANTENNA1 385 → 1.0 (8.0).
+- **IncrementalStMan range reads are linear.** Every row used to re-parse
+  its bucket's whole interval index (two allocations sized to the bucket), so
+  a column that changes every row (MS `ANTENNA1`) was quadratic per bucket.
+  `IsmFile::for_each_cell_raw` parses each bucket's index once and walks it
+  forward with the rows.
+- **Tiled cell decode** uses a single `as_chunks` pass instead of a fallible
+  reader call per element; `Table::getcol` resolves the storage manager once
+  per call instead of per row (it cloned the SM type name per cell).
+- **Tiled column flushes write only the pending cells, in place.**
+  `patch_tsm_column` read the whole tile file, patched it in memory and
+  rewrote it for every flush: O(column) I/O per dask-ms chunk. It now
+  locates each pending cell with the reader's own geometry and row maps
+  (`TsmFile::cell_location`, which also honours `cube.file_offset` and the
+  TiledShapeStMan row map the old patch ignored), coalesces adjacent cells
+  and writes just those byte ranges; Bool edge bytes are read-modify-written
+  with mask clears instead of a per-bit loop.
+- **StandardStMan in-place patch applies to real MS layouts.** It refused any
+  DM holding an array/string column, even untouched, so FLAG_ROW (grouped
+  with UVW in an MS) rebuilt the whole SSM file on every flush. Only the
+  written columns must now be fixed-size scalars.
+- **`putcol` bridge**: rows are sub-slices of the numpy buffer (the old
+  `iter().skip(start)` re-walked from element 0 per row, quadratic in the
+  chunk), the handle/store locks are taken once per `putcol` instead of per
+  cell, and `putcell` no longer clones the column name per call.
+  putcol+flush per 10k-row chunk over 100k rows, before → after (casacore):
+  DATA 888 → 114 ms (37), FLAG 85 → 23 (3.5), FLAG_ROW 340 → 15 (5.1),
+  WEIGHT 25 → 18 (0.9). The remaining write gap is the per-cell
+  `RecordValue` buffering in `WritableTable`.
+- **The write buffer holds only the rows written.** `WritableTable` kept one
+  slot per TABLE row for every written column (`Vec<Option<RecordValue>>`
+  plus a pending bitset); the first write after each flush re-allocated and
+  initialised it and the flush freed it, so every chunk flush cost O(table
+  rows) whatever the chunk size. Each column now buffers a row -> cell map
+  of the written rows only, with a per-cell pending flag. Allocation per
+  one-row putcell + flush on a 131k-row table: TSM 8.4 MB → 7.8 KB (no
+  longer dependent on table size), SSM 8.5 MB → 90 KB (the rest is the
+  bucket index re-read per flush); a one-row putcol + flush from Python on a
+  100k-row table 0.35 → 0.058 ms. Trade-off: buffering a large chunk costs
+  ~0.17 µs more per cell than a pre-sized slot (10k-row putcol ~20% slower on
+  a 100k-row table, flush slightly faster, net about even there; the saving
+  grows with the table size). Pinned by `tests/flush_cost.rs`.
+- **An incremental flush parses `table.dat` once.** `flush()` parsed it for
+  the preserving check, `flush_preserving` parsed it again, and each tiled
+  column patch parsed it a third time for the endian flag; the parsed
+  header is now passed down. The effect on these benchmarks is within
+  noise (the file is small).
+
+### Fixed
+
+- **StandardStMan incremental flush wrote to the wrong column** when the
+  written column was not the data manager's first-indexed column in table
+  order: the SSM spec's `column_offset`/`col_index_map` were indexed by the
+  table column index instead of the column's position within the DM
+  (falling back to offset 0), overwriting another column's cells. Latent
+  until the in-place patch was enabled for MS-like DMs; guarded by
+  `ssm_patch_uses_within_dm_column_index`.
+- **Zero-row `getcol`** returns an empty array of the column's dtype
+  (casacore's behaviour) instead of `int32`.
+
+- **Storage errors name the file they came from.**  `storage error: Permission
+  denied (os error 13)` used to be the whole message, so a failure reaching a
+  user through dask-ms (`ndarray_putcol` -> `table.flush()`) named neither the
+  table nor the block at fault — while casacore names the file
+  (`RegularFileIO: error in open or create of file <path>: <cause>`).  Every
+  open in the storage managers now reports through `datafile::FileIoError`
+  (`<path>: <cause>`), and the write path's own `table.dat` / `table.fN` reads
+  and writes do the same, so the message reads
+
+      storage error: /data/out.ms/table.f0: Permission denied (os error 13)
+
+  The tiled storage manager's tile-file open also reports its real cause now:
+  it was mapped to `MissingTileFile` whatever had gone wrong, so a permission
+  error was reported as a missing file.  Reported as issue #12.
+
 ## [3.8.6] - 2026-09-24
 
 ### Benchmarks
