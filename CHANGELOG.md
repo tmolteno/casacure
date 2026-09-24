@@ -5,6 +5,20 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.6] - 2026-09-24
+
+### Benchmarks
+
+- **`BENCHMARK.md` refreshed** from a full rerun of every benchmark on a new
+  local machine (AMD Ryzen 5 5600G, 62 GB RAM, 2026-09-24). Highlights:
+  casacure `putcol` is now at or below python-casacore per cell (37–38 vs
+  50–53 ns/cell; 1.4× overall on the 20k bench), `getcol` is the remaining
+  gap at ~2.7×, and full-column dask-ms chunked reads hold casacore parity
+  (2.24 vs 2.23 GiB peak at `chunk = all`, ~180 MiB chunked; bounded reads at
+  the ~160–200 MiB stack baseline). Test counts unchanged and green: 137
+  passed / 1 skipped (Python), 151 lib + 15 integration + 6 python-crate
+  (Rust), clippy/fmt clean.
+
 ## [3.8.5] - 2026-09-24
 
 ### Performance
