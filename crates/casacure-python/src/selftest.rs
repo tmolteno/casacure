@@ -444,7 +444,7 @@ pub fn run_benchmark<'py>(py: Python<'py>) -> PyResult<()> {
         let _ = std::fs::remove_dir_all(&path);
     }
 
-    println!("\ncasacure benchmark (n = {n} rows, complex128 cell [4,4] per row):");
+    println!("\ncasacure benchmark (n = {n} rows, double scalar columns TIME and WEIGHT):");
     println!(
         "{:<22} {:>11} {:>11} {:>11}",
         "op", "casacure ms", "casacore ms", "cure/core"

@@ -13,6 +13,35 @@ Work areas are tracked as GitHub issues; subtasks live in `TODO.md`.
 | casacore comparison tests | `PYTHONPATH=/tmp/cpb:/tmp/shim .venv/bin/python -m pytest tests/` | 14/14 | type system + python-casacore `test_table.py` port (9 tests: datatypes, putdata, addcolumns, keywords, subset, subtables, tableascii, complete/required descs) |
 | write interop (manual) | `examples/create_sample_table.rs` + python-casacore | ✓ | casacure-write → casacore-read: SSM scalars, arrays, long strings, and ISM TIME/ANT1 in one 4-file table; 3-row and 100-row variants return exactly the written values |
 
+## Speed and memory relative to casacore (3.8.8)
+
+This is casacure / python-casacore 3.8.1 on the same machine and the same
+data, so **< 1 means casacure is faster or lighter**.  The method and raw
+numbers are in `BENCHMARK.md`.
+
+| workload | time | peak RSS |
+|---|---|---|
+| dask-ms chunked read of a 977 MiB DATA column, 25 000-row chunks | 1.03 | 1.04 |
+| same, 1000-row chunks | **0.40** | 1.35 |
+| dask-ms write of a new MS (256k rows, 2000-row chunks) | **0.60** | **0.80** |
+| skarabina flag + 32x average + `--msout`, MeerKAT scan (11 GB) | **0.80** | **0.77** |
+| skarabina flag, `--write-changed-only`, same scan | **0.62** | **0.54** |
+| `casacure-bench`: whole-column putcol / getcol / taql on a 20k-row cached table | 3.0 / 3.5 / 4.8 | — |
+
+**On MS-shaped work through dask-ms, casacure is at parity or faster.**
+Chunked scans and new MS writes are I/O-bound, and both flagging pipelines
+measured run 20-40 % faster, in 23-46 % less memory.  **On small, fully
+cached tables it is 3-5x slower per call**: the Python bridging and cell
+packaging dominate there, not I/O.  Before 3.8.8, writing a new table was
+the exception: memory grew with the table and time grew quadratically (57.6 s
+and 1.9 GiB for 256k rows, against casacore's 2.4 s and 234 MiB).
+
+Known gap found while benchmarking: StandardStMan **Direct** fixed-shape
+array columns (column option 5, e.g. UVW in an MS built by python-casacore's
+`default_ms`) store their data inline in the bucket.  casacure reads them as
+array-file references and fails ("array reference ... falls outside the
+array index file").  MeerKAT MSes keep UVW tiled and are not affected.
+
 ## Casacure-compatible packages
 
 Which packages that depend on casacore can run on casacure.

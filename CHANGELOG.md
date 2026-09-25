@@ -5,6 +5,8 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.8] - 2026-09-26
+
 ### Performance
 
 - **Writing a new table through dask-ms is bounded by the row chunk.**
@@ -60,6 +62,15 @@ subtasks are moved here.
   variable-shape array column are empty arrays of the column's type. They
   used to be a Double array and a one-element array respectively.
 - `as_contiguous_bytes` panicked on an empty array cell.
+- `scripts/bench_daskms_chunking.py` reports each read's own peak (the
+  child's VmHWM polled by the parent); `ru_maxrss` inherited the parent's
+  build-time peak.
+
+### Known issues
+
+- StandardStMan Direct fixed-shape array columns (option 5, e.g. the UVW of
+  an MS built by python-casacore's `default_ms`) store their cells inline in
+  the bucket.  casacure reads them as array-file references and fails.
 
 ## [3.8.7] - 2026-09-25
 

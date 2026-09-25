@@ -76,16 +76,36 @@ sys.stdout.flush()
 
 
 def read_sum(path, chunk):
+    """Run one chunked read in a fresh interpreter; (peak RSS MiB, read ms).
+
+    The peak is the child's /proc VmHWM polled by this process.  The child's
+    own ru_maxrss is not usable: it inherits the parent's high-water mark
+    across fork+exec, so after this process built the MS every chunk
+    reported the build's peak.
+    """
     env = dict(os.environ, TMPDIR=os.environ.get("TMPDIR", "/var/tmp"))
-    out = subprocess.run(
+    p = subprocess.Popen(
         [sys.executable, "-c", READ_BODY, path, str(chunk)],
-        capture_output=True,
+        stdout=subprocess.PIPE,
         text=True,
-        check=True,
         env=env,
     )
-    rss, ms = out.stdout.split()
-    return float(rss), float(ms)
+    peak_kib = 0
+    while p.poll() is None:
+        try:
+            with open(f"/proc/{p.pid}/status") as fh:
+                for line in fh:
+                    if line.startswith("VmHWM:"):
+                        peak_kib = max(peak_kib, int(line.split()[1]))
+                        break
+        except FileNotFoundError:
+            break
+        time.sleep(0.005)
+    out = p.stdout.read()
+    if p.returncode != 0:
+        raise RuntimeError(f"read at chunk {chunk} failed: {out}")
+    _, ms = out.split()
+    return peak_kib / 1024, float(ms)
 
 
 def main(path, nrows, nchan, ncorr):
