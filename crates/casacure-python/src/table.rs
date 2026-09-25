@@ -455,7 +455,7 @@ fn fill_numpy_raw(
                 // Decode straight from the mapped file into the caller's
                 // buffer with the GIL released (see fill_buffer_by_dtype), so
                 // the dask scheduler can overlap independent column reads.
-                py.allow_threads(|| {
+                py.detach(|| {
                     t.getcol_raw(col_idx, startrow, nrow, |_, bytes| {
                         let dst = &mut slice[row * count..(row + 1) * count];
                         if bytes.len() < count * sz {
@@ -530,7 +530,7 @@ fn fill_numpy_raw(
                 return Ok(false);
             }
             let mut row = 0usize;
-            py.allow_threads(|| {
+            py.detach(|| {
                 t.getcol_raw_bits(col_idx, startrow, nrow, |bytes, skip, nelem| {
                     if nelem != count || (skip + nelem).div_ceil(8) > bytes.len() {
                         return Err(short(bytes.len(), (skip + count).div_ceil(8)));
@@ -1211,7 +1211,7 @@ impl Table {
         }
         // Per-cell decode fallback; pure Rust, so run it with the GIL
         // released to let the scheduler overlap independent reads.
-        let cells = py.allow_threads(|| self.read_col(col_idx, startrow, nrow))?;
+        let cells = py.detach(|| self.read_col(col_idx, startrow, nrow))?;
         self.column_to_python(py, col_idx, &cells)
     }
 
@@ -1412,7 +1412,7 @@ impl Table {
         }
         // The per-cell decode is pure Rust; release the GIL so the dask
         // scheduler can overlap this read with independent work.
-        let cells = py.allow_threads(|| self.read_col(col_idx, startrow, nrow))?;
+        let cells = py.detach(|| self.read_col(col_idx, startrow, nrow))?;
         let cell = cell_shape_of(&cells).iter().product::<usize>().max(1);
         convert::fill_buffer_by_dtype(py, buf, &cells, cell)
     }
@@ -1436,7 +1436,7 @@ impl Table {
             nrow as u64
         };
         let col_idx = self.col_index(column)?;
-        let cells = py.allow_threads(|| self.read_colslice(col_idx, &blc, &trc, startrow, nrow))?;
+        let cells = py.detach(|| self.read_colslice(col_idx, &blc, &trc, startrow, nrow))?;
         self.column_to_python(py, col_idx, &cells)
     }
 
@@ -1461,7 +1461,7 @@ impl Table {
             nrow as u64
         };
         let col_idx = self.col_index(column)?;
-        let cells = py.allow_threads(|| self.read_colslice(col_idx, &blc, &trc, startrow, nrow))?;
+        let cells = py.detach(|| self.read_colslice(col_idx, &blc, &trc, startrow, nrow))?;
         let cell = cell_shape_of(&cells).iter().product::<usize>().max(1);
         convert::fill_buffer_by_dtype(py, buf, &cells, cell)
     }
@@ -2111,7 +2111,7 @@ impl Table {
         // cloned so the whole validation + store loop can run GIL-free.
         let desc = s.wt.desc().clone();
         let wt = &mut s.wt;
-        py.allow_threads(|| -> PyResult<()> {
+        py.detach(|| -> PyResult<()> {
             for (row, value) in (startrow..).zip(values) {
                 if let Some(col) = desc.columns.get(col_idx) {
                     if !record_fits_column(col, &value) {

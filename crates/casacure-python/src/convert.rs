@@ -151,7 +151,7 @@ pub(crate) fn fill_buffer_by_dtype(
                 let s = b
                     .as_slice_mut()
                     .map_err(|_| PyValueError::new_err("getcolnp: non-contiguous buffer"))?;
-                return py.allow_threads(|| fill_flat(s, cells, cell, $f, $s));
+                return py.detach(|| fill_flat(s, cells, cell, $f, $s));
             }
         }};
     }
