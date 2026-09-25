@@ -284,13 +284,13 @@ impl ArrayData {
     /// encoding element by element.
     pub fn as_contiguous_bytes(&self) -> Option<&[u8]> {
         use std::slice::from_raw_parts;
+        // The byte length is the slice's own `size_of_val`: taking the size of
+        // `$v[0]` indexed element 0 and panicked on an empty array cell (a
+        // variable-shape column between `addrows` and its first write).
         macro_rules! bytes {
             ($v:expr) => {
                 Some(unsafe {
-                    from_raw_parts(
-                        $v.as_ptr() as *const u8,
-                        $v.len().checked_mul(std::mem::size_of_val(&$v[0]))?,
-                    )
+                    from_raw_parts($v.as_ptr() as *const u8, std::mem::size_of_val(&$v[..]))
                 })
             };
         }
