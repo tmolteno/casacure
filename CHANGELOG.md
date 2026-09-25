@@ -5,6 +5,62 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Performance
+
+- **Writing a new table through dask-ms is bounded by the row chunk.**
+  dask-ms creates the output table and then writes it chunk by chunk: rows
+  appended per chunk (`addrows` + `putcol`), or all added up front
+  (`addrows(nrow)`, rows with a ROWID), with a `flush` after every column.
+  Each flush on a table larger than its files used to regenerate the whole
+  table from buffered `RecordValue`s. Peak memory grew with the table and
+  time was quadratic in it. Tables now **grow in place** (`grow.rs`):
+  - TSM tile files are zero-extended (sparse) and their headers rewritten.
+  - StandardStMan appends default buckets (topping up a partial last
+    bucket), rewrites its index into the existing bucket chain (extended when
+    it outgrows it), and appends default records for fixed-shape array
+    columns.
+  - IncrementalStMan re-encodes its last bucket and appends new ones.
+
+  The chunk just written is then patched in. That patch now covers every
+  storage manager:
+  - StandardStMan array columns (UVW, SIGMA, WEIGHT) are rewritten in place
+    when the shape is unchanged, otherwise appended.
+  - IncrementalStMan re-encodes only the buckets holding the chunk.
+
+  A dask-ms write of DATA/FLAG/WEIGHT_SPECTRUM/SIGMA/WEIGHT/TIME/... in
+  2000-row chunks, peak RSS and write time (`tests/test_write_scaling.py`):
+
+  | rows (table size) | before | now | python-casacore |
+  |---|---|---|---|
+  | 16 000 (23 MiB) | 242 MiB, 0.39 s | 137 MiB, 0.13 s | 188 MiB, 0.19 s |
+  | 64 000 (94 MiB) | 633 MiB, 4.1 s | 169 MiB, 0.42 s | 219 MiB, 0.67 s |
+  | 256 000 (375 MiB) | 1865 MiB, 57.6 s | 188 MiB, 1.45 s | 234 MiB, 2.4 s |
+  | 1 024 000 (1.5 GiB) | — | 224 MiB, 6.5 s | — |
+
+  Opening a table with `nrow > 0` from Python no longer buffers a zero cell
+  per row and array column; it writes the empty table and grows it.
+  Layouts that cannot be grown in place (casacore files with several SSM
+  column groups, string/record cells, a casacore-tiled hypercube, ...) keep
+  the whole-table rewrite.
+
+### Fixed
+
+- IncrementalStMan writer: rows were compared against the wrong previous row
+  after the first bucket, so a value recurring there opened no interval and
+  read back as the previous interval's value (a dask-ms MS lost SCAN_NUMBER
+  and FIELD_ID values).
+- The StandardStMan array file (`table.f{seq}i`) header stored only the low
+  byte of its length. casacore appends at the stored length, so a casacore
+  write to a casacure-written table overwrote array records past byte 255.
+  It is now the `Int64` casacore reads.
+- A 0-row TiledShapeStMan header left out its (empty) row-map blocks and
+  could not be reopened.
+- A tile file past 4 GiB is recorded with a TSMFile v2 (Int64) length.
+- An undefined (offset 0) StandardStMan array cell and the default of a
+  variable-shape array column are empty arrays of the column's type. They
+  used to be a Double array and a one-element array respectively.
+- `as_contiguous_bytes` panicked on an empty array cell.
+
 ## [3.8.7] - 2026-09-25
 
 ### Performance

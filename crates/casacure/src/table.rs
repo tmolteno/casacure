@@ -184,6 +184,19 @@ pub fn build_table_dat(
     dms: &[crate::columnset::DmBlob],
     col_dm_seq: &[u32],
 ) -> Result<Vec<u8>, TableCreateError> {
+    build_table_dat_with_seq_count(big_endian, nrow, desc, dms, col_dm_seq, dms.len() as u32)
+}
+
+/// [`build_table_dat`] with the ColumnSet's data-manager sequence counter
+/// given (casacore's counts every manager ever created, not the live ones).
+fn build_table_dat_with_seq_count(
+    big_endian: bool,
+    nrow: u64,
+    desc: &crate::tabledesc::TableDesc,
+    dms: &[crate::columnset::DmBlob],
+    col_dm_seq: &[u32],
+    seq_count: u32,
+) -> Result<Vec<u8>, TableCreateError> {
     let mut w = crate::aipsio::Writer::new();
     if nrow > u64::from(u32::MAX) {
         w.put_root_object_start("Table", 3);
@@ -201,7 +214,7 @@ pub fn build_table_dat(
         .cloned()
         .zip(col_dm_seq.iter().copied())
         .collect();
-    crate::columnset::write_multi_column_set(&mut w, nrow, dms.len() as u32, dms, &cols);
+    crate::columnset::write_multi_column_set(&mut w, nrow, seq_count, dms, &cols);
     w.put_object_end();
     Ok(w.into_bytes())
 }
@@ -697,8 +710,17 @@ fn build_ssm_data(
         col_index_map: vec![0; dm_cols.len()],
     };
     let f0i = if has_arrays {
+        // StManArrayFile header: [u32 version][Int64 file length], in the
+        // data-file byte order.  Only the low byte of the length used to be
+        // written, so real casacore appending to the file (it continues at
+        // the stored length) overwrote the records past byte 255.
         let mut f0i = vec![0u8; 16];
-        f0i[4] = (16 + array_index.len()) as u8;
+        let len = (16 + array_index.len()) as i64;
+        f0i[4..12].copy_from_slice(&if big_endian {
+            len.to_be_bytes()
+        } else {
+            len.to_le_bytes()
+        });
         f0i.extend_from_slice(&array_index);
         Some(f0i)
     } else {
@@ -1773,6 +1795,9 @@ pub struct WritableTable {
     /// A table/column keyword was written, so the header (`table.dat`) must
     /// be regenerated; an in-place data-only flush cannot preserve it.
     meta_dirty: bool,
+    /// Flushes that regenerated the whole table (tests assert a chunked
+    /// write stream never needs one after the first).
+    full_rewrites: u64,
 }
 
 /// Convert absolute `Table`-valued subtable references to the `./relative`
@@ -1868,6 +1893,7 @@ impl WritableTable {
             cells,
             touched,
             meta_dirty: false,
+            full_rewrites: 0,
         }
     }
 
@@ -2199,57 +2225,76 @@ impl WritableTable {
     /// Assemble the on-disk table from the buffered cells, filling missing
     /// scalar cells with their defaults; returns the table directory.
     ///
-    /// When the table already exists with the same schema and row count and
-    /// only some columns were written (`putcell`/`putcol`), casacore's
-    /// in-place semantics apply: exactly the data files of the written
+    /// When the table already exists with the same schema, casacore's
+    /// in-place semantics apply: only the data files of the written
     /// columns' data managers are updated, and every untouched column's
-    /// files (and the header) stay byte-identical.  Otherwise the whole
-    /// table is regenerated.
+    /// files stay byte-identical.  A table with more rows than its files
+    /// (`addrows`: dask-ms writing a new table chunk by chunk) is first
+    /// GROWN in place — each storage manager appends default rows without
+    /// re-encoding the rows it holds (see `grow.rs`).  Otherwise (a new
+    /// table, a changed schema, removed rows, a layout that cannot be grown)
+    /// the whole table is regenerated.
     ///
     /// The in-place path is INCREMENTAL: only rows written since the last
     /// flush are overlaid onto the on-disk files (TiledShape/TiledColumn
     /// bool tiles are patched byte-wise), the untouched rows are never
     /// re-encoded, and after a successful flush the column's buffered cell
     /// values are released — so a write stream of dask-ms chunks keeps at
-    /// most one chunk of values resident instead of the whole column.
+    /// most one chunk of values resident, and costs time linear in the
+    /// rows, however large the table.
     pub fn flush(&mut self) -> Result<std::path::PathBuf, WriteTableError> {
         let dir = self.dir.clone();
         let nrow = self.rows;
-        // Preservation is only possible when the on-disk table shares this
-        // schema and row count (a full regrowth is otherwise required).
-        // `table.dat` is read and parsed once here (only when the cheap
-        // checks pass) and handed to the preserving path, which used to
-        // re-read it — as did every tiled column patch.
-        let on_disk = (self.touched.len() == self.desc.columns.len()
-            && !self.meta_dirty
-            && self.touched.iter().any(|&t| t)
-            && self.touched.iter().any(|&t| !t))
-        .then(|| std::fs::read(dir.join("table.dat")).ok())
-        .flatten()
-        .and_then(|b| parse_table_dat(&b).ok())
-        .filter(|dat| {
-            dat.desc.columns.len() == self.desc.columns.len()
-                && dat.header.nrow == nrow
-                && dat
-                    .desc
-                    .columns
-                    .iter()
-                    .zip(self.desc.columns.iter())
-                    .all(|(a, b)| {
-                        a.name == b.name
-                            && a.data_manager_type == b.data_manager_type
-                            && a.data_manager_group == b.data_manager_group
-                    })
-        });
-        let Some(dat) = on_disk else {
+        // In place needs the on-disk table to share this schema and hold
+        // at most this many rows.  `table.dat` is read and parsed once here
+        // and handed to the preserving path.
+        let on_disk = (self.touched.len() == self.desc.columns.len())
+            .then(|| std::fs::read(dir.join("table.dat")).ok())
+            .flatten()
+            .and_then(|b| parse_table_dat(&b).ok())
+            .filter(|dat| {
+                dat.desc.columns.len() == self.desc.columns.len()
+                    && dat.column_set.columns.len() == self.desc.columns.len()
+                    && dat
+                        .desc
+                        .columns
+                        .iter()
+                        .zip(self.desc.columns.iter())
+                        .all(|(a, b)| {
+                            a.name == b.name
+                                && a.data_type == b.data_type
+                                && a.data_manager_type == b.data_manager_type
+                                && a.data_manager_group == b.data_manager_group
+                        })
+            });
+        // The row count the files hold: casacore's (the lock file's sync
+        // record first, then the header -- see `Table::open`).
+        let in_place = match &on_disk {
+            Some(dat) => {
+                let disk = lock_sync_nrrow(&dir)
+                    .filter(|&n| n != 0)
+                    .unwrap_or(dat.header.nrow);
+                disk == nrow || (disk < nrow && self.grow_in_place(&dir, dat, disk, nrow)?)
+            }
+            None => false,
+        };
+        let Some(dat) = on_disk.filter(|_| in_place) else {
             let values = self.materialize_all()?;
             create_table(&dir, &self.desc, &values)?;
+            self.full_rewrites += 1;
             // The regrowth wrote every cell: nothing is pending anymore.
             self.clear_all_pending();
             self.touched.fill(false);
+            self.meta_dirty = false;
             return Ok(dir);
         };
         self.flush_preserving(&dir, &dat)?;
+        // Keywords (and any other descriptor change) live in table.dat:
+        // regenerate it around the unchanged data managers.
+        if self.meta_dirty || dat.desc != self.desc {
+            self.rewrite_table_dat(&dir, &dat)?;
+            self.meta_dirty = false;
+        }
         // `touched` is scoped to the un-flushed writes of one session: a
         // later write round (possibly on a reused handle) must be judged
         // against the flushed state, not forever keep every previously
@@ -2258,6 +2303,123 @@ impl WritableTable {
         // preserving path again.
         self.touched.fill(false);
         Ok(dir)
+    }
+
+    /// Grow every data manager's files from `old` to `new` rows in place,
+    /// then the row counts in `table.dat` and the lock file.  Every manager
+    /// is checked first (a dry run), so a table with one layout that cannot
+    /// be grown is left untouched and `Ok(false)` sends the caller to the
+    /// whole-table rewrite.
+    fn grow_in_place(
+        &self,
+        dir: &std::path::Path,
+        dat: &TableDat,
+        old: u64,
+        new: u64,
+    ) -> Result<bool, WriteTableError> {
+        use crate::columnset::DataManagerBlob;
+        let big_endian = dat.header.big_endian;
+        for dry_run in [true, false] {
+            for dm in &dat.column_set.data_managers {
+                let seq = dm.sequence_nr;
+                let cols: Vec<usize> = (0..self.desc.columns.len())
+                    .filter(|&c| dat.column_set.columns[c].data_manager_seq == seq)
+                    .collect();
+                if cols.is_empty() {
+                    continue;
+                }
+                let cds: Vec<&crate::tabledesc::ColumnDesc> =
+                    cols.iter().map(|&c| &self.desc.columns[c]).collect();
+                let grown = match (dm.type_name.as_str(), &dm.blob) {
+                    ("StandardStMan", DataManagerBlob::StandardStMan(spec)) => {
+                        crate::grow::ssm_grow(dir, seq, big_endian, spec, &cds, old, new, dry_run)
+                    }
+                    ("IncrementalStMan", _) => {
+                        crate::grow::ism_update(dir, seq, big_endian, &cds, old, new, &[], dry_run)
+                    }
+                    ("TiledColumnStMan" | "TiledShapeStMan", _) if cols.len() == 1 => {
+                        // The shape of the cells being written, for a table
+                        // created empty with no shape in its descriptor.
+                        let pending_shape =
+                            self.pending_cells(cols[0]).find_map(|(_, v)| match v {
+                                RecordValue::Array(a) if !a.shape.is_empty() => {
+                                    Some(a.shape.iter().rev().map(|&d| i64::from(d)).collect())
+                                }
+                                _ => None,
+                            });
+                        crate::grow::tsm_grow(
+                            dir,
+                            seq,
+                            big_endian,
+                            &dm.type_name,
+                            cds[0],
+                            old,
+                            new,
+                            pending_shape,
+                            dry_run,
+                        )
+                    }
+                    _ => Ok(false),
+                }
+                .map_err(WriteTableError::Storage)?;
+                if !grown {
+                    if dry_run {
+                        return Ok(false);
+                    }
+                    return Err(WriteTableError::Storage(format!(
+                        "{}: data manager {seq} could not be grown after its check passed",
+                        dir.display()
+                    )));
+                }
+            }
+            if dry_run && !crate::grow::table_dat_nrow_fits(dir, new) {
+                return Ok(false);
+            }
+        }
+        crate::grow::patch_table_dat_nrow(dir, new).map_err(WriteTableError::Storage)?;
+        crate::grow::patch_lock_nrrow(dir, new).map_err(WriteTableError::Storage)?;
+        Ok(true)
+    }
+
+    /// Regenerate `table.dat` from this descriptor around the data managers
+    /// already on disk (their spec blobs and sequence numbers kept).
+    fn rewrite_table_dat(
+        &self,
+        dir: &std::path::Path,
+        dat: &TableDat,
+    ) -> Result<(), WriteTableError> {
+        use crate::columnset::{DataManagerBlob, DmBlob};
+        let dms: Vec<DmBlob> = dat
+            .column_set
+            .data_managers
+            .iter()
+            .map(|dm| DmBlob {
+                type_name: dm.type_name.clone(),
+                sequence_nr: dm.sequence_nr,
+                blob: match &dm.blob {
+                    DataManagerBlob::StandardStMan(spec) => {
+                        crate::columnset::write_standard_stman(spec)
+                    }
+                    DataManagerBlob::Unsupported(raw) => raw.clone(),
+                },
+            })
+            .collect();
+        let col_dm_seq: Vec<u32> = dat
+            .column_set
+            .columns
+            .iter()
+            .map(|c| c.data_manager_seq)
+            .collect();
+        let bytes = build_table_dat_with_seq_count(
+            dat.header.big_endian,
+            self.rows,
+            &self.desc,
+            &dms,
+            &col_dm_seq,
+            dat.column_set.seq_count.max(dms.len() as u32),
+        )?;
+        let path = dir.join("table.dat");
+        std::fs::write(&path, bytes).map_err(|e| WriteTableError::Storage(storage_error(&path, e)))
     }
 
     /// The whole cell store as per-column value lists — the input for a
@@ -2466,8 +2628,11 @@ impl WritableTable {
                     // Strings / records / array columns fall back to the
                     // full-column rebuild (their cells reference
                     // variable-size string / array buckets).
-                    let patched = dm.type_name == "StandardStMan"
-                        && self.patch_ssm_column(dir, seq, dat, &cols)?;
+                    let patched = if dm.type_name == "StandardStMan" {
+                        self.patch_ssm_column(dir, seq, dat, &cols)?
+                    } else {
+                        self.patch_ism_columns(dir, seq, dat, &cols)?
+                    };
                     if !patched {
                         // Full-column rebuild from the on-disk values
                         // overlaid with the pending rows (the fallback for
@@ -2590,9 +2755,12 @@ impl WritableTable {
         // (A real MS keeps FLAG_ROW in one StandardStMan with UVW and other
         // arrays; rejecting the DM for those forced a whole-file rebuild on
         // every chunk flush.)
+        // Array columns (UVW, SIGMA, WEIGHT) are patched too: their bucket
+        // cell is an 8-byte reference into the array file, whose record is
+        // rewritten in place when the shape is unchanged, else appended.
         if cols.iter().filter(|&&c| self.has_pending(c)).any(|&c| {
             let cd = &self.desc.columns[c];
-            !matches!(cd.kind, ColumnKind::Scalar(_)) || cd.data_type == DataType::String
+            matches!(cd.kind, ColumnKind::Record) || cd.data_type == DataType::String
         }) {
             return Ok(false);
         }
@@ -2621,8 +2789,102 @@ impl WritableTable {
         // and whole-byte cell replacements for fixed-size scalar cells.
         let mut bit_ops: BTreeMap<u32, BTreeMap<usize, (u8, u8)>> = BTreeMap::new();
         let mut byte_patches: BTreeMap<u32, Vec<(usize, Vec<u8>)>> = BTreeMap::new();
+        let mut array_file: Option<crate::grow::ArrayFile> = None;
         for &col in cols {
             let cd = self.desc.columns[col].clone();
+            if matches!(cd.kind, ColumnKind::Array) {
+                if !self.has_pending(col) {
+                    continue;
+                }
+                let within = dat
+                    .column_set
+                    .columns
+                    .iter()
+                    .take(col)
+                    .filter(|c| c.data_manager_seq == seq)
+                    .count();
+                let (Some(&index_nr), Some(&column_offset)) = (
+                    spec.col_index_map.get(within),
+                    spec.column_offset.get(within),
+                ) else {
+                    return Ok(false);
+                };
+                let Some(index) = parsed.indices.get(index_nr as usize) else {
+                    return Ok(false);
+                };
+                if array_file.is_none() {
+                    array_file = Some(
+                        crate::grow::ArrayFile::open(dir, seq, big_endian)
+                            .map_err(WriteTableError::Storage)?,
+                    );
+                }
+                let af = array_file.as_mut().unwrap();
+                let f0i = parsed.f0i().unwrap_or(&[]);
+                for (r, value) in self.pending_cells(col) {
+                    let RecordValue::Array(arr) = value else {
+                        return Ok(false);
+                    };
+                    let Ok(record) = crate::ssm::encode_array_record(big_endian, cd.data_type, arr)
+                    else {
+                        return Ok(false);
+                    };
+                    let Some(bucket) = index.find(r) else {
+                        return Ok(false);
+                    };
+                    let at = column_offset as usize
+                        + (r - bucket.start_row) as usize * crate::ssm::ARRAY_REF_SIZE as usize;
+                    let (cell, _) = parsed
+                        .cell_bytes(
+                            index_nr as usize,
+                            column_offset,
+                            r,
+                            crate::ssm::ARRAY_REF_SIZE,
+                        )
+                        .map_err(|e| WriteTableError::Storage(e.to_string()))?;
+                    let cell: [u8; 8] = cell[..8].try_into().unwrap();
+                    let off = if big_endian {
+                        i64::from_be_bytes(cell)
+                    } else {
+                        i64::from_le_bytes(cell)
+                    };
+                    // Rewrite in place when the stored record has the same
+                    // [ndim][dims] (hence the same size) and is not shared.
+                    let head = 4 + 4 * arr.shape.len();
+                    let in_place = usize::try_from(off)
+                        .ok()
+                        .filter(|&o| o > 0)
+                        .is_some_and(|o| {
+                            let p = o + if af.refcount { 4 } else { 0 };
+                            let unshared = !af.refcount
+                                || f0i.get(o..o + 4).is_some_and(|c| {
+                                    let c: [u8; 4] = c.try_into().unwrap();
+                                    1 == if big_endian {
+                                        u32::from_be_bytes(c)
+                                    } else {
+                                        u32::from_le_bytes(c)
+                                    }
+                                });
+                            unshared
+                                && f0i.len() >= p + record.len()
+                                && f0i[p..p + head] == record[..head]
+                        });
+                    if in_place {
+                        af.rewrite(off as u64, record);
+                    } else {
+                        let new_off = af.push(&record).map_err(WriteTableError::Storage)?;
+                        let bytes = if big_endian {
+                            new_off.to_be_bytes()
+                        } else {
+                            new_off.to_le_bytes()
+                        };
+                        byte_patches
+                            .entry(bucket.number)
+                            .or_default()
+                            .push((at, bytes.to_vec()));
+                    }
+                }
+                continue;
+            }
             let cell_size = u64::from(scalar_cell_size(&cd));
             let is_bit_cell = cd.data_type == DataType::Bool;
             let cell_bits = if is_bit_cell { 1 } else { cell_size * 8 };
@@ -2702,7 +2964,43 @@ impl WritableTable {
             file.write_all(&buf)
                 .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
         }
+        if let Some(af) = array_file {
+            af.finish().map_err(WriteTableError::Storage)?;
+        }
         Ok(true)
+    }
+
+    /// Re-encode, in place, only the IncrementalStMan buckets of data
+    /// manager `seq` that hold pending rows (see `grow::ism_update`).
+    /// `Ok(false)` when the file cannot be patched so (strings, a bucket
+    /// too full to re-encode), leaving the caller's full rebuild.
+    fn patch_ism_columns(
+        &self,
+        dir: &std::path::Path,
+        seq: u32,
+        dat: &TableDat,
+        cols: &[usize],
+    ) -> Result<bool, WriteTableError> {
+        let big_endian = dat.header.big_endian;
+        let mut pending: Vec<Vec<(u64, Vec<u8>)>> = Vec::with_capacity(cols.len());
+        for &col in cols {
+            let cd = &self.desc.columns[col];
+            let mut cells = Vec::new();
+            for (r, v) in self.pending_cells(col) {
+                let Ok(cell) = crate::ssm::encode_scalar_cell(big_endian, cd, v) else {
+                    return Ok(false);
+                };
+                cells.push((r, cell));
+            }
+            pending.push(cells);
+        }
+        let cds: Vec<&crate::tabledesc::ColumnDesc> =
+            cols.iter().map(|&c| &self.desc.columns[c]).collect();
+        // Every check (and every existing bucket's re-encode) happens
+        // before `ism_update` writes anything, so one call suffices.
+        let nrow = self.rows;
+        crate::grow::ism_update(dir, seq, big_endian, &cds, nrow, nrow, &pending, false)
+            .map_err(WriteTableError::Storage)
     }
 
     /// One column's current values: its on-disk cells with the pending
@@ -2876,7 +3174,13 @@ pub fn default_cell_value(cd: &crate::tabledesc::ColumnDesc) -> Option<RecordVal
             // descriptor stores the reversed shape.
             let mut shape: Vec<i64> = cd.shape.clone().unwrap_or_default();
             shape.reverse();
-            let n = shape.iter().map(|&d| d.max(0) as usize).product();
+            // No shape (a variable-shape column) is an EMPTY array, not the
+            // one element the product over no dimensions would give.
+            let n = if shape.is_empty() {
+                0
+            } else {
+                shape.iter().map(|&d| d.max(0) as usize).product()
+            };
             let data = match cd.data_type {
                 crate::record::DataType::Bool => ArrayData::Bool(vec![false; n]),
                 crate::record::DataType::UChar => ArrayData::UChar(vec![0; n]),
@@ -5297,6 +5601,141 @@ mod tests {
                 "n={n}: {} bad rows, first {:?}",
                 bad.len(),
                 &bad[..bad.len().min(3)]
+            );
+        }
+    }
+
+    /// Growing in place: a table of every column kind a dask-ms MS uses is
+    /// written chunk by chunk -- rows appended per chunk (`append`) or all
+    /// added up front (`update`) -- and every cell reads back after every
+    /// flush, written or default, with no whole-table rewrite after the
+    /// first flush.  The chunks are uneven (partial SSM buckets topped up,
+    /// ISM values changing mid-bucket, TSM tiles crossed) and the SSM index
+    /// outgrows one bucket; a final pass rewrites a range in place (fixed
+    /// arrays overwritten, variable arrays reshaped).
+    #[test]
+    #[allow(clippy::needless_range_loop)] // (column, row) grids
+    fn growing_in_place_keeps_every_cell() {
+        use crate::record::{ArrayData, ArrayValue};
+        let mut var = array_col("VAR", DataType::Int, 0, vec![]);
+        var.shape = None;
+        var.ndim = -1;
+        let mut data = tsm_arr_col("DATA", DataType::Complex, vec![64, 4]);
+        data.data_manager_group = "DataGroup".into();
+        let mut flag = tsm_arr_col("FLAG", DataType::Bool, vec![64, 4]);
+        flag.data_manager_type = "TiledShapeStMan".into();
+        flag.data_manager_group = "FlagGroup".into();
+        let cols = vec![
+            scalar_col("I", DataType::Int, 0),
+            scalar_col("B", DataType::Bool, 0),
+            scalar_col("D", DataType::Double, 0),
+            array_col("SIG", DataType::Float, 4, vec![4]),
+            var,
+            ism_col("SCAN", DataType::Int, 0),
+            data,
+            flag,
+        ];
+        let arr = |shape: Vec<u32>, data: ArrayData| RecordValue::Array(ArrayValue { shape, data });
+        // `gen` distinguishes the first writes from the final rewrite.
+        let value = |c: usize, r: u64, gen: u64| -> RecordValue {
+            let g = gen as i64;
+            match c {
+                0 => RecordValue::Int((r as i64 * 3 + g) as i32),
+                1 => RecordValue::Bool((r + gen).is_multiple_of(3)),
+                2 => RecordValue::Double(r as f64 * 0.5 + g as f64),
+                3 => arr(
+                    vec![4],
+                    ArrayData::Float((0..4).map(|k| (r + k + gen) as f32).collect()),
+                ),
+                4 => {
+                    let n = ((r + gen) % 4) as u32;
+                    arr(
+                        vec![n],
+                        ArrayData::Int((0..n).map(|k| (r + u64::from(k)) as i32).collect()),
+                    )
+                }
+                5 => RecordValue::Int(((r + gen * 350) / 700) as i32),
+                6 => arr(
+                    vec![64, 4],
+                    ArrayData::Complex((0..256).map(|k| (r as f32, (k + gen) as f32)).collect()),
+                ),
+                _ => arr(
+                    vec![64, 4],
+                    ArrayData::Bool((0..256).map(|k| (r + k + gen).is_multiple_of(5)).collect()),
+                ),
+            }
+        };
+        let chunks: [u64; 9] = [1, 31, 1, 100, 2000, 3, 4096, 777, 2991];
+        let total: u64 = chunks.iter().sum();
+        for mode in ["append", "update"] {
+            let mut desc = typed_desc();
+            desc.columns = cols.clone();
+            let defaults: Vec<RecordValue> = desc
+                .columns
+                .iter()
+                .map(|cd| default_cell_value(cd).unwrap())
+                .collect();
+            let dir = temp_dir(&format!("grow-{mode}"));
+            let mut wt = WritableTable::create(&dir, desc);
+            wt.flush().unwrap(); // the empty table
+            if mode == "update" {
+                wt.addrows(total);
+            }
+            // (col, row) -> the generation written, if any
+            let mut written: Vec<Vec<Option<u64>>> = vec![vec![None; total as usize]; cols.len()];
+            let check = |wt: &WritableTable, written: &Vec<Vec<Option<u64>>>, what: &str| {
+                let t = Table::open(&dir, false).unwrap();
+                assert_eq!(t.nrows(), wt.nrows(), "{mode} {what}: row count");
+                for c in 0..cols.len() {
+                    let got = t.getcol(c, 0, t.nrows()).unwrap();
+                    for (r, v) in got.iter().enumerate() {
+                        let want = written[c][r]
+                            .map_or_else(|| defaults[c].clone(), |g| value(c, r as u64, g));
+                        assert_eq!(*v, want, "{mode} {what}: column {} row {r}", cols[c].name);
+                    }
+                }
+            };
+            let mut start = 0u64;
+            for (k, &n) in chunks.iter().enumerate() {
+                if mode == "append" {
+                    wt.addrows(n);
+                }
+                for c in 0..cols.len() {
+                    // Chunk 2 leaves the array columns and chunk 5 every
+                    // column unwritten: those rows keep their defaults.
+                    if k == 5 || (k == 2 && matches!(c, 3 | 4 | 6 | 7)) {
+                        continue;
+                    }
+                    let vals: Vec<RecordValue> =
+                        (start..start + n).map(|r| value(c, r, 0)).collect();
+                    wt.putcol(c, start, &vals).unwrap();
+                    wt.flush().unwrap();
+                    for r in start..start + n {
+                        written[c][r as usize] = Some(0);
+                    }
+                }
+                wt.flush().unwrap();
+                check(&wt, &written, &format!("chunk {k}"));
+                start += n;
+            }
+            // Rewrite a range spanning buckets, tiles and ISM intervals.
+            for c in 0..cols.len() {
+                let vals: Vec<RecordValue> = (1500..6500).map(|r| value(c, r, 1)).collect();
+                wt.putcol(c, 1500, &vals).unwrap();
+                for r in 1500..6500 {
+                    written[c][r] = Some(1);
+                }
+            }
+            wt.flush().unwrap();
+            check(&wt, &written, "rewrite");
+            assert_eq!(
+                wt.full_rewrites, 1,
+                "{mode}: only the empty table is written whole"
+            );
+            let f = crate::ssm::StandardStManFile::open(&dir, 0, false).unwrap();
+            assert!(
+                f.header.nr_index_buckets > 1,
+                "{mode}: the SSM index chain grew"
             );
         }
     }

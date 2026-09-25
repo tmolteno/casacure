@@ -627,10 +627,27 @@ pub fn read_array_cell(
         i64::from_le_bytes(cell[0..8].try_into().unwrap())
     };
     if offset == 0 {
-        // casacore stores empty array cells as a null (offset 0) reference.
+        // casacore stores empty array cells as a null (offset 0) reference
+        // (also what a row added to a variable-shape column holds until it
+        // is written): an empty array of the column's type, as the
+        // column default (`default_cell_value`) has.
+        let data = match desc.data_type {
+            DataType::Bool => ArrayData::Bool(Vec::new()),
+            DataType::UChar | DataType::Char => ArrayData::UChar(Vec::new()),
+            DataType::Short => ArrayData::Short(Vec::new()),
+            DataType::UShort => ArrayData::UShort(Vec::new()),
+            DataType::Int => ArrayData::Int(Vec::new()),
+            DataType::UInt => ArrayData::UInt(Vec::new()),
+            DataType::Int64 => ArrayData::Int64(Vec::new()),
+            DataType::Float => ArrayData::Float(Vec::new()),
+            DataType::Complex => ArrayData::Complex(Vec::new()),
+            DataType::DComplex => ArrayData::DComplex(Vec::new()),
+            DataType::String => ArrayData::String(Vec::new()),
+            _ => ArrayData::Double(Vec::new()),
+        };
         return Ok(RecordValue::Array(ArrayValue {
             shape: Vec::new(),
-            data: crate::record::ArrayData::Double(Vec::new()),
+            data,
         }));
     }
     // Multidim string arrays are stored in the string buckets: the cell is
@@ -1292,6 +1309,80 @@ fn write_index_stream(
     }
     iw.put_object_end();
     iw.put_object_end();
+}
+
+/// Serialize one `SSMIndex` object for arbitrary buckets: `last_row[i]`
+/// is the last row held by data bucket `bucket_number[i]`.  Version 1
+/// (u32 rows) unless a row needs 64 bits (version 2, `Block<rownr_t>`).
+/// The free-space map is written empty.
+pub fn encode_ssm_index(
+    big_endian: bool,
+    rows_per_bucket: u32,
+    nr_columns: usize,
+    last_row: &[u64],
+    bucket_number: &[u32],
+) -> Vec<u8> {
+    let wide = last_row.last().is_some_and(|&r| r > u64::from(u32::MAX));
+    let mut iw = if big_endian {
+        crate::aipsio::Writer::new()
+    } else {
+        crate::aipsio::Writer::new_le()
+    };
+    iw.put_root_object_start("SSMIndex", if wide { 2 } else { 1 });
+    iw.put_u32(last_row.len() as u32); // itsNUsed
+    iw.put_u32(rows_per_bucket);
+    iw.put_i32(nr_columns as i32);
+    iw.put_object_start("SimpleOrderedMap", 1);
+    iw.put_i32(0); // old default value
+    iw.put_u32(0); // size
+    iw.put_u32(1); // old increment
+    iw.put_object_end();
+    iw.put_object_start("Block", 1);
+    iw.put_u32(last_row.len() as u32);
+    for &r in last_row {
+        if wide {
+            iw.put_u64(r);
+        } else {
+            iw.put_u32(r as u32);
+        }
+    }
+    iw.put_object_end();
+    iw.put_object_start("Block", 1);
+    iw.put_u32(bucket_number.len() as u32);
+    for &b in bucket_number {
+        iw.put_u32(b);
+    }
+    iw.put_object_end();
+    iw.put_object_end();
+    iw.into_bytes()
+}
+
+/// Serialize the StandardStMan data-file header (it must fit in
+/// [`DATA_START`] bytes): v2 is big endian with no flag, v3 carries the
+/// endian flag.
+pub fn encode_ssm_header(h: &StandardStManHeader) -> Vec<u8> {
+    let mut hw = if h.big_endian {
+        crate::aipsio::Writer::new()
+    } else {
+        crate::aipsio::Writer::new_le()
+    };
+    hw.put_root_object_start("StandardStMan", h.version);
+    if h.version >= 3 {
+        hw.put_bool(h.big_endian);
+    }
+    hw.put_u32(h.bucket_size);
+    hw.put_u32(h.nr_buckets);
+    hw.put_u32(h.pers_cache_size);
+    hw.put_u32(h.n_free_bucket);
+    hw.put_i32(h.first_free_bucket);
+    hw.put_u32(h.nr_index_buckets);
+    hw.put_i32(h.first_index_bucket);
+    hw.put_i32(h.index_bucket_offset);
+    hw.put_i32(h.last_string_bucket);
+    hw.put_u32(h.index_length);
+    hw.put_u32(h.nr_index);
+    hw.put_object_end();
+    hw.into_bytes()
 }
 
 /// Encode one scalar cell for `desc`/`value` into the exact

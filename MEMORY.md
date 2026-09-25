@@ -101,6 +101,45 @@ one chunk peaks 417 MiB in casacure vs 331 MiB in casacore (1.26×), and the
 (casacure is still ~2.1× casacore on the flag workload — the separate speed
 lead).
 
+## The write path (dask-ms writing a NEW table)
+
+dask-ms writes a new output table (an averaged `--msout`, a flag-version
+backup) chunk by chunk. It either appends each chunk's rows (`addrows` +
+`putcol`) or adds all rows up front (`addrows(nrow)`, rows with a ROWID), and
+it flushes after every column. Each such flush sees a table with more rows
+than its files. casacure used to regenerate the whole table from buffered
+cells at every one, so the peak grew with the table and time was quadratic
+in it.
+
+casacure now **grows the files in place** (`crates/casacure/src/grow.rs`):
+- TSM tile files are zero-extended.
+- StandardStMan appends default buckets and rewrites its index.
+- IncrementalStMan re-encodes its last bucket and appends new ones.
+
+The written chunk is then patched in:
+- TSM cells are patched byte-wise.
+- StandardStMan scalar cells are patched in their buckets, and array records
+  in the array file.
+- IncrementalStMan re-encodes only the buckets that hold the chunk.
+
+Resident memory is one chunk of cells; I/O and time are linear in the rows.
+
+`tests/test_write_scaling.py` measures DATA/FLAG/WEIGHT_SPECTRUM + SSM
+scalars/arrays + ISM columns in 2000-row chunks (peak RSS, write time):
+
+| rows (table) | casacure before | casacure now | casacore |
+|---|---|---|---|
+| 16 000 (23 MiB) | 242 MiB, 0.39 s | 137 MiB, 0.13 s | 188 MiB, 0.19 s |
+| 64 000 (94 MiB) | 633 MiB, 4.1 s | 169 MiB, 0.42 s | 219 MiB, 0.67 s |
+| 256 000 (375 MiB) | 1865 MiB, 57.6 s | 188 MiB, 1.45 s | 234 MiB, 2.4 s |
+| 1 024 000 (1.5 GiB) | — | 224 MiB, 6.5 s | — |
+
+The append and update patterns measure the same. A layout that cannot be
+grown in place keeps the whole-table rewrite. Such layouts are:
+- a casacore-written file with several SSM column groups;
+- string or record cells in a grown StandardStMan;
+- a casacore-tiled hypercube.
+
 ## History
 
 | stage | memory behaviour |
@@ -110,6 +149,7 @@ lead).
 | + `MADV_DONTNEED` on bulk reads | full pass streams at ~the working set (164 MiB), no whole-file floor |
 | **+ typed-buffer `getcolnp`** | SSM numeric cells decode straight from the map into the numpy buffer (no per-cell `Vec<RecordValue>`), so a single whole-column read holds ~1 full buffer + the read window (2.2 GiB, casacore parity) |
 | **+ lazy cell store** | a writable open allocates nothing (the row count is authoritative; a column's cells are allocated on first write), so the dask-ms changed-only write path reaches parity: 801 → 80 MiB to open `bpcal.ms` writable, and 4.0× → 1.5× peak RSS on the flag workload |
+| **+ growth in place** | a flush on a table with more rows than its files appends default rows to each storage manager instead of regenerating the table, so writing a NEW table through dask-ms is chunk-bounded: 1865 → 188 MiB and 57.6 → 1.45 s for 256k rows, below casacore |
 
 ## How it works
 

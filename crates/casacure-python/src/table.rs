@@ -650,42 +650,14 @@ impl Table {
         if let Some(desc_string) = desc_json {
             let desc = core::tabledesc::TableDesc::from_desc_json(desc_string).map_err(err)?;
             let mut wt = core::WritableTable::create(&dir, desc);
+            // Write the empty table, then grow it: the growth appends
+            // default rows in place (zeroed tiles, default buckets, empty or
+            // zeroed array cells -- casacore's defaults), where buffering
+            // one default cell per row and array column before the first
+            // flush cost memory and time in the table's size.
             if nrow > 0 {
+                let _ = wt.flush().map_err(err)?;
                 wt.addrows(nrow);
-                // Array columns have no default: fill zeros when the caller
-                // did not provide values (casacore fills with the default).
-                let defs: Vec<(usize, DataType, Option<Vec<i64>>)> = wt
-                    .desc()
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, c)| match c.kind {
-                        core::tabledesc::ColumnKind::Array => {
-                            Some((i, c.data_type, c.shape.clone()))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                for (col_idx, dt, shape) in defs {
-                    // Fixed-shape columns default to zeros; variable-shape
-                    // columns to an empty array.
-                    let arr = match &shape {
-                        Some(s) => {
-                            let n = s.iter().map(|&d| d.max(0) as usize).product();
-                            RecordValue::Array(core::record::ArrayValue {
-                                shape: s.iter().map(|&d| d.max(0) as u32).collect(),
-                                data: zero_elements(dt, n),
-                            })
-                        }
-                        None => RecordValue::Array(core::record::ArrayValue {
-                            shape: vec![],
-                            data: zero_elements(dt, 0),
-                        }),
-                    };
-                    for r in 0..nrow {
-                        wt.putcell(col_idx, r, arr.clone()).map_err(err)?;
-                    }
-                }
             }
             let _ = wt.flush().map_err(err)?;
             let read = ::casacure::Table::open(&dir, false).map_err(err)?;

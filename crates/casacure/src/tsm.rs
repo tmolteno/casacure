@@ -899,12 +899,20 @@ fn tsm_header(p: TsmHeaderParams<'_>) -> Vec<u8> {
         hw.put_bool(false); // file[0]: placeholder, absent
     }
     hw.put_bool(true);
-    hw.put_u32(1); // TSMFile version
+    // TSMFile::putObject: version 1 stores the length as a u32; a tile file
+    // past the u32 range needs version 2 (Int64 length), which casacore and
+    // `parse_header` both read.
+    let wide = tile_file_len as u64 > u64::from(u32::MAX);
+    hw.put_u32(if wide { 2 } else { 1 }); // TSMFile version
     hw.put_u32(real_file_seq as u32); // TSMFile sequence number
-    hw.put_u32(tile_file_len as u32); // TSMFile length
-                                      // Cubes: TiledShapeStMan keeps a placeholder cube 0 (extensible=false,
-                                      // no shape, file -1) and the real cube at index 1; the singleHypercube
-                                      // row maps reference that index.
+    if wide {
+        hw.put_u64(tile_file_len as u64); // TSMFile length
+    } else {
+        hw.put_u32(tile_file_len as u32);
+    }
+    // Cubes: TiledShapeStMan keeps a placeholder cube 0 (extensible=false,
+    // no shape, file -1) and the real cube at index 1; the singleHypercube
+    // row maps reference that index.
     let nrcube: u32 = if is_shape { 2 } else { 1 };
     hw.put_u32(nrcube);
     if is_shape {
@@ -936,7 +944,13 @@ fn tsm_header(p: TsmHeaderParams<'_>) -> Vec<u8> {
         // one entry mapping row nrow-1 to cube 1 at position nrow-1.
         put_iposition(&mut hw, &tile_shape);
         if nrow == 0 {
+            // casacore's putBlock writes the (empty) Block objects even
+            // with no entries, and both readers expect them: leaving them
+            // out made an empty table unreadable ("buffer too short").
             hw.put_u32(0);
+            write_block(&mut hw, &[]);
+            write_block(&mut hw, &[]);
+            write_block(&mut hw, &[]);
         } else {
             hw.put_u32(1);
             write_block(&mut hw, &[nrow as u32 - 1]);
@@ -946,6 +960,76 @@ fn tsm_header(p: TsmHeaderParams<'_>) -> Vec<u8> {
     }
     hw.put_object_end(); // stman_type
     hw.into_bytes()
+}
+
+/// The header of a casacure-layout TSM column of `nrow` rows (one real
+/// cube, default tiles), the length its tile file must have, and the tile
+/// file's sequence number: what growing a column in place rewrites.  The
+/// tile data itself is unchanged by growth — tile `t` stays at
+/// `t * bucket_size` and new rows land in zeroed (default) bytes.
+pub(crate) fn tsm_grown_header(
+    stman_type: &str,
+    big_endian: bool,
+    seq_nr: u32,
+    hypercolumn_name: &str,
+    data_type: DataType,
+    cell_shape: &[i64],
+    nrow: u64,
+) -> Result<(Vec<u8>, u64, u32), TsmError> {
+    let layout = tsm_layout(cell_shape, data_type, nrow)?;
+    let tile_file_len = layout.bucket_size * layout.n_tiles as usize;
+    let hdr = tsm_header(TsmHeaderParams {
+        stman_type,
+        big_endian,
+        seq_nr,
+        hypercolumn_name,
+        data_type,
+        cell_shape,
+        nrow,
+        layout: &layout,
+        tile_file_len,
+    });
+    let file_seq = u32::from(stman_type == "TiledShapeStMan");
+    Ok((hdr, tile_file_len as u64, file_seq))
+}
+
+/// Whether `header` has exactly the layout casacure writes for a column of
+/// `cell_shape` cells (CASA order): one real cube at file offset 0 with the
+/// default tile shape, in the tile file [`tsm_grown_header`] names, and
+/// (TiledShapeStMan) the single-hypercube row map.  Only such a column can
+/// be grown in place by rewriting its header.
+pub(crate) fn is_casacure_layout(
+    header: &TsmHeader,
+    data_type: DataType,
+    cell_shape: &[i64],
+) -> bool {
+    let is_shape = header.root_type == "TiledShapeStMan";
+    let Ok(layout) = tsm_layout(cell_shape, data_type, header.nrrow) else {
+        return false;
+    };
+    let real = usize::from(is_shape);
+    let file_seq = real as u32;
+    if header.cubes.len() != real + 1 || header.files.len() != 1 {
+        return false;
+    }
+    if header.files[0].sequence_nr != file_seq {
+        return false;
+    }
+    let cube = &header.cubes[real];
+    let mut cube_shape = cell_shape.to_vec();
+    cube_shape.push(header.nrrow as i64);
+    let mut tile_shape = cell_shape.to_vec();
+    tile_shape.push(layout.rows_per_tile as i64);
+    let maps_ok = !is_shape
+        || (header.nrrow == 0 && header.row_map.is_empty())
+        || (header.row_map == [header.nrrow as u32 - 1]
+            && header.cube_map == [1]
+            && header.pos_map == [header.nrrow as u32 - 1]);
+    cube.file_seq_nr == file_seq as i32
+        && cube.file_offset == 0
+        && cube.cube_shape == cube_shape
+        && cube.tile_shape == tile_shape
+        && maps_ok
 }
 
 /// Write a whole bool column straight from its row bit-slices: the

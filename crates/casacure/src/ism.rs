@@ -31,6 +31,9 @@ use thiserror::Error;
 /// the StandardStMan bucket cache start offset).
 pub const DATA_START: usize = 512;
 
+/// The bucket size casacure writes (casacore's default).
+pub const ISM_BUCKET_SIZE: usize = 32768;
+
 /// Errors from reading an IncrementalStMan data file.
 #[derive(Debug, Error)]
 pub enum IsmError {
@@ -431,13 +434,10 @@ pub struct WriteIsmColumn<'a> {
 /// in a column share one stored value (an interval entry), exactly as
 /// `ISMBucket::addData` does.
 pub fn write_ism_file(big_endian: bool, n_rows: u64, cols: &[WriteIsmColumn<'_>]) -> Vec<u8> {
-    let ncols = cols.len();
     // Match casacore's default ISM bucket size; rows per bucket constrained
     // so data + per-column index fit.
-    let bucket_size = 32768usize;
-    let sum_sizes: usize = cols.iter().map(|c| c.cell_size as usize).sum();
-    let per_row = sum_sizes + 8 * ncols;
-    let rows_per_bucket = ((bucket_size.saturating_sub(4 * ncols)) / per_row.max(1)).max(1);
+    let bucket_size = ISM_BUCKET_SIZE;
+    let rows_per_bucket = ism_rows_per_bucket(bucket_size, cols);
     let nr_buckets = n_rows.div_ceil(rows_per_bucket as u64) as usize;
 
     let mut file = Vec::with_capacity(512 + nr_buckets * bucket_size + 256);
@@ -467,78 +467,157 @@ pub fn write_ism_file(big_endian: bool, n_rows: u64, cols: &[WriteIsmColumn<'_>]
     for b in 0..nr_buckets {
         let start_row = b as u64 * rows_per_bucket as u64;
         let end_row = (start_row + rows_per_bucket as u64).min(n_rows);
-        let mut data: Vec<u8> = Vec::new();
-        // Per column: (intrabucket start row, data offset) of each interval.
-        let mut starts: Vec<Vec<u32>> = vec![Vec::new(); ncols];
-        let mut offsets: Vec<Vec<u32>> = vec![Vec::new(); ncols];
-        // Whether a row repeats the previous row's value, per column: an
-        // ABSOLUTE row index into the column bytes.  It used to hold the
-        // bucket-relative index, so every bucket after the first compared
-        // against a row near the start of the table, and a value that happened
-        // to match it opened no interval -- the rows then read back the
-        // previous interval's value (279 lost SCAN_NUMBER rows in a dask-ms MS).
-        let mut prev: Vec<Option<u64>> = vec![None; ncols];
-        for row in start_row..end_row {
-            for (c, col) in cols.iter().enumerate() {
-                let cell = &col.bytes[(row * col.cell_size as u64) as usize
-                    ..((row + 1) * col.cell_size as u64) as usize];
-                let same_as_prev = prev[c].is_some_and(|pr| {
-                    let prev_cell = &col.bytes[(pr * col.cell_size as u64) as usize
-                        ..((pr + 1) * col.cell_size as u64) as usize];
-                    prev_cell == cell
-                });
-                if !same_as_prev {
-                    starts[c].push((row - start_row) as u32);
-                    offsets[c].push(data.len() as u32);
-                    data.extend_from_slice(cell);
-                }
-                prev[c] = Some(row);
-            }
-        }
-        // indexOffset = dataLeng + 4; 32-bit rows (high bit clear).
-        let index_offset = (data.len() + 4) as u32;
-        let mut bucket = vec![0u8; bucket_size];
-        put_u32_e(&mut bucket, 0, index_offset, big_endian);
-        bucket[4..4 + data.len()].copy_from_slice(&data);
-        let mut pos = 4usize + data.len();
-        for c in 0..ncols {
-            put_u32_e(&mut bucket, pos, starts[c].len() as u32, big_endian);
-            pos += 4;
-            for &s in &starts[c] {
-                put_u32_e(&mut bucket, pos, s, big_endian);
-                pos += 4;
-            }
-            for &o in &offsets[c] {
-                put_u32_e(&mut bucket, pos, o, big_endian);
-                pos += 4;
-            }
-        }
+        let slices: Vec<WriteIsmColumn<'_>> = cols
+            .iter()
+            .map(|col| WriteIsmColumn {
+                cell_size: col.cell_size,
+                bytes: &col.bytes[(start_row * col.cell_size as u64) as usize
+                    ..(end_row * col.cell_size as u64) as usize],
+            })
+            .collect();
+        let bucket = encode_ism_bucket(big_endian, bucket_size, end_row - start_row, &slices)
+            .expect("an ISM bucket of rows_per_bucket rows always fits");
         file.extend_from_slice(&bucket);
     }
 
     // ISMIndex at the end.
-    let mut iw = crate::aipsio::Writer::new();
-    if !big_endian {
-        iw = crate::aipsio::Writer::new_le();
-    }
-    iw.put_root_object_start("ISMIndex", 1);
-    iw.put_u32(nr_buckets as u32); // nused
-    iw.put_object_start("Block", 1);
-    iw.put_u32((nr_buckets + 1) as u32);
-    for b in 0..=nr_buckets {
-        let boundary = (b as u64 * rows_per_bucket as u64).min(n_rows) as u32;
-        iw.put_u32(boundary);
-    }
-    iw.put_object_end();
-    iw.put_object_start("Block", 1);
-    iw.put_u32(nr_buckets as u32);
-    for b in 0..nr_buckets {
-        iw.put_u32(b as u32);
-    }
-    iw.put_object_end();
-    iw.put_object_end();
-    file.extend_from_slice(&iw.into_bytes());
+    let boundaries: Vec<u64> = (0..=nr_buckets)
+        .map(|b| (b as u64 * rows_per_bucket as u64).min(n_rows))
+        .collect();
+    let numbers: Vec<u32> = (0..nr_buckets as u32).collect();
+    file.extend_from_slice(&encode_ism_index(big_endian, &boundaries, &numbers));
     file
+}
+
+/// The rows an IncrementalStMan bucket of `bucket_size` bytes can always
+/// hold, whatever the values: every row a new interval in every column
+/// (`[u32 indexOffset]` + the cells + per column `[u32 nr]` and a u32 row
+/// and u32 offset per interval).
+pub fn ism_rows_per_bucket(bucket_size: usize, cols: &[WriteIsmColumn<'_>]) -> usize {
+    let ncols = cols.len();
+    let sum_sizes: usize = cols.iter().map(|c| c.cell_size as usize).sum();
+    let per_row = sum_sizes + 8 * ncols;
+    (bucket_size.saturating_sub(4 + 4 * ncols) / per_row.max(1)).max(1)
+}
+
+/// Encode one IncrementalStMan bucket of `nrows` rows: `cols[c].bytes`
+/// holds exactly `nrows` cells of column `c`.  Consecutive rows with
+/// identical bytes share one stored value (an interval entry), exactly as
+/// `ISMBucket::addData` does.  `None` when the encoding does not fit.
+pub fn encode_ism_bucket(
+    big_endian: bool,
+    bucket_size: usize,
+    nrows: u64,
+    cols: &[WriteIsmColumn<'_>],
+) -> Option<Vec<u8>> {
+    let ncols = cols.len();
+    let mut data: Vec<u8> = Vec::new();
+    // Per column: (intrabucket start row, data offset) of each interval.
+    let mut starts: Vec<Vec<u32>> = vec![Vec::new(); ncols];
+    let mut offsets: Vec<Vec<u32>> = vec![Vec::new(); ncols];
+    for (c, col) in cols.iter().enumerate() {
+        let size = col.cell_size as usize;
+        let mut prev: Option<&[u8]> = None;
+        for row in 0..nrows as usize {
+            let cell = &col.bytes[row * size..(row + 1) * size];
+            if prev != Some(cell) {
+                starts[c].push(row as u32);
+                offsets[c].push(0);
+            }
+            prev = Some(cell);
+        }
+    }
+    // Lay the data out row-major across the columns (the order casacore's
+    // addData appends it), then fill in each interval's offset.
+    let mut next = vec![0usize; ncols];
+    for row in 0..nrows as usize {
+        for (c, col) in cols.iter().enumerate() {
+            if next[c] < starts[c].len() && starts[c][next[c]] as usize == row {
+                let size = col.cell_size as usize;
+                offsets[c][next[c]] = data.len() as u32;
+                data.extend_from_slice(&col.bytes[row * size..(row + 1) * size]);
+                next[c] += 1;
+            }
+        }
+    }
+    let index_len: usize = starts.iter().map(|s| 4 + 8 * s.len()).sum();
+    if 4 + data.len() + index_len > bucket_size {
+        return None;
+    }
+    // indexOffset = dataLeng + 4; 32-bit rows (high bit clear).
+    let index_offset = (data.len() + 4) as u32;
+    let mut bucket = vec![0u8; bucket_size];
+    put_u32_e(&mut bucket, 0, index_offset, big_endian);
+    bucket[4..4 + data.len()].copy_from_slice(&data);
+    let mut pos = 4usize + data.len();
+    for c in 0..ncols {
+        put_u32_e(&mut bucket, pos, starts[c].len() as u32, big_endian);
+        pos += 4;
+        for &s in &starts[c] {
+            put_u32_e(&mut bucket, pos, s, big_endian);
+            pos += 4;
+        }
+        for &o in &offsets[c] {
+            put_u32_e(&mut bucket, pos, o, big_endian);
+            pos += 4;
+        }
+    }
+    Some(bucket)
+}
+
+/// Serialize the `ISMIndex` object: `boundaries` holds the `nused + 1`
+/// ascending bucket-boundary rows, `numbers` the bucket of each range.
+/// Version 1 (u32 rows) unless a row needs 64 bits.
+pub fn encode_ism_index(big_endian: bool, boundaries: &[u64], numbers: &[u32]) -> Vec<u8> {
+    let wide = boundaries.last().is_some_and(|&r| r > u64::from(u32::MAX));
+    let mut iw = if big_endian {
+        crate::aipsio::Writer::new()
+    } else {
+        crate::aipsio::Writer::new_le()
+    };
+    iw.put_root_object_start("ISMIndex", if wide { 2 } else { 1 });
+    iw.put_u32(numbers.len() as u32); // nused
+    iw.put_object_start("Block", 1);
+    iw.put_u32(boundaries.len() as u32);
+    for &b in boundaries {
+        if wide {
+            iw.put_u64(b);
+        } else {
+            iw.put_u32(b as u32);
+        }
+    }
+    iw.put_object_end();
+    iw.put_object_start("Block", 1);
+    iw.put_u32(numbers.len() as u32);
+    for &n in numbers {
+        iw.put_u32(n);
+    }
+    iw.put_object_end();
+    iw.put_object_end();
+    iw.into_bytes()
+}
+
+/// Serialize the IncrementalStMan data-file header (padded to
+/// [`DATA_START`] by the caller): v4 is big endian with no flag, v5 carries
+/// the endian flag.
+pub fn encode_ism_header(h: &IsmHeader) -> Vec<u8> {
+    let mut hw = if h.big_endian {
+        crate::aipsio::Writer::new()
+    } else {
+        crate::aipsio::Writer::new_le()
+    };
+    hw.put_root_object_start("IncrementalStMan", h.version);
+    if h.version >= 5 {
+        hw.put_bool(h.big_endian);
+    }
+    hw.put_u32(h.bucket_size);
+    hw.put_u32(h.nbucket);
+    hw.put_u32(h.pers_cache_size);
+    hw.put_u32(h.uniq_nr);
+    hw.put_u32(h.n_free_bucket);
+    hw.put_i32(h.first_free_bucket);
+    hw.put_object_end();
+    hw.into_bytes()
 }
 
 /// Serialize the IncrementalStMan spec blob stored in `table.dat`
