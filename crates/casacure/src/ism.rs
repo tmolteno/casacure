@@ -471,14 +471,20 @@ pub fn write_ism_file(big_endian: bool, n_rows: u64, cols: &[WriteIsmColumn<'_>]
         // Per column: (intrabucket start row, data offset) of each interval.
         let mut starts: Vec<Vec<u32>> = vec![Vec::new(); ncols];
         let mut offsets: Vec<Vec<u32>> = vec![Vec::new(); ncols];
-        let mut prev: Vec<Option<u32>> = vec![None; ncols]; // prev row idx for eq test
+        // Whether a row repeats the previous row's value, per column: an
+        // ABSOLUTE row index into the column bytes.  It used to hold the
+        // bucket-relative index, so every bucket after the first compared
+        // against a row near the start of the table, and a value that happened
+        // to match it opened no interval -- the rows then read back the
+        // previous interval's value (279 lost SCAN_NUMBER rows in a dask-ms MS).
+        let mut prev: Vec<Option<u64>> = vec![None; ncols];
         for row in start_row..end_row {
             for (c, col) in cols.iter().enumerate() {
                 let cell = &col.bytes[(row * col.cell_size as u64) as usize
                     ..((row + 1) * col.cell_size as u64) as usize];
                 let same_as_prev = prev[c].is_some_and(|pr| {
-                    let prev_cell = &col.bytes[(pr as u64 * col.cell_size as u64) as usize
-                        ..((pr as u64 + 1) * col.cell_size as u64) as usize];
+                    let prev_cell = &col.bytes[(pr * col.cell_size as u64) as usize
+                        ..((pr + 1) * col.cell_size as u64) as usize];
                     prev_cell == cell
                 });
                 if !same_as_prev {
@@ -486,7 +492,7 @@ pub fn write_ism_file(big_endian: bool, n_rows: u64, cols: &[WriteIsmColumn<'_>]
                     offsets[c].push(data.len() as u32);
                     data.extend_from_slice(cell);
                 }
-                prev[c] = Some((row - start_row) as u32);
+                prev[c] = Some(row);
             }
         }
         // indexOffset = dataLeng + 4; 32-bit rows (high bit clear).

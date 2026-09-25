@@ -5211,4 +5211,93 @@ mod tests {
         );
         let _ = desc;
     }
+
+    /// The dask-ms append path in an order its threaded scheduler produces:
+    /// `addrows` per chunk interleaved with per-column `putcol` + `flush`, the
+    /// chunks written out of order.  Every written chunk must be on disk,
+    /// intact, after every step (found as 279 lost SCAN_NUMBER rows of an
+    /// IncrementalStMan column in a dask-ms-written MS).
+    #[test]
+    fn out_of_order_appends_keep_every_written_chunk() {
+        const C: u64 = 2000;
+        let mut desc = typed_desc();
+        desc.columns = vec![
+            ism_col("SCAN", DataType::Int, 0),
+            ism_col("FIELD", DataType::Int, 0),
+            scalar_col("TIME", DataType::Double, 0),
+            scalar_col("ANT1", DataType::Int, 0),
+        ];
+        let want = |col: usize, row: u64| -> RecordValue {
+            match col {
+                0 => RecordValue::Int((row / 5000 + 1) as i32),
+                1 => RecordValue::Int((row / 20000) as i32),
+                2 => RecordValue::Double(row as f64 * 8.0),
+                _ => RecordValue::Int((row % 61) as i32),
+            }
+        };
+        // Seed 3 of the Python emulation: A = addrows(C), Xk = write column X
+        // (S, F, T, N) chunk k.
+        let seq = "A A A F2 A A A A A S6 T3 T2 S7 F0 F1 N0 T5 F5 F3 S3 N5 S4 N6 T1 N1 F7 S2 \
+                   S0 S1 S5 F4 F6 T0 T4 T6 T7 N2 N3 N4 N7";
+        let dir = temp_dir("append-order");
+        let mut wt = WritableTable::create(&dir, desc);
+        wt.flush().unwrap(); // the 0-row table casacure writes at create
+        let mut written: Vec<(usize, u64)> = Vec::new();
+        for op in seq.split_whitespace() {
+            if op == "A" {
+                wt.addrows(C);
+                continue;
+            }
+            let col = "SFTN".find(&op[..1]).unwrap();
+            let k: u64 = op[1..].parse().unwrap();
+            let vals: Vec<RecordValue> = (k * C..(k + 1) * C).map(|r| want(col, r)).collect();
+            wt.putcol(col, k * C, &vals).unwrap();
+            wt.flush().unwrap();
+            written.push((col, k));
+            let t = Table::open(&dir, false).unwrap();
+            assert_eq!(t.nrows(), wt.nrows(), "after {op}: on-disk row count");
+            for &(c, kk) in &written {
+                let got = t.getcol(c, kk * C, C).unwrap();
+                for (i, v) in got.iter().enumerate() {
+                    let r = kk * C + i as u64;
+                    assert_eq!(*v, want(c, r), "after {op}: column {c} row {r}");
+                }
+            }
+        }
+    }
+
+    /// IncrementalStMan: a value that recurs after a different one (1, 0, 1)
+    /// must read back where it was written.
+    #[test]
+    fn ism_recurring_value_reads_back() {
+        let mut desc = typed_desc();
+        desc.columns = vec![ism_col("SCAN", DataType::Int, 0)];
+        for (n, runs) in [
+            (
+                6000u64,
+                vec![(0u64, 2000u64, 1), (2000, 4000, 0), (4000, 6000, 1)],
+            ),
+            (60, vec![(0, 20, 1), (20, 40, 0), (40, 60, 1)]),
+        ] {
+            let vals: Vec<RecordValue> = (0..n)
+                .map(|r| {
+                    let v = runs.iter().find(|(a, b, _)| r >= *a && r < *b).unwrap().2;
+                    RecordValue::Int(v)
+                })
+                .collect();
+            let dir = temp_dir(&format!("ism-recur-{n}"));
+            create_table(&dir, &desc, std::slice::from_ref(&vals)).unwrap();
+            let t = Table::open(&dir, false).unwrap();
+            let got = t.getcol(0, 0, n).unwrap();
+            let bad: Vec<u64> = (0..n)
+                .filter(|&r| got[r as usize] != vals[r as usize])
+                .collect();
+            assert!(
+                bad.is_empty(),
+                "n={n}: {} bad rows, first {:?}",
+                bad.len(),
+                &bad[..bad.len().min(3)]
+            );
+        }
+    }
 }
