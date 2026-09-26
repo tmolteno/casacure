@@ -259,3 +259,37 @@ def test_an_ms_antenna_table_from_casacore(tmp_path):
     path = str(tmp_path / "x.ms")
     _ok(_DEFAULT_MS, [path], _casacore_env(), "WRITTEN")
     _ok(_ANTENNA, [path], _casacure_env(), "CHECKED")
+
+
+_ZERO_LENGTH_WRITE = r"""
+import sys
+import numpy as np
+from casacore.tables import table, maketabdesc, makearrcoldesc
+t = table(sys.argv[1], maketabdesc([makearrcoldesc("RF", 0.0, 1)]), nrow=3, ack=False)
+t.putcell("RF", 0, np.zeros(0))
+t.putcell("RF", 1, np.array([1.0, 2.0]))
+t.putcell("RF", 2, np.zeros(0))
+t.close()
+print("WRITTEN")
+"""
+
+_ZERO_LENGTH_READ = r"""
+import sys
+import numpy as np
+from casacore.tables import table
+t = table(sys.argv[1], ack=False)
+assert np.asarray(t.getcell("RF", 0)).shape == (0,)
+assert np.array_equal(t.getcell("RF", 1), [1.0, 2.0])
+assert np.asarray(t.getcol("RF", 2, 1)).shape == (1, 0)
+print("CHECKED")
+"""
+
+
+@needs_casacore
+def test_zero_length_array_cells(tmp_path):
+    """A variable-shape cell of shape [0] (an MS SOURCE REST_FREQUENCY with
+    no lines) reads as an empty array, as in casacore -- casacure <= 3.8.8
+    counted it as one element and failed to reshape it."""
+    path = str(tmp_path / "zero.tab")
+    _ok(_ZERO_LENGTH_WRITE, [path], _casacore_env(), "WRITTEN")
+    _ok(_ZERO_LENGTH_READ, [path], _casacure_env(), "CHECKED")

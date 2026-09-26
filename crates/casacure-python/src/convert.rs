@@ -467,7 +467,13 @@ fn arrays_to_ndarray_impl(
     include_row: bool,
 ) -> PyResult<Py<PyAny>> {
     let nrow = cells.len();
-    let cell = cell_shape.iter().product::<usize>().max(1);
+    // A zero-length cell shape ([0], e.g. an MS SOURCE REST_FREQUENCY with
+    // no lines) holds no elements; only a shapeless cell counts as one.
+    let cell = if cell_shape.is_empty() {
+        1
+    } else {
+        cell_shape.iter().product::<usize>()
+    };
     let mut shape = vec![nrow];
     shape.extend_from_slice(cell_shape);
     let kind = cells.iter().find_map(|c| match c {
@@ -607,7 +613,13 @@ pub(crate) fn array_to_ndarray(py: Python<'_>, a: &ArrayValue) -> PyResult<Py<Py
     // A single cell is returned with just the cell shape (no leading row
     // singleton), matching casacore's `getcell`.
     let cell: Vec<usize> = a.shape.iter().map(|&d| d as usize).collect();
-    let n = cell.iter().product::<usize>().max(1);
+    // Shape [0] is an empty array (casacore returns `array([])`); the
+    // product over [0] is 0, and only a shapeless cell counts as one element.
+    let n = if cell.is_empty() {
+        1
+    } else {
+        cell.iter().product::<usize>()
+    };
     macro_rules! cell_build {
         ($ty:ty, $f:expr) => {{
             let mut buf: Vec<$ty> = vec![Default::default(); n];
