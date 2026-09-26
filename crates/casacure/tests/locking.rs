@@ -1,3 +1,7 @@
+//! Cross-process fcntl locking is a POSIX facility; Windows attaches
+//! nothing yet (see `src/lockfile.rs`).
+#![cfg(unix)]
+
 //! Cross-process tests for casacore's locking protocol. fcntl record locks
 //! never conflict within one process, so every contention scenario here
 //! runs a child copy of this test binary (the `locking_child` entry) under

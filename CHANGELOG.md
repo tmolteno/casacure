@@ -5,6 +5,18 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.11] - 2026-09-27
+
+### Fixed
+
+- **Windows builds.** 3.8.10's locking used POSIX fcntl unconditionally, so
+  the Rust crate did not compile on Windows (the crates.io release is
+  affected; Windows wheels were never published to PyPI for 3.8.10). The
+  protocol module is now compiled per platform: Linux/macOS keep the full
+  fcntl implementation, Windows attaches nothing (every lock request
+  succeeds, the no-locking mode) while the sync record stays
+  byte-compatible. Clippy 1.98 (CI's stable) is clean as well.
+
 ## [3.8.10] - 2026-09-27
 
 ### Added

@@ -19,6 +19,10 @@ import pytest
 
 from casacore.tables import table, maketabdesc, makescacoldesc
 
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32", reason="table locking is POSIX-only for now"
+)
+
 PYTHON = sys.executable
 
 

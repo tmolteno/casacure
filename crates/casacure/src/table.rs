@@ -1188,15 +1188,13 @@ impl Table {
                 }
                 M::UserLocking => {
                     // Take the open read lock, then release it at once —
-                    // only explicit `lock()` calls hold a user lock.
-                    if lf
-                        .acquire(crate::lockfile::LockType::Read, 0)
-                        .map_err(|e| TableDatError::Storage(format!("{}: {e}", path.display())))?
-                    {
-                        lf.release_read().map_err(|e| {
-                            TableDatError::Storage(format!("{}: {e}", path.display()))
-                        })?;
-                    }
+                    // only explicit `lock()` calls hold a user lock. The
+                    // acquire blocks, so it always succeeds; `release_read`
+                    // is a no-op if it somehow did not.
+                    lf.acquire(crate::lockfile::LockType::Read, 0)
+                        .map_err(|e| TableDatError::Storage(format!("{}: {e}", path.display())))?;
+                    lf.release_read()
+                        .map_err(|e| TableDatError::Storage(format!("{}: {e}", path.display())))?;
                 }
                 _ => {}
             }
