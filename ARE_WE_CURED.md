@@ -36,11 +36,12 @@ packaging dominate there, not I/O.  Before 3.8.8, writing a new table was
 the exception: memory grew with the table and time grew quadratically (57.6 s
 and 1.9 GiB for 256k rows, against casacore's 2.4 s and 234 MiB).
 
-Known gap found while benchmarking: StandardStMan **Direct** fixed-shape
-array columns (column option 5, e.g. UVW in an MS built by python-casacore's
-`default_ms`) store their data inline in the bucket.  casacure reads them as
-array-file references and fails ("array reference ... falls outside the
-array index file").  MeerKAT MSes keep UVW tiled and are not affected.
+Direct arrays: before 3.8.9, casacure could not read StandardStMan Direct
+fixed-shape array columns (column option 5, e.g. an MS's ANTENNA POSITION).
+It now reads and writes them in casacore's inline layout.  On a MeerKAT
+scan, all 132 columns of the MS and its subtables read as in casacore.  An
+MS written through skarabina, read back by casacore, is identical to the one
+python-casacore writes.
 
 ## Casacure-compatible packages
 

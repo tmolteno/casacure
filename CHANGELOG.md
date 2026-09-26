@@ -5,6 +5,31 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.9] - 2026-09-26
+
+### Fixed
+
+- **StandardStMan Direct array columns use casacore's inline layout.**
+  casacore's `SSMDirColumn` stores the cells of a Direct (option 1,
+  fixed-shape) array column inline in the bucket, like a scalar of `nelem`
+  elements; Bool cells are bit-packed.  The MS schema uses it for ANTENNA
+  POSITION/OFFSET and FEED POSITION, and python-casacore's `default_ms` for
+  UVW too.  casacure read every StandardStMan array cell as an array-file
+  reference, so it could not read the ANTENNA POSITION of a real MeerKAT MS.
+  It also wrote references for Direct columns, which casacore misreads.
+  Reads, writes, in-place patches and in-place growth now use the inline
+  layout.  Tables that casacure <= 3.8.8 wrote with references for Direct
+  columns are recognised by their bucket geometry and still read correctly;
+  their first flush rewrites them in casacore's layout.
+  `tests/test_direct_arrays.py` exchanges such tables both ways with real
+  python-casacore; `tests/data/legacy_direct_388.tab` is a 3.8.8-written
+  table.  On a MeerKAT scan the 132 columns of the MS and its subtables read
+  as in casacore.  An averaged MS written through skarabina, read back by
+  casacore, is identical to the one python-casacore writes.
+- A zero-length variable-shape array cell (shape `[0]`, e.g. an MS SOURCE
+  REST_FREQUENCY with no lines) reads as an empty array.  It used to be
+  counted as one element, and the numpy reshape failed.
+
 ## [3.8.8] - 2026-09-26
 
 ### Performance
@@ -71,6 +96,7 @@ subtasks are moved here.
 - StandardStMan Direct fixed-shape array columns (option 5, e.g. the UVW of
   an MS built by python-casacore's `default_ms`) store their cells inline in
   the bucket.  casacure reads them as array-file references and fails.
+  (Fixed in 3.8.9.)
 
 ## [3.8.7] - 2026-09-25
 
