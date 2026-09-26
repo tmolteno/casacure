@@ -99,6 +99,18 @@ pub struct Table {
     path: String,
     writable: bool,
     inner: Mutex<Inner>,
+    /// The `lockoptions` this handle was opened with, as given (for
+    /// `table.lockoptions()`).
+    lock_options: core::lockfile::LockOptions,
+    /// `AutoLocking` yield bookkeeping for read handles (see
+    /// [`Table::auto_tick`]).
+    auto_state: Mutex<AutoLockState>,
+}
+
+#[derive(Default)]
+struct AutoLockState {
+    ops: u32,
+    released: bool,
 }
 
 fn err<E: std::fmt::Display>(e: E) -> PyErr {
@@ -156,20 +168,30 @@ pub(crate) fn path_string(c: &Bound<'_, PyAny>) -> PyResult<String> {
 
 /// Re-materialise a directory's shared writable backing (`WriteData`) from
 /// the current on-disk files, after an out-of-band TaQL statement
-/// (UPDATE/DELETE/INSERT/ALTER/...) rewrote them. Live handles that share
-/// `shared` then read — and, on `close()`, flush — the fresh state instead
-/// of a stale pre-statement snapshot (which would otherwise clobber the
-/// change back). Returns false when the directory no longer holds a table
-/// (e.g. `DROPTABLE`), so the caller can drop the cached entry.
+/// (UPDATE/DELETE/INSERT/ALTER/...) rewrote them — or after another
+/// *process* grew the table while this one's backing was idle. Live handles
+/// that share `shared` then read — and, on `close()`, flush — the fresh
+/// state instead of a stale pre-statement snapshot (which would otherwise
+/// clobber the change back). Returns false when the directory no longer
+/// holds a table (e.g. `DROPTABLE`), so the caller can drop the cached
+/// entry.
 fn refresh_write(
     dir: &std::path::Path,
     shared: &std::sync::Arc<std::sync::Mutex<WriteData>>,
+    options: core::lockfile::LockOptions,
 ) -> bool {
     let read = match ::casacure::Table::open(dir, false) {
         Ok(t) => t,
         Err(_) => return false,
     };
-    let mut wt = core::WritableTable::create(dir.to_path_buf(), read.dat.desc.clone());
+    let mut wt = match core::WritableTable::create_with_lock(
+        dir.to_path_buf(),
+        read.dat.desc.clone(),
+        options,
+    ) {
+        Ok(wt) => wt,
+        Err(_) => return false,
+    };
     let n = read.nrows();
     if n > 0 {
         wt.addrows(n);
@@ -617,14 +639,61 @@ fn fill_numpy_raw(
 }
 
 impl Table {
+    /// Parse python-casacore's `lockoptions` argument: one of the option
+    /// words (`default, auto, autonoread, user, usernoread, permanent,
+    /// permanentwait`) or a dict `{'option': <word>, 'interval': <seconds>,
+    /// 'maxwait': <attempts>}` (`TableProxy::makeLockOptions`).
+    pub(crate) fn parse_lockoptions(
+        lo: &Bound<'_, PyAny>,
+    ) -> PyResult<core::lockfile::LockOptions> {
+        let unknown = |w: &str| {
+            PyRuntimeError::new_err(format!(
+                "'{w}' is an unknown lock option; valid are default,auto,autonoread,\
+user,usernoread,permanent,permanentwait"
+            ))
+        };
+        let (mode, interval, maxwait) = if let Ok(word) = lo.extract::<String>() {
+            let mode = core::lockfile::LockMode::parse(&word).ok_or_else(|| unknown(&word))?;
+            (mode, None, None)
+        } else {
+            let dict = lo
+                .cast::<PyDict>()
+                .map_err(|_| PyRuntimeError::new_err("lockoptions must be a string or a dict"))?;
+            let word: String = match dict.get_item("option")? {
+                Some(v) => v.extract().map_err(err)?,
+                None => "default".to_string(),
+            };
+            let mode = core::lockfile::LockMode::parse(&word).ok_or_else(|| unknown(&word))?;
+            let interval = match dict.get_item("interval")? {
+                Some(v) => Some(v.extract::<f64>().map_err(err)?),
+                None => None,
+            };
+            let maxwait = match dict.get_item("maxwait")? {
+                Some(v) => Some(v.extract::<u32>().map_err(err)?),
+                None => None,
+            };
+            (mode, interval, maxwait)
+        };
+        Ok(core::lockfile::LockOptions {
+            mode,
+            // casacore keeps the interval as a double in seconds; sub-second
+            // intervals round up to a whole second here.
+            interval: interval.map(|i| i.ceil() as u32).unwrap_or(5),
+            maxwait: maxwait.unwrap_or(0),
+        })
+    }
+
     /// Open or create a table; `desc_json` is the python-casacore table-desc
     /// dict (creates when given) and `nrow` its initial row count.
+    ///
+    /// Runs without the GIL where the caller detaches: opening takes the
+    /// mode's open lock, which may block on another process.
     fn open_or_create(
-        _py: Python<'_>,
         path: &str,
         desc_json: Option<&str>,
         nrow: u64,
         writable: bool,
+        options: core::lockfile::LockOptions,
     ) -> PyResult<Self> {
         // Table paths are handled absolute (mirrors casacore, whose table
         // names are absolute): subtable links are stored relative to the
@@ -649,7 +718,7 @@ impl Table {
         };
         if let Some(desc_string) = desc_json {
             let desc = core::tabledesc::TableDesc::from_desc_json(desc_string).map_err(err)?;
-            let mut wt = core::WritableTable::create(&dir, desc);
+            let mut wt = core::WritableTable::create_with_lock(&dir, desc, options).map_err(err)?;
             // Write the empty table, then grow it: the growth appends
             // default rows in place (zeroed tiles, default buckets, empty or
             // zeroed array cells -- casacore's defaults), where buffering
@@ -660,7 +729,7 @@ impl Table {
                 wt.addrows(nrow);
             }
             let _ = wt.flush().map_err(err)?;
-            let read = ::casacure::Table::open(&dir, false).map_err(err)?;
+            let read = ::casacure::Table::open_with_lock(&dir, false, options).map_err(err)?;
             let shared = std::sync::Arc::new(std::sync::Mutex::new(WriteData {
                 read,
                 wt,
@@ -671,6 +740,8 @@ impl Table {
                 path: abs.clone(),
                 writable,
                 inner: Mutex::new(Inner::Write { shared }),
+                lock_options: options,
+                auto_state: Mutex::new(AutoLockState::default()),
             });
         }
         if !writable {
@@ -685,28 +756,67 @@ impl Table {
                     flush_if_dirty(&shared)?;
                 }
             }
-            let read = ::casacure::Table::open(&dir, false).map_err(err)?;
+            let read = ::casacure::Table::open_with_lock(&dir, true, options).map_err(err)?;
             return Ok(Table {
                 path: abs.clone(),
                 writable: false,
                 inner: Mutex::new(Inner::Read(std::sync::Arc::new(read))),
+                lock_options: options,
+                auto_state: Mutex::new(AutoLockState::default()),
             });
         }
         // Reuse a live shared backing for this directory so concurrent
         // writable handles accumulate into one cell store (a second flush of
         // a stale snapshot must not clobber the first handle's writes).
+        // casacore `DefaultLocking` follows the backing's options; an
+        // explicit permanent request still has to acquire (it then conflicts
+        // with another *process* holding the lock — fcntl locks do not
+        // conflict within one process).
         if let Some(shared) = find_write(&dir) {
+            // The backing is stale if another process grew the table since
+            // this one's last flush (nothing pending here): adopt the
+            // on-disk state, keeping the caller's locking options.
+            let stale = {
+                let s = shared.lock().unwrap();
+                !s.dirty
+                    && ::casacure::lock_sync_nrrow(&dir)
+                        .filter(|&n| n != 0)
+                        .is_some_and(|n| n > s.wt.nrows())
+            };
+            if stale && !refresh_write(&dir, &shared, options) {
+                return Err(err(format!(
+                    "{}: table changed on disk and could not be reloaded",
+                    dir.display()
+                )));
+            }
+            let eff = options.effective();
+            if eff.is_permanent() {
+                let nattempts = if eff.mode == core::lockfile::LockMode::PermanentLocking {
+                    1
+                } else {
+                    0
+                };
+                if shared.lock().unwrap().wt.lock(true, nattempts).is_err() {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "Permanent lock on table {} could not be acquired",
+                        dir.display()
+                    )));
+                }
+            }
             return Ok(Table {
                 path: abs.clone(),
                 writable: true,
                 inner: Mutex::new(Inner::Write { shared }),
+                lock_options: options,
+                auto_state: Mutex::new(AutoLockState::default()),
             });
         }
         // A writable open of an existing table is LAZY: no column is
         // materialised, so a changed-columns write holds only the rows it
         // actually writes instead of per-cell RecordValues for the whole
         // table (~3 GiB on a 1.6 GB MS).
-        let (read, wt) = core::WritableTable::open_for_update(&dir).map_err(err)?;
+        let (read, wt) =
+            core::WritableTable::open_for_update_with_lock(&dir, options).map_err(err)?;
         let shared = std::sync::Arc::new(std::sync::Mutex::new(WriteData {
             read,
             wt,
@@ -717,6 +827,8 @@ impl Table {
             path: abs.clone(),
             writable: true,
             inner: Mutex::new(Inner::Write { shared }),
+            lock_options: options,
+            auto_state: Mutex::new(AutoLockState::default()),
         })
     }
 
@@ -727,6 +839,52 @@ impl Table {
         } else {
             PathBuf::from(&self.path)
         }
+    }
+
+    /// casacore's `AutoLocking` yield for read handles: the read lock taken
+    /// at open is released once another process is waiting (checked with
+    /// `LockFile::inspect`'s 25-call/interval throttle), and the next
+    /// operation re-acquires it — blocking until the writer is done, then
+    /// resyncing from the freshly written state. A released handle reads
+    /// its (stale) snapshot until then, exactly as casacore continues on
+    /// its in-memory caches after an auto release.
+    fn auto_tick(&self) -> PyResult<()> {
+        let mut st = self.auto_state.lock().unwrap();
+        if st.released {
+            st.released = false;
+            st.ops = 0;
+            let t = ::casacure::Table::open_with_lock(self.dir_of(), true, self.lock_options)
+                .map_err(err)?;
+            *self.inner.lock().unwrap() = Inner::Read(std::sync::Arc::new(t));
+            return Ok(());
+        }
+        st.ops += 1;
+        if st.ops < 25 {
+            return Ok(());
+        }
+        st.ops = 0;
+        let inner = self.inner.lock().unwrap();
+        let Inner::Read(arc) = &*inner else {
+            return Ok(());
+        };
+        let eff = arc.lock_options();
+        if eff.mode != core::lockfile::LockMode::AutoLocking || !eff.read_locking {
+            return Ok(());
+        }
+        let Some(lf) = arc.lock_file() else {
+            return Ok(());
+        };
+        let waiter = lf.lock().unwrap().inspect_has_waiter(false).map_err(err)?;
+        drop(inner);
+        if waiter {
+            st.released = true;
+            // Drop the locked snapshot for an unlocked one: the registry
+            // keeps the fd (and therefore the read lock) only while some
+            // handle still references it.
+            let unlocked = ::casacure::Table::open(self.dir_of(), true).map_err(err)?;
+            *self.inner.lock().unwrap() = Inner::Read(std::sync::Arc::new(unlocked));
+        }
+        Ok(())
     }
 
     /// A fresh read-only core table for running TaQL against the current
@@ -851,6 +1009,7 @@ impl Table {
     }
 
     fn nrows(&self) -> PyResult<u64> {
+        self.auto_tick()?;
         Ok(self.row_count())
     }
 
@@ -1098,15 +1257,115 @@ impl Table {
         Ok(())
     }
 
-    /// `lock(write=False)` — advisory only in the replacement.
-    #[pyo3(signature = (write = false, _read = false, _opt = None))]
-    fn lock(&self, write: bool, _read: bool, _opt: Option<u32>) -> PyResult<()> {
-        let _ = write;
-        Ok(())
+    /// `lock(write=True, nattempts=0)`: acquire the table's lock (a real
+    /// fcntl lock on `table.lock`; `nattempts == 0` waits indefinitely,
+    /// otherwise that many one-second-apart attempts are made). Locks do
+    /// not nest: an already-held write lock satisfies a read request.
+    #[pyo3(signature = (write = true, nattempts = 0))]
+    fn lock(&self, py: Python<'_>, write: bool, nattempts: u32) -> PyResult<()> {
+        self.auto_state.lock().unwrap().released = false;
+        py.detach(|| {
+            let mut inner = self.inner.lock().unwrap();
+            match &*inner {
+                // A read snapshot is immutable, so the lock is driven on the
+                // directory's shared lock file; the resync is the re-open
+                // below (its attach re-enters the same LockFile, where the
+                // fresh acquire is a no-op while held).
+                Inner::Read(arc) => {
+                    let Some(lf) = arc.lock_file() else {
+                        return Ok(());
+                    };
+                    let typ = if write {
+                        core::lockfile::LockType::Write
+                    } else {
+                        core::lockfile::LockType::Read
+                    };
+                    let ok = lf.lock().unwrap().acquire(typ, nattempts).map_err(err)?;
+                    if !ok {
+                        return Err(err(format!(
+                            "Error (gave up acquiring the lock) when acquiring {}-lock on {}",
+                            if write { "write" } else { "read" },
+                            self.dir_of().display()
+                        )));
+                    }
+                    let t =
+                        ::casacure::Table::open_with_lock(self.dir_of(), true, self.lock_options)
+                            .map_err(err)?;
+                    *inner = Inner::Read(std::sync::Arc::new(t));
+                    Ok(())
+                }
+                Inner::Write { shared } => {
+                    {
+                        let mut s = shared.lock().unwrap();
+                        s.wt.lock(write, nattempts).map_err(err)?;
+                    }
+                    // A fresh acquire may follow another process's write:
+                    // adopt its rows into the read snapshot (the writable
+                    // read path answers rows beyond the snapshot with
+                    // defaults).
+                    let mut s = shared.lock().unwrap();
+                    if s.wt.nrows() > s.read.nrows() {
+                        s.read = ::casacure::Table::open_with_lock(
+                            self.dir_of(),
+                            false,
+                            core::lockfile::LockOptions::no_locking(),
+                        )
+                        .map_err(err)?;
+                    }
+                    Ok(())
+                }
+            }
+        })
     }
 
+    /// `unlock()`: flush pending writes and release the lock. Nothing is
+    /// done when no lock is held.
     fn unlock(&self) -> PyResult<()> {
-        Ok(())
+        let inner = self.inner.lock().unwrap();
+        match &*inner {
+            Inner::Read(arc) => {
+                if let Some(lf) = arc.lock_file() {
+                    lf.lock().unwrap().release_read().map_err(err)?;
+                }
+                Ok(())
+            }
+            Inner::Write { shared } => shared.lock().unwrap().wt.unlock().map_err(err),
+        }
+    }
+
+    /// `haslock(write=True)`: whether the write (or read) lock is held.
+    #[pyo3(signature = (write = true))]
+    fn haslock(&self, write: bool) -> PyResult<bool> {
+        let inner = self.inner.lock().unwrap();
+        match &*inner {
+            // The shared lock file's `held` is the process truth (a write
+            // lock held anywhere in the process covers every read handle).
+            Inner::Read(arc) => Ok(match arc.lock_file().map(|lf| lf.lock().unwrap().held) {
+                Some(Some(core::lockfile::LockType::Write)) => true,
+                Some(Some(_)) => !write,
+                _ => false,
+            }),
+            Inner::Write { shared } => Ok(shared.lock().unwrap().wt.has_lock(write)),
+        }
+    }
+
+    /// `lockoptions()`: the option word, inspection interval (seconds) and
+    /// maximum wait this handle was opened with.
+    fn lockoptions(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let d = PyDict::new(py);
+        d.set_item("option", self.lock_options.mode.as_str())?;
+        d.set_item("interval", self.lock_options.interval)?;
+        d.set_item("maxwait", self.lock_options.maxwait)?;
+        Ok(d.into_any().unbind())
+    }
+
+    /// `ismultiused()`: whether another process has the table open.
+    fn ismultiused(&self) -> PyResult<bool> {
+        let inner = self.inner.lock().unwrap();
+        match &*inner {
+            Inner::Read(arc) => arc.is_multi_used().map_err(err),
+            Inner::Write { shared } => shared.lock().unwrap().wt.is_multi_used().map_err(err),
+        }
     }
 
     fn flush(&self) -> PyResult<()> {
@@ -1119,6 +1378,14 @@ impl Table {
 
     fn close(&self) -> PyResult<()> {
         self.flush()?;
+        // Release any lock this handle holds (the Drop of the core handle
+        // would anyway; this is the explicit casacore close semantics).
+        let inner = self.inner.lock().unwrap();
+        if let Inner::Read(arc) = &*inner {
+            if let Some(lf) = arc.lock_file() {
+                lf.lock().unwrap().release_read().map_err(err)?;
+            }
+        }
         Ok(())
     }
 
@@ -1136,6 +1403,7 @@ impl Table {
         nrow: i64,
         _rowincr: i64,
     ) -> PyResult<Py<PyAny>> {
+        self.auto_tick()?;
         let total = self.row_count();
         let startrow = if startrow < 0 {
             (total as i64 + startrow).max(0)
@@ -1347,6 +1615,7 @@ impl Table {
         startrow: i64,
         nrow: i64,
     ) -> PyResult<()> {
+        self.auto_tick()?;
         let total = self.row_count();
         let startrow = if startrow < 0 {
             (total as i64 + startrow).max(0)
@@ -1400,6 +1669,7 @@ impl Table {
         startrow: i64,
         nrow: i64,
     ) -> PyResult<Py<PyAny>> {
+        self.auto_tick()?;
         let total = self.row_count();
         let startrow = if startrow < 0 { 0 } else { startrow } as u64;
         let nrow = if nrow < 0 {
@@ -1425,6 +1695,7 @@ impl Table {
         startrow: i64,
         nrow: i64,
     ) -> PyResult<()> {
+        self.auto_tick()?;
         let total = self.row_count();
         let startrow = if startrow < 0 { 0 } else { startrow } as u64;
         let nrow = if nrow < 0 {
@@ -1440,6 +1711,7 @@ impl Table {
 
     /// `getcell(column, row)` -> numpy array (or scalar/list).
     fn getcell(&self, py: Python<'_>, column: &str, row: u64) -> PyResult<Py<PyAny>> {
+        self.auto_tick()?;
         let col_idx = self.col_index(column)?;
         let v = self.read_cell(col_idx, row)?;
         if let RecordValue::Array(a) = &v {
@@ -1461,6 +1733,7 @@ impl Table {
         blc: Vec<i64>,
         trc: Vec<i64>,
     ) -> PyResult<Py<PyAny>> {
+        self.auto_tick()?;
         let col_idx = self.col_index(column)?;
         let v = self.read_cellslice(col_idx, row, &blc, &trc)?;
         convert::cell_to_py(py, &v)
@@ -2584,7 +2857,7 @@ fn spec_to_dict(py: Python<'_>, spec: &core::DmSpec) -> PyResult<Py<PyAny>> {
 /// Module-level `table(...)` factory.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
-#[pyo3(signature = (name, tabledesc = None, nrow = 0, _dminfo = None, readonly = false, _ack = true, *_args, **_kwargs))]
+#[pyo3(signature = (name, tabledesc = None, nrow = 0, _dminfo = None, readonly = false, _ack = true, lockoptions = None, *_args, **_kwargs))]
 pub fn table(
     py: Python<'_>,
     name: &Bound<'_, PyAny>,
@@ -2593,6 +2866,7 @@ pub fn table(
     _dminfo: Option<&Bound<'_, PyAny>>,
     readonly: bool,
     _ack: bool,
+    lockoptions: Option<&Bound<'_, PyAny>>,
     _args: &Bound<'_, PyTuple>,
     _kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Table> {
@@ -2608,13 +2882,22 @@ pub fn table(
         }
         _ => None,
     };
-    Table::open_or_create(
-        py,
-        &name,
-        desc_json.as_deref(),
-        nrow.max(0) as u64,
-        !readonly,
-    )
+    // python-casacore's default: `lockoptions='default'` (AutoLocking).
+    let options = match lockoptions {
+        Some(lo) if !lo.is_none() => Table::parse_lockoptions(lo)?,
+        _ => core::lockfile::LockOptions::locking_default(),
+    };
+    // Opening acquires the mode's lock, which may wait on another process:
+    // do that without the GIL so other Python threads keep running.
+    py.detach(|| {
+        Table::open_or_create(
+            &name,
+            desc_json.as_deref(),
+            nrow.max(0) as u64,
+            !readonly,
+            options,
+        )
+    })
 }
 
 /// Module-level `taql(query, tables=[], style=...)`.
@@ -2696,7 +2979,9 @@ pub fn taql(
         let mut reg = write_registry().lock().unwrap();
         for dir in &touched {
             if let Some(shared) = reg.get(dir) {
-                if !refresh_write(dir, shared) {
+                // The taql path owns these tables' writes; keep their
+                // replacement backing lock-free as before.
+                if !refresh_write(dir, shared, core::lockfile::LockOptions::no_locking()) {
                     reg.remove(dir);
                 }
             }
@@ -2708,7 +2993,15 @@ pub fn taql(
             .into_any()
             .unbind(),
         core::taql::TaqlResult::Created(path) => {
-            let t = Table::open_or_create(py, &path.display().to_string(), None, 0, true)?;
+            // A TaQL-created scratch table: fresh directory, single handle,
+            // no locking (also keeps lock files out of temp dirs).
+            let t = Table::open_or_create(
+                &path.display().to_string(),
+                None,
+                0,
+                true,
+                core::lockfile::LockOptions::no_locking(),
+            )?;
             t.into_pyobject(py)?.into_any().unbind()
         }
     })
@@ -2819,6 +3112,9 @@ fn taql_result_to_table(_py: Python<'_>, out: core::taql::TaqlTable) -> PyResult
         path: dir.display().to_string(),
         writable: true,
         inner: Mutex::new(Inner::Write { shared }),
+        // TaQL result tables are fresh temp-dir tables with one handle.
+        lock_options: core::lockfile::LockOptions::no_locking(),
+        auto_state: Mutex::new(AutoLockState::default()),
     })
 }
 

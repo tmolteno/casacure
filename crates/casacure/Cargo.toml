@@ -10,6 +10,7 @@ readme = "README.md"
 keywords = ["casacore", "measurement-set", "radio-astronomy", "taql"]
 
 [dependencies]
+libc = "0.2"
 thiserror = "2"
 memmap2 = "0.9"
 

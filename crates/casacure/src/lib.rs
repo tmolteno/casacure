@@ -8,6 +8,7 @@ pub mod columnset;
 pub mod datafile;
 mod grow;
 pub mod ism;
+pub mod lockfile;
 pub mod ms;
 pub mod ms_schema;
 pub mod quanta;
@@ -31,9 +32,9 @@ pub use ssm::{
 };
 pub use table::{
     build_table_dat, casa_value_type, create_table, default_cell_value, get_dminfo,
-    parse_table_dat, parse_table_header, patch_copy_nrow, slice_array_value, DmInfo, DmSpec, Table,
-    TableCreateError, TableDat, TableDatError, TableError, TableHeader, TableReadError,
-    WritableTable, WriteTableError, ROWS_PER_BUCKET,
+    lock_sync_nrrow, parse_table_dat, parse_table_header, patch_copy_nrow, slice_array_value,
+    DmInfo, DmSpec, Table, TableCreateError, TableDat, TableDatError, TableError, TableHeader,
+    TableReadError, WritableTable, WriteTableError, ROWS_PER_BUCKET,
 };
 pub use tabledesc::{
     parse_table_desc, write_table_desc, ColumnDesc, ColumnKind, TableDesc, TableDescError,

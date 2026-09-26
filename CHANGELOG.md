@@ -5,6 +5,39 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Added
+
+- **casacore's locking protocol.** Tables are coordinated between processes
+  through fcntl record locks on `<dir>/table.lock`, byte- and
+  behaviour-compatible with casacore (`LockFile` / `TableLock`): byte 0
+  carries the read(shared)/write(exclusive) lock, byte 1 the "in use" lock
+  (`ismultiused`), the 260-byte request list records waiting pids, and the
+  info area carries the `sync` record (authoritative `nrrow`, column count,
+  change counters) casacore reads for its own resync. The Python surface
+  gains the full `lockoptions` argument (`default, auto, autonoread, user,
+  usernoread, permanent, permanentwait` — string or dict with
+  `interval`/`maxwait`) plus `lock(write=True, nattempts=0)`, `unlock()`,
+  `haslock(write=True)`, `lockoptions()` and `ismultiused()`; `lock()`
+  acquires and resyncs (rows written by another process become visible),
+  `unlock()` flushes then releases. Flushes run under the write lock and
+  store the sync record, `create` writes a lock file (like casacore), and
+  a table without one (a byte-level copy) operates lock-free exactly like
+  casacore's `mustExist=False`. Reads through a `user`-locked handle
+  resync on `lock()`; an `auto` reader yields its open read lock to a
+  waiting writer (25-call/interval throttle) and re-acquires with a resync
+  on a later operation. Blocked opens and lock waits release the GIL.
+  Cross-process exclusion, reader resync and `ismultiused` are tested
+  between casacure processes and against real python-casacore 3.8.1 in
+  both directions (`tests/test_locking.py`,
+  `crates/casacure/tests/locking.rs`).
+- Fixed along the way: a whole-table rewrite (schema change, row removal)
+  left the lock file's sync record at the stale row count, so the next
+  open trusted it and failed reads with `row N not covered by any indexed
+  bucket` (pre-existing gap, exposed by the new always-present lock
+  files); every `table.lock` access now also goes through one persistent
+  fd per process, since POSIX drops a process's record locks when any fd
+  to the file closes.
+
 ## [3.8.9] - 2026-09-26
 
 ### Fixed

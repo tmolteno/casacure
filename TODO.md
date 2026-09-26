@@ -22,6 +22,10 @@ Work areas follow `CASACORE_TO_CASA_RS.md` (tracked as GitHub issues).
 - [X] `table()` open + create
 - [X] `lock()`/`unlock()` (advisory), `flush()`, `close()`
 - [X] `iswritable()`, `name()`
+- [X] casacore locking protocol: fcntl locks on `table.lock` (byte 0
+      read/write, byte 1 in-use), request list, `sync` record, all eight
+      `lockoptions`, auto-locking yield, cross-process exclusion + resync
+      (`src/lockfile.rs`, `tests/test_locking.py`)
 
 ## 3. Column data access (hot path)
 

@@ -55,3 +55,24 @@ unwritten cell anymore.
 None currently. TaQL's `ORDER BY` is an unimplemented feature (a gap), not a
 deliberate divergence — unimplemented features and compatibility gaps are
 tracked in `ARE_WE_CURED.md`.
+
+## Locking: casacore's protocol, with the yield checked at operation entry
+
+Not a divergence from the on-disk protocol — casacore's locking is
+implemented byte- and behaviour-compatibly (fcntl record locks on
+`table.lock`, request list, `sync` record, all eight `lockoptions`), and
+real python-casacore and casacure exclude each other in both directions
+(`tests/test_locking.py`). Recorded here because two behaviours are
+casacore's *conventions* rather than its exact mechanics:
+
+- **`AutoLocking` yield points.** casacore checks for a waiting process
+  inside its column cache on every operation; casacure reads are immutable
+  snapshots, so the check runs at the entry of the data-access methods
+  (`nrows`/`getcol`/`getcell`/…, same 25-call + interval throttle). A
+  reader that is *between* such operations still holds its read lock,
+  where casacore might release marginally earlier within one operation.
+- **Missing `table.lock`.** A byte-level directory copy has no lock file;
+  as with casacore's `mustExist=False`, every lock request then succeeds
+  without actual locking until a table rewrite creates the file. Writers
+  that need exclusion against copies should re-create the table rather
+  than copy it.

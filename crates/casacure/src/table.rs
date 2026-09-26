@@ -466,6 +466,18 @@ pub fn create_table(
         std::fs::write(&f_path, file)?;
         written.push(f_path);
     }
+    // Every casacore table carries a `table.lock` — the fcntl target of the
+    // locking protocol (a byte-level directory copy without one simply
+    // operates lock-free, like casacore's `mustExist=False`). Create it
+    // through the shared registry: this may run while this process holds
+    // the write lock, and a transient fd opened and closed here would drop
+    // it (POSIX releases a process's record locks when any fd to the file
+    // closes).
+    let lock_path = table_dir.join("table.lock");
+    if !lock_path.exists() {
+        let opts = crate::lockfile::LockOptions::locking_default().effective();
+        let _ = crate::lockfile::attach(table_dir, &opts, true);
+    }
     Ok(written)
 }
 
@@ -940,16 +952,32 @@ fn build_tsm_data(
 }
 
 /// A CASA table: the parsed descriptor plus the opened data managers, with
-/// the table lifecycle API (`open`/`create`, advisory `lock`/`unlock`,
+/// the table lifecycle API (`open`/`create`, `lock`/`unlock`,
 /// `flush`, `close`, `is_writable`, `name`).
 ///
-/// All file contents are owned, so a `Table` is `Send` + `Sync` and safe to
-/// hold across threads (dask-ms serializes access on its side).
+/// Data files are mapped read-only into the handle (a stable snapshot for
+/// the handle's lifetime — a refresh re-opens them, see [`Table::resync`]),
+/// so a `Table` is `Send` + `Sync` and safe to hold across threads (dask-ms
+/// serializes access on its side).
+///
+/// Locking follows casacore's protocol on `<dir>/table.lock` (fcntl record
+/// locks; see [`crate::lockfile`]). Which locks are taken depends on the
+/// [`crate::lockfile::LockOptions`] the handle was opened with; plain
+/// [`Table::open`] uses `NoLocking` (the internal snapshot behaviour), and
+/// the Python layer passes the caller's `lockoptions` through.
 #[derive(Debug)]
 pub struct Table {
     path: std::path::PathBuf,
     writable: bool,
     locked: bool,
+    /// The directory's shared `table.lock`, when locking is in effect.
+    lock_file: Option<crate::lockfile::SharedLockFile>,
+    lock_options: crate::lockfile::EffectiveLockOptions,
+    /// The lock *this handle* holds (`FileLocker::Write` implies read).
+    lock_held: Option<crate::lockfile::LockType>,
+    /// The sync record as of the last read — the baseline the change
+    /// counters are compared against on [`Table::resync`].
+    sync_seen: Option<crate::lockfile::TableSyncData>,
     pub dat: TableDat,
     /// StandardStMan data files, keyed by DM sequence number.
     pub ssm_files: Vec<(u32, crate::ssm::StandardStManFile)>,
@@ -957,6 +985,22 @@ pub struct Table {
     pub ism_files: Vec<(u32, crate::ism::IsmFile)>,
     /// TiledColumnStMan storage managers, keyed by DM sequence number.
     pub tsm_files: Vec<(u32, crate::tsm::TsmFile)>,
+}
+
+impl Drop for Table {
+    fn drop(&mut self) {
+        // The fd stays alive for other handles of this process via the
+        // lock-file registry; this drops this handle's logical hold. A
+        // snapshot never releases a write lock held elsewhere in the
+        // process (`release_read` no-ops then, as a write lock covers the
+        // read case).
+        if self.lock_held.is_some() {
+            if let Some(lf) = &self.lock_file {
+                let _ = lf.lock().unwrap().release_read();
+            }
+            self.lock_held = None;
+        }
+    }
 }
 
 /// The table directory as an absolute path (lexically normalised, no symlink
@@ -980,7 +1024,19 @@ pub fn absolute_dir(p: &std::path::Path) -> std::path::PathBuf {
 /// nrrow is u32, v2 u64).  `PlainTable::PlainTable` takes this value in
 /// preference to the header's nrrow, so casacure mirrors it (see
 /// [`Table::open`]).
-fn lock_sync_nrrow(path: &std::path::Path) -> Option<u64> {
+pub fn lock_sync_nrrow(path: &std::path::Path) -> Option<u64> {
+    // When this process already has the lock file open, read through its
+    // fd: a transient open + close here would drop the process's fcntl
+    // locks (POSIX releases them when *any* fd to the file is closed).
+    if let Some(lf) = crate::lockfile::lookup(path) {
+        return lf
+            .lock()
+            .unwrap()
+            .get_info()
+            .ok()
+            .flatten()
+            .map(|d| d.nrrow);
+    }
     let bytes = std::fs::read(path.join("table.lock")).ok()?;
     let mut found = None;
     for (i, w) in bytes.windows(4).enumerate() {
@@ -1003,59 +1059,156 @@ fn lock_sync_nrrow(path: &std::path::Path) -> Option<u64> {
     found
 }
 
+/// Read and parse a table directory's `table.dat` and open its data
+/// managers — everything an open needs before any locking. The lock-file
+/// sync record's row count overrides the header's, exactly as casacore's
+/// `PlainTable::PlainTable` prefers `lockSync` over the header (falling
+/// back only when the sync value is 0), so a header written stale (e.g. an
+/// MS subtable whose header fields were updated by a writer that never
+/// rewrote `table.dat`) still opens with the real row count.
+/// The opened data-manager file sets of one table directory.
+pub(crate) type DataFiles = (
+    TableDat,
+    Vec<(u32, crate::ssm::StandardStManFile)>,
+    Vec<(u32, crate::ism::IsmFile)>,
+    Vec<(u32, crate::tsm::TsmFile)>,
+);
+
+fn read_table_dir(path: &std::path::Path) -> Result<DataFiles, TableDatError> {
+    let buf = std::fs::read(path.join("table.dat"))?;
+    let mut dat = parse_table_dat(&buf)?;
+    if let Some(n) = lock_sync_nrrow(path) {
+        if n != 0 {
+            dat.header.nrow = n;
+        }
+    }
+    let big = dat.header.big_endian;
+    let mut ssm_files = Vec::new();
+    let mut ism_files = Vec::new();
+    let mut tsm_files = Vec::new();
+    for dm in &dat.column_set.data_managers {
+        match dm.type_name.as_str() {
+            "StandardStMan" => ssm_files.push((
+                dm.sequence_nr,
+                crate::ssm::StandardStManFile::open(path, dm.sequence_nr, big)
+                    .map_err(|e| TableDatError::Storage(e.to_string()))?,
+            )),
+            "IncrementalStMan" => ism_files.push((
+                dm.sequence_nr,
+                crate::ism::IsmFile::open(path, dm.sequence_nr, big)
+                    .map_err(|e| TableDatError::Storage(e.to_string()))?,
+            )),
+            "TiledColumnStMan" | "TiledShapeStMan" => tsm_files.push((
+                dm.sequence_nr,
+                crate::tsm::TsmFile::open(path, dm.sequence_nr, big)
+                    .map_err(|e| TableDatError::Storage(e.to_string()))?,
+            )),
+            other => {
+                return Err(TableDatError::Storage(format!(
+                    "unsupported data-manager type {other}"
+                )))
+            }
+        }
+    }
+    Ok((dat, ssm_files, ism_files, tsm_files))
+}
+
 impl Table {
-    /// Open a table directory (`<dir>/table.dat` + data files).
+    /// Open a table directory (`<dir>/table.dat` + data files) without
+    /// locking — the internal-snapshot behaviour, unchanged.
     pub fn open(
         dir: impl Into<std::path::PathBuf>,
         readonly: bool,
     ) -> Result<Table, TableDatError> {
+        Table::open_with_lock(dir, readonly, crate::lockfile::LockOptions::no_locking())
+    }
+
+    /// Open a table directory under casacore's locking protocol
+    /// (`PlainTable`'s constructor): attach `<dir>/table.lock`, then acquire
+    /// the open lock the mode calls for — a write lock for a writable open
+    /// and a read lock for a readonly one; `permanent` throws when the lock
+    /// is held elsewhere, `permanentwait` blocks, `auto` takes its read
+    /// lock and keeps it, `user` takes the open read lock and releases it
+    /// immediately (only explicit `lock` calls lock).
+    pub fn open_with_lock(
+        dir: impl Into<std::path::PathBuf>,
+        readonly: bool,
+        options: crate::lockfile::LockOptions,
+    ) -> Result<Table, TableDatError> {
         let dir: std::path::PathBuf = dir.into();
         let path = absolute_dir(&dir);
-        let buf = std::fs::read(path.join("table.dat"))?;
-        let mut dat = parse_table_dat(&buf)?;
-        // casacore reads the row count from the table's lock-file sync record
-        // in preference to the header (`PlainTable::PlainTable`: nrrow_p from
-        // lockSync, falling back to the header only when it is 0), so a
-        // header written stale (e.g. an MS subtable whose header fields were
-        // updated by a writer that never rewrote table.dat) still opens with
-        // the real row count.
-        if let Some(n) = lock_sync_nrrow(&path) {
-            if n != 0 {
-                dat.header.nrow = n;
-            }
-        }
-        let big = dat.header.big_endian;
-        let mut ssm_files = Vec::new();
-        let mut ism_files = Vec::new();
-        let mut tsm_files = Vec::new();
-        for dm in &dat.column_set.data_managers {
-            match dm.type_name.as_str() {
-                "StandardStMan" => ssm_files.push((
-                    dm.sequence_nr,
-                    crate::ssm::StandardStManFile::open(&path, dm.sequence_nr, big)
-                        .map_err(|e| TableDatError::Storage(e.to_string()))?,
-                )),
-                "IncrementalStMan" => ism_files.push((
-                    dm.sequence_nr,
-                    crate::ism::IsmFile::open(&path, dm.sequence_nr, big)
-                        .map_err(|e| TableDatError::Storage(e.to_string()))?,
-                )),
-                "TiledColumnStMan" | "TiledShapeStMan" => tsm_files.push((
-                    dm.sequence_nr,
-                    crate::tsm::TsmFile::open(&path, dm.sequence_nr, big)
-                        .map_err(|e| TableDatError::Storage(e.to_string()))?,
-                )),
-                other => {
-                    return Err(TableDatError::Storage(format!(
-                        "unsupported data-manager type {other}"
-                    )))
+        let (dat, ssm_files, ism_files, tsm_files) = read_table_dir(&path)?;
+        let effective = options.effective();
+        let lock_file = crate::lockfile::attach(&path, &effective, false)
+            .map_err(|e| TableDatError::Storage(format!("{}: {e}", path.display())))?;
+        let mut sync_seen = None;
+        let mut lock_held = None;
+        if let Some(lf) = &lock_file {
+            let mut lf = lf.lock().unwrap();
+            sync_seen = lf.get_info().ok().flatten();
+            use crate::lockfile::LockMode as M;
+            let want = if readonly {
+                crate::lockfile::LockType::Read
+            } else {
+                crate::lockfile::LockType::Write
+            };
+            match effective.mode {
+                M::PermanentLocking | M::PermanentLockingWait => {
+                    // `permanent` tries once and throws; `permanentwait`
+                    // blocks (`nattempts == 0`).
+                    let nattempts = if effective.mode == M::PermanentLocking {
+                        1
+                    } else {
+                        0
+                    };
+                    if !lf
+                        .acquire(want, nattempts)
+                        .map_err(|e| TableDatError::Storage(format!("{}: {e}", path.display())))?
+                    {
+                        return Err(TableDatError::Storage(format!(
+                            "Permanent lock on table {} could not be acquired",
+                            path.display()
+                        )));
+                    }
+                    lock_held = Some(want);
                 }
+                M::AutoLocking if effective.read_locking => {
+                    // The open read lock (`PlainTable::PlainTable` acquires
+                    // it with the default blocking wait).
+                    if !lf
+                        .acquire(crate::lockfile::LockType::Read, 0)
+                        .map_err(|e| TableDatError::Storage(format!("{}: {e}", path.display())))?
+                    {
+                        return Err(TableDatError::Storage(format!(
+                            "Error when acquiring read lock on {}",
+                            path.display()
+                        )));
+                    }
+                    lock_held = Some(crate::lockfile::LockType::Read);
+                }
+                M::UserLocking => {
+                    // Take the open read lock, then release it at once —
+                    // only explicit `lock()` calls hold a user lock.
+                    if lf
+                        .acquire(crate::lockfile::LockType::Read, 0)
+                        .map_err(|e| TableDatError::Storage(format!("{}: {e}", path.display())))?
+                    {
+                        lf.release_read().map_err(|e| {
+                            TableDatError::Storage(format!("{}: {e}", path.display()))
+                        })?;
+                    }
+                }
+                _ => {}
             }
         }
         Ok(Table {
             path,
             writable: !readonly,
             locked: false,
+            lock_file,
+            lock_options: effective,
+            lock_held,
+            sync_seen,
             dat,
             ssm_files,
             ism_files,
@@ -1070,9 +1223,42 @@ impl Table {
         desc: &crate::tabledesc::TableDesc,
         values: &[Vec<crate::record::RecordValue>],
     ) -> Result<Table, TableDatError> {
+        Table::create_with_lock(
+            dir,
+            desc,
+            values,
+            crate::lockfile::LockOptions::no_locking(),
+        )
+    }
+
+    /// [`Table::create`] under the locking protocol: `table.lock` is created
+    /// (with its request-list area zeroed) so a concurrent casacore process
+    /// can lock against this table, and the open follows `options`.
+    pub fn create_with_lock(
+        dir: impl Into<std::path::PathBuf>,
+        desc: &crate::tabledesc::TableDesc,
+        values: &[Vec<crate::record::RecordValue>],
+        options: crate::lockfile::LockOptions,
+    ) -> Result<Table, TableDatError> {
         let dir = dir.into();
         create_table(&dir, desc, values).map_err(|e| TableDatError::Storage(e.to_string()))?;
-        Table::open(dir, false)
+        let path = absolute_dir(&dir);
+        let effective = options.effective();
+        if effective.mode != crate::lockfile::LockMode::NoLocking {
+            // Create the lock file if absent (an existing one — e.g. a
+            // rewrite of a casacore table — is kept, as `create_table` does).
+            let lock_path = path.join("table.lock");
+            if !lock_path.exists() {
+                if let Err(e) = std::fs::write(&lock_path, vec![0u8; crate::lockfile::SIZE_REQ_ID])
+                {
+                    return Err(TableDatError::Storage(format!(
+                        "{}: {e}",
+                        lock_path.display()
+                    )));
+                }
+            }
+        }
+        Table::open_with_lock(dir, false, options)
     }
 
     /// The table directory (casacore `table.name()`).
@@ -1086,27 +1272,137 @@ impl Table {
         self.writable
     }
 
-    /// Adversarial user lock (casacore `table.lock(write=True)`); internally
-    /// advisory as the replacement never holds OS locks.
-    pub fn lock(&mut self) {
+    /// casacore `table.lock(write=True, nattempts=0)`: acquire the lock and
+    /// resync from the lock file's sync record (another process may have
+    /// grown or changed the table while it was unlocked). `nattempts == 0`
+    /// blocks; otherwise that many one-second-apart attempts are made.
+    pub fn lock(&mut self, write: bool, nattempts: u32) -> Result<(), TableDatError> {
         self.locked = true;
+        let Some(lf) = self.lock_file.clone() else {
+            return Ok(()); // no locking: every request succeeds
+        };
+        // Already appropriately held? A write lock implies read.
+        let already = matches!(
+            (self.lock_held, write),
+            (Some(crate::lockfile::LockType::Write), _)
+                | (Some(crate::lockfile::LockType::Read), false)
+        );
+        if already {
+            return Ok(());
+        }
+        let typ = if write {
+            crate::lockfile::LockType::Write
+        } else {
+            crate::lockfile::LockType::Read
+        };
+        let ok = lf
+            .lock()
+            .unwrap()
+            .acquire(typ, nattempts)
+            .map_err(|e| TableDatError::Storage(format!("{}: {e}", self.path.display())))?;
+        if !ok {
+            return Err(TableDatError::Storage(format!(
+                "Error (gave up acquiring the lock) when acquiring {}-lock on {}",
+                if write { "write" } else { "read" },
+                self.path.display()
+            )));
+        }
+        self.lock_held = Some(typ);
+        self.resync()
     }
 
-    /// Release the advisory lock (casacore `table.unlock()`).
+    /// casacore `table.unlock()`: release the lock this handle holds. A
+    /// `Table` snapshot never has pending writes, so no sync data is
+    /// written on release.
     pub fn unlock(&mut self) {
         self.locked = false;
+        if let Some(lf) = &self.lock_file {
+            let _ = lf.lock().unwrap().release_read();
+        }
+        self.lock_held = None;
     }
 
-    /// Whether an advisory lock is currently held.
+    /// Whether this handle holds a lock (a write lock counts for read too,
+    /// as `PlainTable::hasLock(FileLocker::Read)` does).
     pub fn is_locked(&self) -> bool {
-        self.locked
+        self.locked || self.lock_held.is_some()
     }
 
-    /// Flush pending writes. The current implementation writes eagerly
-    /// (`create_table`), so this is a no-op; kept for API compatibility.
+    /// casacore `haslock(write)`: whether the write (or read) lock is held.
+    pub fn has_lock(&self, write: bool) -> bool {
+        matches!(
+            (self.lock_held, write),
+            (Some(crate::lockfile::LockType::Write), _)
+                | (Some(crate::lockfile::LockType::Read), false)
+        )
+    }
+
+    /// The options this handle was opened with (`table.lockoptions()`).
+    pub fn lock_options(&self) -> crate::lockfile::EffectiveLockOptions {
+        self.lock_options
+    }
+
+    /// The directory's shared lock file, when locking is in effect (the
+    /// binding's auto-locking tick uses it to yield to waiting processes).
+    pub fn lock_file(&self) -> Option<crate::lockfile::SharedLockFile> {
+        self.lock_file.clone()
+    }
+
+    /// Whether another process has the table open (`table.ismultiused()`),
+    /// via the byte-1 in-use lock. `false` when no lock file is in use.
+    pub fn is_multi_used(&self) -> Result<bool, TableDatError> {
+        match &self.lock_file {
+            Some(lf) => lf
+                .lock()
+                .unwrap()
+                .is_multi_used()
+                .map_err(|e| TableDatError::Storage(format!("{}: {e}", self.path.display()))),
+            None => Ok(false),
+        }
+    }
+
+    /// `PlainTable::lock`'s sync step: re-read the lock file's sync record
+    /// and bring the snapshot up to date — the row count always follows the
+    /// record; when the table-change counter moved (or the record's column
+    /// count disagrees) `table.dat` and the data managers are re-opened, as
+    /// casacore's `syncTable` does. A column-count mismatch is an error.
+    fn resync(&mut self) -> Result<(), TableDatError> {
+        let Some(data) = (match &self.lock_file {
+            Some(lf) => lf.lock().unwrap().get_info().ok().flatten(),
+            None => None,
+        }) else {
+            return Ok(());
+        };
+        let ncols = i32::try_from(self.dat.column_set.columns.len()).unwrap_or(i32::MAX);
+        if data.nrcolumn >= 0 && data.nrcolumn != ncols {
+            return Err(TableDatError::Storage(format!(
+                "Table::lock cannot sync table {}; another process changed the number of columns",
+                self.path.display()
+            )));
+        }
+        let header_changed = self
+            .sync_seen
+            .as_ref()
+            .is_some_and(|s| s.table_change_counter != data.table_change_counter);
+        let rows_changed = data.nrrow != self.dat.header.nrow;
+        if header_changed || rows_changed {
+            let (dat, ssm_files, ism_files, tsm_files) = read_table_dir(&self.path)?;
+            self.dat = dat;
+            self.ssm_files = ssm_files;
+            self.ism_files = ism_files;
+            self.tsm_files = tsm_files;
+        }
+        self.sync_seen = Some(data);
+        Ok(())
+    }
+
+    /// Flush pending writes. Writes are eager elsewhere (`create_table`,
+    /// the `WritableTable` flush), so this is a no-op; kept for API
+    /// compatibility.
     pub fn flush(&mut self) {}
 
-    /// Close the table, releasing the data managers (casacore `table.close()`).
+    /// Close the table, releasing the data managers and the lock
+    /// (casacore `table.close()`).
     pub fn close(self) {}
 
     /// Number of rows (casacore `table.nrows()`).
@@ -1840,6 +2136,25 @@ pub struct WritableTable {
     /// Flushes that regenerated the whole table (tests assert a chunked
     /// write stream never needs one after the first).
     full_rewrites: u64,
+    /// The directory's shared `table.lock`, when locking is in effect.
+    lock_file: Option<crate::lockfile::SharedLockFile>,
+    lock_options: crate::lockfile::EffectiveLockOptions,
+    /// A write lock explicitly held via [`WritableTable::lock`] (kept
+    /// across flushes until `unlock`).
+    write_held: bool,
+}
+
+impl Drop for WritableTable {
+    fn drop(&mut self) {
+        // Pending writes are lost here exactly as before (callers flush);
+        // the lock, however, must never be dropped silently held.
+        if self.write_held {
+            self.write_held = false;
+            if let Some(lf) = &self.lock_file {
+                let _ = lf.lock().unwrap().release_write(None);
+            }
+        }
+    }
 }
 
 /// Convert absolute `Table`-valued subtable references to the `./relative`
@@ -1919,24 +2234,82 @@ struct BufferedCell {
     pending: bool,
 }
 
+/// Attach the directory's `table.lock` for a writable handle. Permanent
+/// modes acquire the write lock right away (`PermanentLocking` with one
+/// attempt — failing with casacore's constructor exception — and
+/// `PermanentLockingWait` blocking); other modes lock around flushes or
+/// via explicit `lock`.
+fn attach_write_lock(
+    path: &std::path::Path,
+    effective: &crate::lockfile::EffectiveLockOptions,
+    create: bool,
+) -> Result<(Option<crate::lockfile::SharedLockFile>, bool), String> {
+    let Some(lf) =
+        crate::lockfile::attach(path, effective, create).map_err(|e| storage_error(path, e))?
+    else {
+        return Ok((None, false));
+    };
+    if effective.is_permanent() {
+        let nattempts = if effective.mode == crate::lockfile::LockMode::PermanentLocking {
+            1
+        } else {
+            0
+        };
+        let ok = lf
+            .lock()
+            .unwrap()
+            .acquire(crate::lockfile::LockType::Write, nattempts)
+            .map_err(|e| storage_error(path, e))?;
+        if !ok {
+            return Err(format!(
+                "Permanent lock on table {} could not be acquired",
+                path.display()
+            ));
+        }
+        return Ok((Some(lf), true));
+    }
+    Ok((Some(lf), false))
+}
+
 impl WritableTable {
     /// Start a new table with the given schema and no rows.
     pub fn create(
         dir: impl Into<std::path::PathBuf>,
         desc: crate::tabledesc::TableDesc,
     ) -> WritableTable {
+        // `NoLocking` attach cannot fail (no lock file is touched), so the
+        // with-lock constructor's error case is unreachable here.
+        WritableTable::create_with_lock(dir, desc, crate::lockfile::LockOptions::no_locking())
+            .expect("NoLocking WritableTable::create cannot fail")
+    }
+
+    /// [`WritableTable::create`] under the locking protocol: `table.lock` is
+    /// created if absent, and the write lock follows `options` (permanent
+    /// modes acquire it here and hold it to close; `auto`/`user` lock
+    /// around each flush or via explicit `lock`).
+    pub fn create_with_lock(
+        dir: impl Into<std::path::PathBuf>,
+        desc: crate::tabledesc::TableDesc,
+        options: crate::lockfile::LockOptions,
+    ) -> Result<WritableTable, String> {
         let dir: std::path::PathBuf = dir.into();
         let cells = vec![std::collections::BTreeMap::new(); desc.columns.len()];
         let touched = vec![false; desc.columns.len()];
-        WritableTable {
-            dir: absolute_dir(&dir),
+        let path = absolute_dir(&dir);
+        let effective = options.effective();
+        let (lock_file, write_held) = attach_write_lock(&path, &effective, true)?;
+        Ok(WritableTable {
+            dir: path,
             desc,
             rows: 0,
             cells,
             touched,
             meta_dirty: false,
             full_rewrites: 0,
-        }
+            lock_file,
+            lock_options: effective,
+            write_held,
+        })
     }
 
     /// Append `n` empty rows (`addrows`).
@@ -2072,9 +2445,36 @@ impl WritableTable {
     pub fn open_for_update(
         dir: impl Into<std::path::PathBuf>,
     ) -> Result<(Table, WritableTable), TableDatError> {
+        WritableTable::open_for_update_with_lock(dir, crate::lockfile::LockOptions::no_locking())
+    }
+
+    /// [`WritableTable::open_for_update`] under the locking protocol: the
+    /// read snapshot and the writable backing share the directory's
+    /// `table.lock` (one fd per process), the snapshot opened with the
+    /// caller's options and the writable side taking the write lock as the
+    /// mode calls for.
+    pub fn open_for_update_with_lock(
+        dir: impl Into<std::path::PathBuf>,
+        options: crate::lockfile::LockOptions,
+    ) -> Result<(Table, WritableTable), TableDatError> {
         let dir: std::path::PathBuf = dir.into();
-        let read = Table::open(&dir, false)?;
-        let mut wt = WritableTable::create(&dir, read.dat.desc.clone());
+        let read = Table::open_with_lock(&dir, false, options)?;
+        let path = absolute_dir(&dir);
+        let effective = options.effective();
+        let (lock_file, write_held) =
+            attach_write_lock(&path, &effective, false).map_err(TableDatError::Storage)?;
+        let mut wt = WritableTable {
+            dir: path,
+            desc: read.dat.desc.clone(),
+            rows: 0,
+            cells: vec![std::collections::BTreeMap::new(); read.dat.desc.columns.len()],
+            touched: vec![false; read.dat.desc.columns.len()],
+            meta_dirty: false,
+            full_rewrites: 0,
+            lock_file,
+            lock_options: effective,
+            write_held,
+        };
         let n = read.nrows();
         if n > 0 {
             wt.addrows(n);
@@ -2264,6 +2664,87 @@ impl WritableTable {
         self.rows
     }
 
+    /// casacore `table.lock(write=True, nattempts=0)`: hold the write lock
+    /// across flushes until [`WritableTable::unlock`]. On a fresh acquire,
+    /// the row count follows the lock file's sync record — another process
+    /// may have grown the table while it was unlocked (the buffered cells
+    /// of this handle stay authoritative for the rows they cover).
+    pub fn lock(&mut self, write: bool, nattempts: u32) -> Result<(), WriteTableError> {
+        let Some(lf) = &self.lock_file else {
+            self.write_held = write;
+            return Ok(());
+        };
+        let typ = if write {
+            crate::lockfile::LockType::Write
+        } else {
+            crate::lockfile::LockType::Read
+        };
+        let ok = lf
+            .lock()
+            .unwrap()
+            .acquire(typ, nattempts)
+            .map_err(|e| WriteTableError::Storage(storage_error(&self.dir, e)))?;
+        if !ok {
+            return Err(WriteTableError::Storage(format!(
+                "Error (gave up acquiring the lock) when acquiring {}-lock on {}",
+                if write { "write" } else { "read" },
+                self.dir.display()
+            )));
+        }
+        // A fresh acquire may follow another process's write: adopt its
+        // rows (the lock file's sync record is authoritative). Buffered
+        // cells of this handle stay authoritative for the rows they cover.
+        let sync = lf.lock().unwrap().get_info().ok().flatten();
+        if let Some(d) = sync {
+            if d.nrrow > self.rows {
+                self.rows = d.nrrow;
+            }
+        }
+        if write {
+            self.write_held = true;
+        }
+        Ok(())
+    }
+
+    /// casacore `table.unlock()`: flush pending writes (so other processes
+    /// see them once the lock drops) and release the write lock.
+    pub fn unlock(&mut self) -> Result<(), WriteTableError> {
+        self.flush()?;
+        if self.write_held {
+            self.write_held = false;
+            if let Some(lf) = &self.lock_file {
+                lf.lock()
+                    .unwrap()
+                    .release_write(None)
+                    .map_err(|e| WriteTableError::Storage(storage_error(&self.dir, e)))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// casacore `haslock(write)`: whether the write lock is explicitly held
+    /// (a write lock covers reads, so it satisfies `haslock(write=False)`).
+    pub fn has_lock(&self, _write: bool) -> bool {
+        self.write_held
+    }
+
+    /// The options this handle was created with (`table.lockoptions()`).
+    pub fn lock_options(&self) -> crate::lockfile::EffectiveLockOptions {
+        self.lock_options
+    }
+
+    /// casacore `table.ismultiused()`: another process has the table open.
+    pub fn is_multi_used(&self) -> Result<bool, WriteTableError> {
+        match &self.lock_file {
+            Some(lf) => lf
+                .lock()
+                .unwrap()
+                .is_multi_used()
+                .map_err(|e| WriteTableError::Storage(storage_error(&self.dir, e))),
+            None => Ok(false),
+        }
+    }
+
     /// Assemble the on-disk table from the buffered cells, filling missing
     /// scalar cells with their defaults; returns the table directory.
     ///
@@ -2285,6 +2766,99 @@ impl WritableTable {
     /// most one chunk of values resident, and costs time linear in the
     /// rows, however large the table.
     pub fn flush(&mut self) -> Result<std::path::PathBuf, WriteTableError> {
+        // casacore's `checkWriteLock`: the physical write happens under the
+        // write lock. A handle that explicitly holds it (`lock(write=True)`,
+        // permanent modes) keeps it across flushes; otherwise the lock is
+        // taken here and released at the end, with the sync record stored
+        // on release so other processes see the new state.
+        self.ensure_write_lock()?;
+        match self.flush_locked() {
+            Ok(dir) => {
+                self.finish_write_lock()?;
+                Ok(dir)
+            }
+            Err(e) => {
+                let _ = self.finish_write_lock();
+                Err(e)
+            }
+        }
+    }
+
+    /// Acquire the write lock for one flush unless this handle already
+    /// holds it.
+    fn ensure_write_lock(&mut self) -> Result<(), WriteTableError> {
+        let Some(lf) = &self.lock_file else {
+            return Ok(());
+        };
+        if self.write_held {
+            return Ok(());
+        }
+        let ok = lf
+            .lock()
+            .unwrap()
+            .acquire(crate::lockfile::LockType::Write, 0)
+            .map_err(|e| WriteTableError::Storage(storage_error(&self.dir, e)))?;
+        if !ok {
+            return Err(WriteTableError::Storage(format!(
+                "Error when acquiring write lock on {}",
+                self.dir.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Store the authoritative sync record (rows, columns, counters) and —
+    /// unless the handle keeps the write lock — release it.
+    fn finish_write_lock(&mut self) -> Result<(), WriteTableError> {
+        let Some(lf) = &self.lock_file else {
+            // An unattached (NoLocking) handle holds no locks, so it can
+            // keep an existing lock file's sync record fresh with a
+            // transient fd — the `patch_lock_nrrow` semantics the write
+            // path always had (a rewrite that shrinks the table must not
+            // leave a stale sync nrrow for the next reader).
+            return crate::grow::patch_lock_nrrow(&self.dir, self.rows)
+                .map_err(WriteTableError::Storage);
+        };
+        let ncols = i32::try_from(self.desc.columns.len()).unwrap_or(i32::MAX);
+        let mut lf = lf.lock().unwrap();
+        let sync = match lf.get_info().ok().flatten() {
+            Some(mut d) => {
+                d.nrrow = self.rows;
+                d.nrcolumn = ncols;
+                d.modify_counter = d.modify_counter.wrapping_add(1);
+                d
+            }
+            None => {
+                // A fresh lock file: casacore's first record carries
+                // counters starting at 1 and one entry per data manager
+                // (the row-change kind of update; a wrong DM count at most
+                // makes a casacore reader re-read `table.dat`).
+                let ndm: usize = self
+                    .desc
+                    .columns
+                    .iter()
+                    .map(|c| (c.data_manager_type.clone(), c.data_manager_group.clone()))
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
+                crate::lockfile::TableSyncData {
+                    nrrow: self.rows,
+                    nrcolumn: ncols,
+                    modify_counter: 1,
+                    table_change_counter: 1,
+                    dm_counters: vec![1; ndm],
+                }
+            }
+        };
+        if self.write_held {
+            lf.put_info(&sync)
+        } else {
+            lf.release_write(Some(&sync))
+        }
+        .map_err(|e| WriteTableError::Storage(storage_error(&self.dir, e)))
+    }
+
+    /// The flush proper (caller holds/arranges the write lock).
+    fn flush_locked(&mut self) -> Result<std::path::PathBuf, WriteTableError> {
         let dir = self.dir.clone();
         let nrow = self.rows;
         // In place needs the on-disk table to share this schema and hold
@@ -2317,9 +2891,23 @@ impl WritableTable {
             // to casacore's inline layout (with its new column offsets).
             Some(dat) if has_legacy_direct_arrays(&dir, dat) => false,
             Some(dat) => {
-                let disk = lock_sync_nrrow(&dir)
-                    .filter(|&n| n != 0)
-                    .unwrap_or(dat.header.nrow);
+                // The row count the files hold: casacore's (the lock file's
+                // sync record first, then the header -- see `Table::open`).
+                // Read through the held lock file when attached: POSIX
+                // drops the process's fcntl locks if any other fd to
+                // `table.lock` is closed, so the record is never read by
+                // opening the file afresh while the write lock is held.
+                let from_lock = match &self.lock_file {
+                    Some(lf) => lf
+                        .lock()
+                        .unwrap()
+                        .get_info()
+                        .ok()
+                        .flatten()
+                        .map(|d| d.nrrow),
+                    None => lock_sync_nrrow(&dir),
+                };
+                let disk = from_lock.filter(|&n| n != 0).unwrap_or(dat.header.nrow);
                 disk == nrow || (disk < nrow && self.grow_in_place(&dir, dat, disk, nrow)?)
             }
             None => false,
@@ -2423,7 +3011,14 @@ impl WritableTable {
             }
         }
         crate::grow::patch_table_dat_nrow(dir, new).map_err(WriteTableError::Storage)?;
-        crate::grow::patch_lock_nrrow(dir, new).map_err(WriteTableError::Storage)?;
+        // `table.lock`'s sync record is refreshed once at the end of the
+        // flush (`finish_write_lock`); patching it here would open the file
+        // behind the held write lock (and POSIX would drop the process's
+        // locks when that transient fd closed). An unattached (NoLocking)
+        // handle still patches in place, as it has no sync record to write.
+        if self.lock_file.is_none() {
+            crate::grow::patch_lock_nrrow(dir, new).map_err(WriteTableError::Storage)?;
+        }
         Ok(true)
     }
 
@@ -4225,7 +4820,7 @@ mod tests {
         assert_eq!(t.colnames(), vec!["X"]);
         // Advisory locking.
         assert!(!t.is_locked());
-        t.lock();
+        t.lock(true, 0).unwrap();
         assert!(t.is_locked());
         t.unlock();
         assert!(!t.is_locked());

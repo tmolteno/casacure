@@ -133,6 +133,25 @@ pub(crate) fn patch_table_dat_nrow(dir: &Path, nrow: u64) -> Result<(), String> 
 /// if the table has a lock file.
 pub(crate) fn patch_lock_nrrow(dir: &Path, nrow: u64) -> Result<(), String> {
     let path = dir.join("table.lock");
+    // With a live shared instance, patch through its fd (a transient open +
+    // close would drop this process's fcntl locks on the file) and keep the
+    // record's other fields by rewriting the parsed info.
+    if let Some(lf) = crate::lockfile::lookup(dir) {
+        let lf = lf.lock().unwrap();
+        if lf.missing {
+            return Ok(());
+        }
+        if let Some(data) = lf
+            .get_info()
+            .map_err(|e| path.display().to_string() + ": " + &e)?
+        {
+            let mut data = data;
+            data.nrrow = nrow;
+            lf.put_info(&data)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        return Ok(());
+    }
     let Ok(mut bytes) = std::fs::read(&path) else {
         return Ok(());
     };

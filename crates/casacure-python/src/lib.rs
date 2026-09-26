@@ -70,6 +70,7 @@ fn default_ms(
         None,
         false, // readonly: the returned main table must be writable
         true,
+        None,
         &PyTuple::empty(py),
         None,
     )?;
@@ -113,6 +114,7 @@ fn default_ms_subtable(
         dminfo,
         false,
         true,
+        None,
         &PyTuple::empty(py),
         None,
     )?;
@@ -251,6 +253,7 @@ fn tablefromascii(
             None,
             false,
             true,
+            None,
             &PyTuple::empty(py),
             None,
         )?
