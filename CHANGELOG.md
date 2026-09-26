@@ -5,6 +5,8 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.10] - 2026-09-27
+
 ### Added
 
 - **casacore's locking protocol.** Tables are coordinated between processes
