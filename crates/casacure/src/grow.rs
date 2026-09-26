@@ -269,6 +269,8 @@ enum SsmDefault {
     /// A variable-shape array: an undefined cell (offset 0), as casacore
     /// leaves a row it adds.
     Null,
+    /// A Direct Bool array: this many zero bits, inline.
+    ZeroBits(u64),
 }
 
 impl SsmDefault {
@@ -277,6 +279,7 @@ impl SsmDefault {
             SsmDefault::Bit(_) => 1,
             SsmDefault::Bytes(b) => 8 * b.len() as u64,
             SsmDefault::Record(_) | SsmDefault::Null => 8 * u64::from(crate::ssm::ARRAY_REF_SIZE),
+            SsmDefault::ZeroBits(n) => *n,
         }
     }
 }
@@ -456,6 +459,12 @@ fn put_ssm_default(
             let at = base + intra as usize * 8;
             bucket[at..at + 8].fill(0);
         }
+        SsmDefault::ZeroBits(n) => {
+            let first = offset as u64 * 8 + intra * n;
+            for bit in first..first + n {
+                bucket[(bit / 8) as usize] &= !(1u8 << (bit % 8));
+            }
+        }
     }
     Ok(())
 }
@@ -505,6 +514,17 @@ pub(crate) fn ssm_grow(
                     SsmDefault::Bit(cell.first().is_some_and(|&b| b != 0))
                 } else {
                     SsmDefault::Bytes(cell)
+                }
+            }
+            ColumnKind::Array if crate::ssm::is_direct_array(cd) => {
+                if !f.direct_cells_inline(spec, defs.len(), cd) {
+                    return Ok(false); // the old casacure layout: rewrite whole
+                }
+                let bits = crate::ssm::direct_cell_bits(cd);
+                if cd.data_type == DataType::Bool {
+                    SsmDefault::ZeroBits(bits)
+                } else {
+                    SsmDefault::Bytes(vec![0u8; (bits / 8) as usize])
                 }
             }
             ColumnKind::Array if cd.data_type != DataType::String => {
@@ -582,7 +602,10 @@ pub(crate) fn ssm_grow(
     if row < new {
         let mut template = vec![0u8; bs];
         for (c, def) in defs.iter().enumerate() {
-            if matches!(def, SsmDefault::Bit(_) | SsmDefault::Bytes(_)) {
+            if matches!(
+                def,
+                SsmDefault::Bit(_) | SsmDefault::Bytes(_) | SsmDefault::ZeroBits(_)
+            ) {
                 for r in 0..rpb {
                     put_ssm_default(
                         &mut template,

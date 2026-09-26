@@ -503,7 +503,13 @@ fn build_ssm_data(
                 }
             }
             crate::tabledesc::ColumnKind::Array => {
-                if cd.data_type == crate::record::DataType::String {
+                if crate::ssm::is_direct_array(cd) {
+                    // Direct arrays (casacore SSMDirColumn) are stored
+                    // inline like a scalar of nelem elements; Bool ones
+                    // bit-packed across the cell and then the rows.
+                    let bits = crate::ssm::direct_cell_bits(cd);
+                    (bits.div_ceil(8) as u32, bits as u32)
+                } else if cd.data_type == crate::record::DataType::String {
                     // String arrays use a 12-byte string-bucket ref cell
                     // (like a scalar variable string), not an f0i offset.
                     (12, 8 * 12)
@@ -533,6 +539,7 @@ fn build_ssm_data(
     let mut has_arrays = dm_cols.iter().any(|&c| {
         matches!(desc.columns[c].kind, crate::tabledesc::ColumnKind::Array)
             && desc.columns[c].data_type != crate::record::DataType::String
+            && !crate::ssm::is_direct_array(&desc.columns[c])
     });
     let mut has_strings = false;
 
@@ -588,6 +595,32 @@ fn build_ssm_data(
                             desc.name, cd.name
                         )));
                     };
+                    if crate::ssm::is_direct_array(cd) {
+                        let nelem = crate::ssm::direct_nelem(cd).unwrap_or(0) as usize;
+                        let got: usize = arr.shape.iter().map(|&d| d as usize).product();
+                        if got != nelem {
+                            return Err(TableCreateError::NotScalar(format!(
+                                "{}.{}: a Direct (fixed-shape) cell needs {nelem} elements, got {got}",
+                                desc.name, cd.name
+                            )));
+                        }
+                        if let crate::record::ArrayData::Bool(v) = &arr.data {
+                            // One byte per element; packed into bits below.
+                            bytes.extend(v.iter().map(|&b| u8::from(b)));
+                        } else {
+                            bytes.extend_from_slice(
+                                &crate::ssm::encode_array_data(big_endian, &arr.data).map_err(
+                                    |e| {
+                                        TableCreateError::Io(std::io::Error::other(format!(
+                                            "encode {}.{}: {e}",
+                                            desc.name, cd.name
+                                        )))
+                                    },
+                                )?,
+                            );
+                        }
+                        continue;
+                    }
                     if cd.data_type == crate::record::DataType::String {
                         // Multidim string arrays: the whole cell (shape
                         // header + filled flag + length-prefixed strings) is
@@ -670,9 +703,14 @@ fn build_ssm_data(
         .enumerate()
         .map(|(i, &col)| {
             let cd = &desc.columns[col];
+            let direct_bool =
+                cd.data_type == crate::record::DataType::Bool && crate::ssm::is_direct_array(cd);
             if cd.data_type == crate::record::DataType::Bool
-                && matches!(cd.kind, crate::tabledesc::ColumnKind::Scalar(_))
+                && (matches!(cd.kind, crate::tabledesc::ColumnKind::Scalar(_)) || direct_bool)
             {
+                // One byte per bit (a row, or a Direct cell's element): the
+                // bits are consecutive, so a Direct cell's elements follow
+                // each other and then the next row's.
                 let bytes = &mut encoded[i];
                 let mut packed = vec![0u8; bytes.len().div_ceil(8)];
                 for (r, b) in bytes.iter().enumerate() {
@@ -681,7 +719,11 @@ fn build_ssm_data(
                     }
                 }
                 *bytes = packed;
-                1
+                if direct_bool {
+                    crate::ssm::direct_cell_bits(cd) as u32
+                } else {
+                    1
+                }
             } else {
                 0
             }
@@ -2270,6 +2312,10 @@ impl WritableTable {
         // The row count the files hold: casacore's (the lock file's sync
         // record first, then the header -- see `Table::open`).
         let in_place = match &on_disk {
+            // Direct array columns written by casacure <= 3.8.8 hold
+            // array-file references; rewriting the table whole converts it
+            // to casacore's inline layout (with its new column offsets).
+            Some(dat) if has_legacy_direct_arrays(&dir, dat) => false,
             Some(dat) => {
                 let disk = lock_sync_nrrow(&dir)
                     .filter(|&n| n != 0)
@@ -2812,6 +2858,61 @@ impl WritableTable {
                 let Some(index) = parsed.indices.get(index_nr as usize) else {
                     return Ok(false);
                 };
+                if crate::ssm::is_direct_array(&cd) {
+                    if !parsed.direct_cells_inline(spec, within, &cd) {
+                        // `flush` rewrites such a table whole before
+                        // patching; a DM rebuild here would leave table.dat
+                        // with the old column offsets.
+                        return Err(WriteTableError::Storage(format!(
+                            "{}: Direct column {} is in the casacure <= 3.8.8 layout",
+                            dir.display(),
+                            cd.name
+                        )));
+                    }
+                    let nelem = crate::ssm::direct_nelem(&cd).unwrap_or(0);
+                    let bits = crate::ssm::direct_cell_bits(&cd);
+                    for (r, value) in self.pending_cells(col) {
+                        let RecordValue::Array(arr) = value else {
+                            return Ok(false);
+                        };
+                        let got: u64 = arr.shape.iter().map(|&d| u64::from(d)).product();
+                        if got != nelem || arr.shape.is_empty() {
+                            return Ok(false);
+                        }
+                        let Some(bucket) = index.find(r) else {
+                            return Ok(false);
+                        };
+                        let bit0 = u64::from(column_offset) * 8 + (r - bucket.start_row) * bits;
+                        if let crate::record::ArrayData::Bool(v) = &arr.data {
+                            let ops = bit_ops.entry(bucket.number).or_default();
+                            for (k, &b) in v.iter().enumerate() {
+                                let bit = bit0 + k as u64;
+                                let e = ops.entry((bit / 8) as usize).or_insert((0, 0));
+                                let mask = 1u8 << (bit % 8);
+                                if b {
+                                    e.0 |= mask;
+                                    e.1 &= !mask;
+                                } else {
+                                    e.1 |= mask;
+                                    e.0 &= !mask;
+                                }
+                            }
+                        } else {
+                            let Ok(cell) = crate::ssm::encode_array_data(big_endian, &arr.data)
+                            else {
+                                return Ok(false);
+                            };
+                            if cell.len() as u64 * 8 != bits {
+                                return Ok(false);
+                            }
+                            byte_patches
+                                .entry(bucket.number)
+                                .or_default()
+                                .push(((bit0 / 8) as usize, cell));
+                        }
+                    }
+                    continue;
+                }
                 if array_file.is_none() {
                     array_file = Some(
                         crate::grow::ArrayFile::open(dir, seq, big_endian)
@@ -3132,6 +3233,39 @@ impl WritableTable {
         }
         Ok(Some(()))
     }
+}
+
+/// Whether a StandardStMan data manager of the table holds a Direct array
+/// column in the casacure <= 3.8.8 layout (array-file references instead of
+/// casacore's inline cells; see `StandardStManFile::direct_cells_inline`).
+fn has_legacy_direct_arrays(dir: &std::path::Path, dat: &TableDat) -> bool {
+    use crate::columnset::DataManagerBlob;
+    for dm in &dat.column_set.data_managers {
+        let DataManagerBlob::StandardStMan(spec) = &dm.blob else {
+            continue;
+        };
+        let cols: Vec<&crate::tabledesc::ColumnDesc> = dat
+            .desc
+            .columns
+            .iter()
+            .zip(&dat.column_set.columns)
+            .filter(|(_, info)| info.data_manager_seq == dm.sequence_nr)
+            .map(|(cd, _)| cd)
+            .collect();
+        if !cols.iter().any(|cd| crate::ssm::is_direct_array(cd)) {
+            continue;
+        }
+        let Ok(f) = crate::ssm::StandardStManFile::open(dir, dm.sequence_nr, dat.header.big_endian)
+        else {
+            continue;
+        };
+        if cols.iter().enumerate().any(|(within, cd)| {
+            crate::ssm::is_direct_array(cd) && !f.direct_cells_inline(spec, within, cd)
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Clear `n` bits of `buf` starting at bit `bit` (LSB-first): partial edge
@@ -5634,6 +5768,10 @@ mod tests {
             ism_col("SCAN", DataType::Int, 0),
             data,
             flag,
+            // Direct (inline) fixed-shape arrays, as the MS's UVW / ANTENNA
+            // POSITION are in casacore's layout.
+            array_col("UVW", DataType::Double, 5, vec![3]),
+            array_col("DFLAG", DataType::Bool, 5, vec![5]),
         ];
         let arr = |shape: Vec<u32>, data: ArrayData| RecordValue::Array(ArrayValue { shape, data });
         // `gen` distinguishes the first writes from the final rewrite.
@@ -5659,9 +5797,17 @@ mod tests {
                     vec![64, 4],
                     ArrayData::Complex((0..256).map(|k| (r as f32, (k + gen) as f32)).collect()),
                 ),
-                _ => arr(
+                7 => arr(
                     vec![64, 4],
                     ArrayData::Bool((0..256).map(|k| (r + k + gen).is_multiple_of(5)).collect()),
+                ),
+                8 => arr(
+                    vec![3],
+                    ArrayData::Double((0..3).map(|k| r as f64 * 1.5 + (k + gen) as f64).collect()),
+                ),
+                _ => arr(
+                    vec![5],
+                    ArrayData::Bool((0..5).map(|k| (r + k + gen).is_multiple_of(3)).collect()),
                 ),
             }
         };
@@ -5703,7 +5849,7 @@ mod tests {
                 for c in 0..cols.len() {
                     // Chunk 2 leaves the array columns and chunk 5 every
                     // column unwritten: those rows keep their defaults.
-                    if k == 5 || (k == 2 && matches!(c, 3 | 4 | 6 | 7)) {
+                    if k == 5 || (k == 2 && matches!(c, 3 | 4 | 6 | 7 | 8 | 9)) {
                         continue;
                     }
                     let vals: Vec<RecordValue> =

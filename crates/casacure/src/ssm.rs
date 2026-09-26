@@ -300,6 +300,110 @@ impl StandardStManFile {
         Ok((slice, skip))
     }
 
+    /// The bytes covering `nbits` bits of row `row`'s cell in a column whose
+    /// cells are `nbits` bits each (a bit-packed Direct Bool array), and the
+    /// cell's bit offset into the first byte.
+    pub fn cell_bits(
+        &self,
+        index_nr: usize,
+        column_offset: u32,
+        row: u64,
+        nbits: u64,
+    ) -> Result<(&[u8], usize), SsmError> {
+        let index = self.indices.get(index_nr).ok_or(SsmError::IndexMissing {
+            index: index_nr,
+            count: self.indices.len(),
+        })?;
+        let bucket = index.find(row).ok_or(SsmError::RowOutOfRange { row })?;
+        let bit_offset = u64::from(column_offset) * 8 + (row - bucket.start_row) * nbits;
+        let base =
+            (DATA_START as u64) + u64::from(bucket.number) * u64::from(self.header.bucket_size);
+        let start = (base + bit_offset / 8) as usize;
+        let skip = (bit_offset % 8) as usize;
+        let len = (skip as u64 + nbits).div_ceil(8) as usize;
+        let slice = self
+            .data
+            .get(start..start + len)
+            .ok_or(SsmError::CellOutOfRange {
+                bucket: bucket.number,
+                offset: bit_offset / 8,
+                len: len as u64,
+            })?;
+        Ok((slice, skip))
+    }
+
+    /// Whether the Direct array column `desc` (see [`is_direct_array`]) is
+    /// stored inline, as casacore stores it -- `false` for a table written
+    /// by casacure 3.8.8 or earlier, which wrote array-file references for
+    /// Direct columns too.  The two layouts differ in the bytes a column
+    /// owns per bucket (`rows_per_bucket` cells of 8 bytes, against cells of
+    /// the element size times `nelem`), and a reference layout needs the
+    /// array file; when the sizes coincide (8-byte cells), the first row's
+    /// cell decides (a plausible reference into the array file, or null).
+    pub fn direct_cells_inline(
+        &self,
+        spec: &crate::columnset::StandardStMan,
+        col_idx: usize,
+        desc: &ColumnDesc,
+    ) -> bool {
+        let Some(f0i) = self.f0i() else {
+            return true; // a reference layout needs the array file
+        };
+        let (Some(&index_nr), Some(&offset)) = (
+            spec.col_index_map.get(col_idx),
+            spec.column_offset.get(col_idx),
+        ) else {
+            return true;
+        };
+        let Some(index) = self.indices.get(index_nr as usize) else {
+            return true;
+        };
+        let rpb = u64::from(index.rows_per_bucket);
+        // The bytes this column owns: up to the next column's region, or
+        // the end of the bucket.
+        let end = spec
+            .column_offset
+            .iter()
+            .copied()
+            .filter(|&o| o > offset)
+            .min()
+            .unwrap_or(self.header.bucket_size);
+        let region = u64::from(end - offset);
+        let reference = rpb * u64::from(ARRAY_REF_SIZE);
+        let direct = (rpb * direct_cell_bits(desc)).div_ceil(8);
+        // casacure <= 3.8.8 wrote 32-row buckets and a version-0 array file;
+        // casacore's array file is version 1 (reference-counted records).
+        let version = f0i.get(0..4).map_or(1, |b| {
+            let b: [u8; 4] = b.try_into().unwrap();
+            if self.header.big_endian {
+                u32::from_be_bytes(b)
+            } else {
+                u32::from_le_bytes(b)
+            }
+        });
+        if region != reference || version != 0 || rpb != 32 {
+            return true;
+        }
+        if direct != reference {
+            return false; // sized for references: the old casacure layout
+        }
+        // 8-byte cells either way: the first row's cell decides.
+        if index.last_row.is_empty() {
+            return true;
+        }
+        let Ok((cell, _)) = self.cell_bytes(index_nr as usize, offset, 0, ARRAY_REF_SIZE) else {
+            return true;
+        };
+        let cell: [u8; 8] = cell[..8].try_into().unwrap();
+        let v = if self.header.big_endian {
+            i64::from_be_bytes(cell)
+        } else {
+            i64::from_le_bytes(cell)
+        };
+        let plausible = v >= 16 && (v as u64) < f0i.len() as u64;
+        !plausible
+    }
+
     /// Decode one scalar cell for `column` (table column index `col_idx`)
     /// at `row`, using the SSM spec offsets from `table.dat`.
     pub fn read_scalar_cell(
@@ -468,6 +572,24 @@ impl StandardStManFile {
                 index: col_idx,
                 count: spec.column_offset.len(),
             })?;
+        if is_direct_array(desc) && self.direct_cells_inline(spec, col_idx, desc) {
+            let nelem = direct_nelem(desc).unwrap_or(0) as usize;
+            let logical: Vec<u32> = desc
+                .shape
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .rev()
+                .map(|&d| d as u32)
+                .collect();
+            if desc.data_type == DataType::Bool {
+                // Bit-packed across rows: not byte-addressable per cell.
+                return Err(SsmError::ArrayColumn(desc.name.clone()));
+            }
+            let size = (direct_cell_bits(desc) / 8) as u32;
+            let (cell, _) = self.cell_bytes(index_nr, *column_offset, row, size)?;
+            return Ok((logical, nelem, cell));
+        }
         let (cell, _) = self.cell_bytes(index_nr, *column_offset, row, ARRAY_REF_SIZE)?;
         let offset = if self.header.big_endian {
             i64::from_be_bytes(cell[0..8].try_into().unwrap())
@@ -586,6 +708,40 @@ fn parse_meta(
 /// `Int64` reference into the array index file (`table.f0i`).
 pub const ARRAY_REF_SIZE: u32 = 8;
 
+/// Whether `desc` is a **Direct** array column (column option bit 1, with a
+/// fixed shape): casacore's `SSMDirColumn` stores each cell's elements
+/// inline in the bucket, like a scalar of `nelem` elements, rather than as
+/// an 8-byte reference into the array file (`SSMIndColumn`).  The MS schema
+/// uses it for UVW, ANTENNA POSITION/OFFSET, FEED POSITION, ...  String
+/// arrays are never stored this way here.
+pub fn is_direct_array(desc: &ColumnDesc) -> bool {
+    matches!(desc.kind, ColumnKind::Array)
+        && desc.data_type != DataType::String
+        && desc.options & 1 != 0
+        && direct_nelem(desc).is_some()
+}
+
+/// Elements of a fixed-shape array cell (`None` without a usable shape).
+pub fn direct_nelem(desc: &ColumnDesc) -> Option<u64> {
+    let shape = desc.shape.as_ref()?;
+    if shape.is_empty() || shape.iter().any(|&d| d <= 0) {
+        return None;
+    }
+    Some(shape.iter().map(|&d| d as u64).product())
+}
+
+/// Bits one Direct cell of `desc` occupies in a bucket: `nelem` for Bool
+/// (bit-packed across the cell, then across rows), else `8 * nelem *` the
+/// element size.
+pub fn direct_cell_bits(desc: &ColumnDesc) -> u64 {
+    let n = direct_nelem(desc).unwrap_or(0);
+    if desc.data_type == DataType::Bool {
+        n
+    } else {
+        8 * n * array_elem_size(desc.data_type) as u64
+    }
+}
+
 /// Decode one array cell for `column` (table column index `col_idx`) at
 /// `row`, returning the logical (row-major) shape and element values.
 ///
@@ -619,6 +775,29 @@ pub fn read_array_cell(
             index: col_idx,
             count: spec.column_offset.len(),
         })?;
+    if is_direct_array(desc) && file.direct_cells_inline(spec, col_idx, desc) {
+        if desc.data_type == DataType::Bool {
+            let nelem = direct_nelem(desc).unwrap_or(0);
+            let (bytes, skip) = file.cell_bits(index_nr, *column_offset, row, nelem)?;
+            let bits = (0..nelem as usize)
+                .map(|i| bytes[(skip + i) / 8] >> ((skip + i) % 8) & 1 != 0)
+                .collect();
+            let logical: Vec<u32> = desc
+                .shape
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .rev()
+                .map(|&d| d as u32)
+                .collect();
+            return Ok(RecordValue::Array(ArrayValue {
+                shape: logical,
+                data: ArrayData::Bool(bits),
+            }));
+        }
+        let (logical, nelem, data) = file.array_cell_region(spec, col_idx, desc, row)?;
+        return decode_array_elements(file.header.big_endian, desc.data_type, logical, nelem, data);
+    }
     // The reference cell is an Int64 in the data-file byte order.
     let (cell, _) = file.cell_bytes(index_nr, *column_offset, row, ARRAY_REF_SIZE)?;
     let offset = if file.header.big_endian {
@@ -693,7 +872,19 @@ pub fn read_array_cell(
     }
 
     let (logical, nelem, data) = file.array_cell_region(spec, col_idx, desc, row)?;
-    let elem = desc.data_type;
+    decode_array_elements(file.header.big_endian, desc.data_type, logical, nelem, data)
+}
+
+/// Decode an array cell's `nelem` stored elements (data-file byte order;
+/// Bool bit-packed from bit 0) into a value of shape `logical`.
+fn decode_array_elements(
+    big_endian: bool,
+    elem: DataType,
+    logical: Vec<u32>,
+    nelem: usize,
+    data: &[u8],
+) -> Result<RecordValue, SsmError> {
+    use crate::record::{ArrayData, ArrayValue};
     // Decode the fixed-size element region in one `chunks_exact` pass with
     // direct from_{le,be}_bytes conversion — no per-element aipsio Reader
     // overhead (the hot path for array-column getcol/getcolnp on an SSM).
@@ -707,7 +898,7 @@ pub fn read_array_cell(
                 });
             }
             let mut out = Vec::with_capacity(chunks.len());
-            if file.header.big_endian {
+            if big_endian {
                 for b in chunks {
                     out.push(<$ty>::from_be_bytes(*b));
                 }
@@ -750,7 +941,7 @@ pub fn read_array_cell(
             }
             let mut v = Vec::with_capacity(nelem);
             for pair in pairs {
-                let bits = if file.header.big_endian {
+                let bits = if big_endian {
                     (
                         f32::from_be_bytes(pair[0..4].try_into().unwrap()),
                         f32::from_be_bytes(pair[4..8].try_into().unwrap()),
@@ -775,7 +966,7 @@ pub fn read_array_cell(
             }
             let mut v = Vec::with_capacity(nelem);
             for pair in pairs {
-                let bits = if file.header.big_endian {
+                let bits = if big_endian {
                     (
                         f64::from_be_bytes(pair[0..8].try_into().unwrap()),
                         f64::from_be_bytes(pair[8..16].try_into().unwrap()),
@@ -1235,8 +1426,11 @@ pub fn write_standard_stman_file(
         let end_row = (start_row + n_bucket_rows).min(n_rows);
         for (c, col) in cols.iter().enumerate() {
             let cell_size = col.cell_size as usize;
-            let (region_start, region_end) = if col.cell_bits > 0 && col.cell_bits < 8 {
-                // Bit-packed column: the packed stream is byte-addressed.
+            let (region_start, region_end) = if col.cell_bits > 0 {
+                // Bit-packed column (Bool scalars, 1 bit per row; Direct
+                // Bool arrays, nelem bits per row): the packed stream is
+                // byte-addressed, and a bucket's first row is byte-aligned
+                // because rows_per_bucket is a multiple of 8.
                 let bits = col.cell_bits as usize;
                 (
                     start_row as usize * bits / 8,
