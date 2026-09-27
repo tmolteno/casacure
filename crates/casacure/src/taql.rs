@@ -5062,7 +5062,7 @@ mod tests {
         // Escaped literal: NAME LIKE '\%' matches nothing (no literal % names).
         assert_eq!(
             rows("SELECT ROWID() AS r FROM $1 WHERE NAME LIKE '\\%'"),
-            []
+            [] as [i64; 0]
         );
     }
 
@@ -5088,7 +5088,10 @@ mod tests {
             [0, 1, 3, 4]
         );
         // Empty set matches nothing.
-        assert_eq!(rows("SELECT ROWID() AS r FROM $1 WHERE ANT IN ()"), []);
+        assert_eq!(
+            rows("SELECT ROWID() AS r FROM $1 WHERE ANT IN ()"),
+            [] as [i64; 0]
+        );
         // IN in a projection expression.
         let r = query(&t, "SELECT ANT IN (1) AS b FROM $1 WHERE ANT = 1 LIMIT 1");
         assert_eq!(bools(r.getcol("b").unwrap()), [true]);
@@ -5133,7 +5136,7 @@ mod tests {
         );
         assert_eq!(
             rows("SELECT ROWID() AS r FROM $1 ORDERBY ANT OFFSET 99"),
-            []
+            [] as [i64; 0]
         );
     }
 
