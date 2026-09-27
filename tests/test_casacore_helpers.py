@@ -664,3 +664,17 @@ def test_relative_path_ms_links_resolve_from_any_cwd(tmp_path, monkeypatch):
     for s in subs:
         table(s, readonly=True, ack=False).close()
     t2.close()
+
+
+def test_version_matches_package_metadata():
+    """`casacure.__version__` is the released package version (it was once a
+    hardcoded string that lagged the release)."""
+    import importlib.metadata
+
+    import casacure
+
+    try:
+        installed = importlib.metadata.version("casacure")
+    except importlib.metadata.PackageNotFoundError:
+        pytest.skip("casacure is not installed with package metadata")
+    assert casacure.__version__ == installed
