@@ -109,7 +109,6 @@ pub struct Table {
 
 #[derive(Default)]
 struct AutoLockState {
-    ops: u32,
     released: bool,
 }
 
@@ -852,30 +851,28 @@ user,usernoread,permanent,permanentwait"
         let mut st = self.auto_state.lock().unwrap();
         if st.released {
             st.released = false;
-            st.ops = 0;
             let t = ::casacure::Table::open_with_lock(self.dir_of(), true, self.lock_options)
                 .map_err(err)?;
             *self.inner.lock().unwrap() = Inner::Read(std::sync::Arc::new(t));
             return Ok(());
         }
-        st.ops += 1;
-        if st.ops < 25 {
-            return Ok(());
-        }
-        st.ops = 0;
-        let inner = self.inner.lock().unwrap();
-        let Inner::Read(arc) = &*inner else {
-            return Ok(());
+        // `LockFile::inspect_has_waiter` owns casacore's throttle (every
+        // 25th call, at most once per interval; interval 0 inspects every
+        // call).
+        let waiter = {
+            let inner = self.inner.lock().unwrap();
+            let Inner::Read(arc) = &*inner else {
+                return Ok(());
+            };
+            let eff = arc.lock_options();
+            if eff.mode != core::lockfile::LockMode::AutoLocking || !eff.read_locking {
+                return Ok(());
+            }
+            match arc.lock_file() {
+                Some(lf) => lf.lock().unwrap().inspect_has_waiter(false).map_err(err)?,
+                None => false,
+            }
         };
-        let eff = arc.lock_options();
-        if eff.mode != core::lockfile::LockMode::AutoLocking || !eff.read_locking {
-            return Ok(());
-        }
-        let Some(lf) = arc.lock_file() else {
-            return Ok(());
-        };
-        let waiter = lf.lock().unwrap().inspect_has_waiter(false).map_err(err)?;
-        drop(inner);
         if waiter {
             st.released = true;
             // Drop the locked snapshot for an unlocked one: the registry
