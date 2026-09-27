@@ -633,6 +633,13 @@ fn build_ssm_data(
                         }
                         continue;
                     }
+                    if cd.data_type == crate::record::DataType::String && arr.shape.is_empty() {
+                        // An undefined cell (e.g. a freshly added row of a
+                        // variable-shape column): write casacore's "no
+                        // array" zero-length reference, not string content.
+                        bytes.extend_from_slice(&[0u8; 12]);
+                        continue;
+                    }
                     if cd.data_type == crate::record::DataType::String {
                         // Multidim string arrays: the whole cell (shape
                         // header + filled flag + length-prefixed strings) is

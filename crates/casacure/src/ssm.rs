@@ -854,6 +854,14 @@ pub fn read_array_cell(
                 length: len as u32,
             });
         }
+        if len == 0 {
+            // casacore marks an undefined string array cell ("no array")
+            // with a zero-length reference.
+            return Ok(RecordValue::Array(ArrayValue {
+                shape: Vec::new(),
+                data: ArrayData::String(Vec::new()),
+            }));
+        }
         let bucket_bytes = file.bucket_bytes(bucket as u32)?;
         let start = 16 + off as usize;
         let end = start + len as usize;
@@ -1906,7 +1914,13 @@ pub fn decode_string_array_content(content: &[u8]) -> Result<(Vec<u32>, Vec<Stri
     }
     let _flag = read_i32(&mut p)?;
     let logical: Vec<u32> = casa_dims.iter().rev().copied().collect();
-    let nelem: usize = logical.iter().map(|&d| d as usize).product();
+    // A 0-dim cell (an undefined / empty array) holds no elements; the
+    // empty product would otherwise be 1.
+    let nelem: usize = if logical.is_empty() {
+        0
+    } else {
+        logical.iter().map(|&d| d as usize).product()
+    };
     let mut strings = Vec::with_capacity(nelem);
     for _ in 0..nelem {
         let len = read_i32(&mut p)?;
@@ -1927,6 +1941,30 @@ pub fn decode_string_array_content(content: &[u8]) -> Result<(Vec<u32>, Vec<Stri
 mod tests {
     use super::*;
     use crate::aipsio::MAGIC;
+
+    #[test]
+    fn zero_dim_string_array_content_has_no_elements() {
+        let empty = crate::record::ArrayValue {
+            shape: Vec::new(),
+            data: crate::record::ArrayData::String(Vec::new()),
+        };
+        let bytes = encode_string_array_content(&empty).unwrap();
+        let (shape, strings) = decode_string_array_content(&bytes).unwrap();
+        assert!(shape.is_empty());
+        assert!(strings.is_empty());
+
+        let one = crate::record::ArrayValue {
+            shape: vec![2],
+            data: crate::record::ArrayData::String(vec!["RR".into(), "a longer string".into()]),
+        };
+        let bytes = encode_string_array_content(&one).unwrap();
+        let (shape, strings) = decode_string_array_content(&bytes).unwrap();
+        assert_eq!(shape, vec![2]);
+        assert_eq!(
+            strings,
+            vec!["RR".to_string(), "a longer string".to_string()]
+        );
+    }
 
     /// Minimal BigEndian file-builder helpers for unit tests.
     struct Be(Vec<u8>);

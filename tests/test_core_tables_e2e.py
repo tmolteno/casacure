@@ -285,6 +285,37 @@ def test_string_array_column(tmp_path):
     t.close()
 
 
+def test_undefined_string_array_cells_survive_rewrite(tmp_path):
+    """Rows added to a variable-shape string array column stay undefined
+    across flushes, and a later string write + flush (a whole-table
+    rewrite) must not choke on them (OBSERVATION LOG/SCHEDULE via dask-ms)."""
+    p = str(tmp_path / "t.tab")
+    desc = maketabdesc(
+        [
+            makescacoldesc("NAME", ""),
+            makearrcoldesc("LOG", "", ndim=1),
+            makearrcoldesc("SCHEDULE", "", ndim=1),
+        ]
+    )
+    t = table(p, desc, 0)
+    t.addrows(2)
+    t.flush()
+    t.putcol("NAME", ["TART", "a name longer than eight"])
+    t.flush()
+    t.putcell("LOG", 1, np.array(["entry"], dtype=object))
+    t.flush()
+    t.close()
+    t = table(p)
+    assert list(t.getcol("NAME")) == ["TART", "a name longer than eight"]
+    assert np.asarray(t.getcell("LOG", 0)).size == 0
+    assert list(t.getcell("LOG", 1)) == ["entry"]
+    assert np.asarray(t.getcell("SCHEDULE", 1)).size == 0
+    # getcol over undefined cells must not crash (python-casacore raises
+    # "no array in row"; casacure answers with the String default)
+    t.getcol("SCHEDULE")
+    t.close()
+
+
 def _as_unicode(a):
     out = np.empty(a.shape, dtype=object)
     for i in range(a.shape[0]):

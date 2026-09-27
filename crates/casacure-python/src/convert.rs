@@ -502,16 +502,20 @@ fn arrays_to_ndarray_impl(
         Some(ArrayData::String(_)) => {
             // Multidim strings come back as {"shape":..., "array":...} dicts;
             // 1-D as a plain list.
-            let cell = cell_shape.iter().product::<usize>().max(1);
-            let nrow = cells.len();
+            // Same element count as the numeric path; cells holding fewer
+            // strings (undefined / empty cells) are padded with "", the
+            // String default, as `fill_flat` pads numeric cells.
             let mut flat: Vec<String> = Vec::with_capacity(nrow * cell);
             for c in cells {
-                if let RecordValue::Array(a) = c {
-                    for i in 0..cell {
-                        if let ArrayData::String(v) = &a.data {
-                            flat.push(v[i].clone());
-                        }
-                    }
+                let strings = match c {
+                    RecordValue::Array(a) => match &a.data {
+                        ArrayData::String(v) => Some(v),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                for i in 0..cell {
+                    flat.push(strings.and_then(|v| v.get(i)).cloned().unwrap_or_default());
                 }
             }
             let list = PyList::empty(py);
