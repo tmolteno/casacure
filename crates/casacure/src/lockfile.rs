@@ -696,6 +696,27 @@ mod posix {
             || e.raw_os_error() == Some(libc::EACCES)
     }
 
+    impl LockFile {
+        /// Whether this instance still stands for the `table.lock` now at
+        /// its path. A table deleted and re-created at the same path gets a
+        /// new lock file (new inode); an instance attached to the old one
+        /// must stay with the handles of the old table and not be shared
+        /// with handles of the new one (casacore opens a lock file per
+        /// table object, so its new handles always see the new file).
+        fn is_current(&self) -> bool {
+            use std::os::unix::fs::MetadataExt;
+            match std::fs::metadata(&self.path) {
+                Ok(on_disk) => {
+                    !self.missing
+                        && self.file.metadata().is_ok_and(|open| {
+                            open.dev() == on_disk.dev() && open.ino() == on_disk.ino()
+                        })
+                }
+                Err(_) => self.missing,
+            }
+        }
+    }
+
     fn no_underlying_file() -> io::Result<File> {
         // A placeholder for the missing-file case; never used for I/O
         // because every path checks `missing` first.
@@ -775,7 +796,9 @@ mod posix {
         let path = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
         let reg = LOCK_REGISTRY.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
         let reg = reg.lock().unwrap();
-        reg.get(&path).and_then(|weak| weak.upgrade())
+        reg.get(&path)
+            .and_then(|weak| weak.upgrade())
+            .filter(|arc| arc.lock().unwrap().is_current())
     }
 
     /// Open (or create) the directory's `table.lock`, sharing an existing
@@ -794,7 +817,17 @@ mod posix {
         let mut reg = reg.lock().unwrap();
         if let Some(weak) = reg.get(&path) {
             if let Some(arc) = weak.upgrade() {
-                return Ok(Some(arc));
+                let reusable = {
+                    let lf = arc.lock().unwrap();
+                    // A missing-file instance cannot serve a create, which
+                    // must make the file and lock it for real.
+                    lf.is_current() && !(create && lf.missing)
+                };
+                if reusable {
+                    return Ok(Some(arc));
+                }
+                // Otherwise the old instance stays with its (old-table)
+                // handles and this path's entry moves to a fresh one.
             }
         }
         let Some(lf) = LockFile::attach(dir, options, create)? else {
@@ -952,6 +985,25 @@ mod tests {
         assert!(Arc::ptr_eq(&a, &b));
         assert!(a.lock().unwrap().path().ends_with("table.lock"));
         assert!(!a.lock().unwrap().missing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recreated_table_gets_a_fresh_instance() {
+        let dir = temp_dir("recreated");
+        let opts = LockOptions::locking_default().effective();
+        let old = attach(&dir, &opts, true).unwrap().unwrap();
+        // Delete and re-create the table directory while `old` is alive.
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let new = attach(&dir, &opts, true).unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&old, &new));
+        assert!(!new.lock().unwrap().missing);
+        // lookup() serves the instance for the current file only.
+        assert!(Arc::ptr_eq(&lookup(&dir).unwrap(), &new));
+        // Handles of the same (new) table keep sharing one instance.
+        let again = attach(&dir, &opts, false).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&new, &again));
     }
 
     #[cfg(unix)]

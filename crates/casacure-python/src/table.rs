@@ -64,6 +64,50 @@ struct WriteData {
     /// Pending in-store writes not yet physically written to disk; write ops
     /// set it, `flush()`/`close()`/mutating taql clear it.
     dirty: bool,
+    /// The table directory this backing belongs to (see [`DirPin`]).
+    pin: DirPin,
+}
+
+/// Identifies the on-disk table directory a [`WriteData`] was built for, so
+/// a table deleted and re-created at the same path (a new directory) is not
+/// served the old table's cells. The open directory fd keeps the old inode
+/// allocated while the backing lives, so its number cannot be recycled for
+/// the new directory and the (dev, inode) comparison is reliable.
+struct DirPin(Option<std::fs::File>);
+
+impl DirPin {
+    fn new(dir: &std::path::Path) -> DirPin {
+        #[cfg(unix)]
+        {
+            DirPin(std::fs::File::open(dir).ok())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+            DirPin(None)
+        }
+    }
+
+    /// Whether `dir` is still the directory this pin was taken on. Without a
+    /// pin (non-unix, or the open failed) the backing is trusted, as before.
+    fn is_current(&self, dir: &std::path::Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let Some(pinned) = &self.0 else {
+                return true;
+            };
+            match (pinned.metadata(), std::fs::metadata(dir)) {
+                (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+                _ => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+            true
+        }
+    }
 }
 
 /// Live writable backing per table directory (weak: closed tables may be
@@ -89,8 +133,18 @@ fn register_write(dir: &std::path::Path, shared: &std::sync::Arc<std::sync::Mute
 
 /// The shared backing for `dir` created earlier in this process (strong refs:
 /// stays live so later writable handles accumulate into the one cell store).
+/// A backing whose directory has since been deleted (and perhaps re-created)
+/// is dropped from the registry instead: its cells belong to the old table.
 fn find_write(dir: &std::path::Path) -> Option<std::sync::Arc<std::sync::Mutex<WriteData>>> {
-    write_registry().lock().unwrap().get(dir).cloned()
+    let mut reg = write_registry().lock().unwrap();
+    let shared = reg.get(dir).cloned()?;
+    let current = shared.lock().unwrap().pin.is_current(dir);
+    if current {
+        Some(shared)
+    } else {
+        reg.remove(dir);
+        None
+    }
 }
 
 /// python-casacore-compatible `table` object.
@@ -207,6 +261,7 @@ fn refresh_write(
     s.read = read;
     s.wt = wt;
     s.dirty = false;
+    s.pin = DirPin::new(dir);
     true
 }
 
@@ -733,6 +788,7 @@ user,usernoread,permanent,permanentwait"
                 read,
                 wt,
                 dirty: false,
+                pin: DirPin::new(&dir),
             }));
             register_write(&dir, &shared);
             return Ok(Table {
@@ -820,6 +876,7 @@ user,usernoread,permanent,permanentwait"
             read,
             wt,
             dirty: false,
+            pin: DirPin::new(&dir),
         }));
         register_write(&dir, &shared);
         Ok(Table {
@@ -3103,6 +3160,7 @@ fn taql_result_to_table(_py: Python<'_>, out: core::taql::TaqlTable) -> PyResult
         read,
         wt,
         dirty: false,
+        pin: DirPin::new(&dir),
     }));
     register_write(&dir, &shared);
     Ok(Table {

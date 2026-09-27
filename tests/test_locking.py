@@ -49,6 +49,40 @@ def ms_path(tmp_path):
     return d
 
 
+def test_recreated_table_is_not_served_stale_state(tmp_path):
+    """An MS deleted and re-created at the same path while handles of the
+    old one are still alive (dask-ms caches its table proxies) must be read
+    and written as the new table, not through the old one's cached state.
+    `default_ms` creates the subtables without going through `table(...,
+    desc)`, so the old FIELD backing used to be reused."""
+    import shutil
+    from casacore.tables import default_ms
+    d = str(tmp_path / "r.ms")
+
+    def build(names):
+        shutil.rmtree(d, ignore_errors=True)
+        default_ms(d).close()
+        w = table(d + "::FIELD", readonly=False, ack=False, lockoptions="user")
+        w.lock(write=True)
+        w.addrows(len(names))
+        w.flush()
+        w.putcol("NAME", names)
+        w.flush()
+        w.unlock()
+        return w  # left open, like a cached proxy
+
+    old = build(["A", "B", "C"])
+    new = build(["J0000"])
+    r = table(d + "::FIELD", ack=False, lockoptions="user")
+    r.lock()
+    assert r.nrows() == 1
+    assert list(r.getcol("NAME")) == ["J0000"]
+    r.unlock()
+    r.close()
+    new.close()
+    old.close()
+
+
 def test_lockoptions_validation(ms_path):
     t = table(ms_path, ack=False)
     assert t.lockoptions()["option"] == "default"
