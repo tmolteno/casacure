@@ -5,6 +5,43 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.13] - 2026-09-27
+
+### Fixed
+
+- **A table re-created at the same path in one process was served the old
+  table's state.** Two per-process registries keyed by path outlived a deleted
+  table: the shared `table.lock` instance (a new table's handles synced against
+  the deleted lock file; `default_ms` at the path could fail with
+  `table.lock: pread`) and the Python binding's shared writable backing (a new
+  writer resumed from the old table's cells, e.g. the old row count). Entries
+  are now checked against the directory / lock file actually at the path
+  (device + inode, pinned by an open fd so the inode cannot be recycled) and
+  replaced when it changed. Handles opened before the delete keep the old
+  table, as in casacore. Seen via dask-ms, whose cached table proxies keep old
+  handles alive when an MS is rebuilt under the same name.
+- **Undefined variable-shape string array cells broke the next rewrite.** Rows
+  added to a table with such a column (MS `OBSERVATION` `LOG`/`SCHEDULE`,
+  `FEED` `POLARIZATION_TYPE`) were written as 0-dimensional cell content whose
+  empty shape decoded as one element, so the next string write + flush failed
+  with `bad string reference: bucket 0, offset 8, length 0`. Undefined cells
+  are now written as casacore's zero-length "no array" reference, a
+  zero-length reference reads as an empty array, and 0-dimensional content
+  decodes as no elements (tables written by 3.8.12 stay readable).
+- `getcol` over string array cells holding fewer strings than the column's
+  cell shape (e.g. undefined cells) panicked with an index out of bounds; the
+  missing strings are now `""`, as numeric cells are padded with their default.
+- `casacure.__version__` was a hardcoded string (still `3.8.3`); it now comes
+  from the Cargo package version.
+
+### Tests
+
+- Regression tests for each fix: re-creating an MS with `default_ms` while old
+  writable handles are alive, the lock-file registry across a re-created
+  directory, undefined string array cells surviving a rewrite (and `getcol`),
+  0-dimensional string array content, and `__version__` against the installed
+  package metadata.
+
 ## [3.8.12] - 2026-09-27
 
 ### Fixed
