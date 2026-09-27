@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import textwrap
 
 import numpy as np
@@ -300,3 +301,48 @@ def test_casacure_resyncs_after_casacore_grows(ms_path):
     assert np.array_equal(got[4:], np.full(2, 3.25))
     reader.unlock()
     reader.close()
+
+
+AUTO_YIELD_CHILD = _child_code("""
+    import sys, time
+    from casacore.tables import table
+    path = sys.argv[1]
+    # A user-mode writer retrying for up to ~6 s: its pid sits in the lock
+    # file's request list for that window, which is what an AutoLocking
+    # holder's inspect looks for.
+    t = table(path, readonly=False,
+              lockoptions={"option": "user", "interval": 0}, ack=False)
+    t.lock(write=True, nattempts=6)
+    t.unlock()
+    t.close()
+    print("DONE")
+""")
+
+
+def test_auto_locking_reader_yields_to_a_waiting_writer(ms_path):
+    """An AutoLocking reader's open read lock is released once another
+    process is waiting (inspect throttle), and the next operation
+    re-acquires — with a resync — once the writer is done."""
+    r = table(ms_path, readonly=True, ack=False)
+    assert r.haslock(write=False)
+
+    child = subprocess.Popen([PYTHON, "-c", AUTO_YIELD_CHILD, ms_path],
+                             stdout=subprocess.PIPE, text=True)
+    # The child has registered its request (retry loop with 1 s sleeps).
+    time.sleep(1.5)
+    # casacore's inspect throttle: the first 25 operations after the last
+    # check are skipped, the 26th really looks -- sees the waiter, and the
+    # reader's read lock is released.
+    for _ in range(26):
+        r.getcol("DATA")
+    assert not r.haslock(write=False), "auto reader must yield to a waiter"
+
+    # The writer gets the lock now and finishes.
+    out = child.communicate(timeout=30)[0]
+    assert child.returncode == 0 and "DONE" in out
+
+    # The next operation re-acquires the lock.
+    r.getcol("DATA")
+    assert r.haslock(write=False)
+    assert r.nrows() == 4
+    r.close()

@@ -985,4 +985,148 @@ mod tests {
         lf.put_info(&data).unwrap();
         assert_eq!(lf.get_info().unwrap().unwrap(), data);
     }
+
+    /// The acquire/release state machine's writer-protection guards: a
+    /// write hold satisfies read requests without downgrading the region,
+    /// a read release never drops a writer's exclusion, and only the
+    /// write-lock release stores sync info.
+    #[cfg(unix)]
+    #[test]
+    fn acquire_release_state_machine_guards_the_writer() {
+        let dir = temp_dir("state");
+        let opts = LockOptions::locking_default().effective();
+        let lf = attach(&dir, &opts, true).unwrap().unwrap();
+        let mut lf = lf.lock().unwrap();
+        assert_eq!(lf.held, None);
+
+        assert!(lf.acquire(LockType::Write, 1).unwrap());
+        assert_eq!(lf.held, Some(LockType::Write));
+        // A read request over our own write hold is satisfied without
+        // touching fcntl (re-acquiring F_RDLCK would *downgrade* the byte).
+        assert!(lf.acquire(LockType::Read, 1).unwrap());
+        assert_eq!(lf.held, Some(LockType::Write));
+        // A read release must not drop the writer's exclusion.
+        lf.release_read().unwrap();
+        assert_eq!(lf.held, Some(LockType::Write));
+        // Releasing the write stores the sync record and clears the hold.
+        let data = TableSyncData {
+            nrrow: 7,
+            nrcolumn: 1,
+            modify_counter: 1,
+            table_change_counter: 1,
+            dm_counters: vec![1],
+        };
+        lf.release_write(Some(&data)).unwrap();
+        assert_eq!(lf.held, None);
+        assert_eq!(lf.get_info().unwrap().unwrap(), data);
+
+        // A read hold does not satisfy haslock(write)-style requests, and a
+        // write release with only a read hold is a no-op (it must not
+        // unlock another holder's exclusion, nor store info).
+        assert!(lf.acquire(LockType::Read, 1).unwrap());
+        lf.release_write(None).unwrap();
+        assert_eq!(lf.held, Some(LockType::Read));
+        lf.release_read().unwrap();
+        assert_eq!(lf.held, None);
+    }
+
+    /// `inspect_has_waiter` reports the request list unthrottled with
+    /// `always`, and throttles plain calls to every 25th (after the
+    /// inspection interval has elapsed).
+    #[cfg(unix)]
+    #[test]
+    fn inspect_reports_waiters_and_throttles() {
+        use std::fs::OpenOptions;
+        use std::io::Write as _;
+        use std::time::Duration;
+        let dir = temp_dir("inspect");
+        // A 1 s inspection interval keeps the test quick.
+        let opts = LockOptions {
+            mode: LockMode::AutoLocking,
+            interval: 1,
+            maxwait: 0,
+        }
+        .effective();
+        let lf = attach(&dir, &opts, true).unwrap().unwrap();
+        let mut lf = lf.lock().unwrap();
+
+        // No waiter: even the unthrottled check says no.
+        assert!(!lf.inspect_has_waiter(true).unwrap());
+
+        // Seed one waiting pid. No fcntl locks are held here, so a
+        // transient fd over the file is safe (the invariant only forbids
+        // it while locks are held).
+        let mut prefix = vec![0u8; SIZE_REQ_ID];
+        prefix[0..4].copy_from_slice(&1u32.to_be_bytes());
+        prefix[4..8].copy_from_slice(&(std::process::id() as i32).to_be_bytes());
+        let mut f = OpenOptions::new().write(true).open(lf.path()).unwrap();
+        f.write_all(&prefix).unwrap();
+        drop(f);
+
+        // The unthrottled check sees the waiter.
+        assert!(lf.inspect_has_waiter(true).unwrap());
+        // The next 25 plain calls are throttled to false however many
+        // waiters there are (`LockFile::inspect`'s call counter).
+        for _ in 0..25 {
+            assert!(!lf.inspect_has_waiter(false).unwrap());
+        }
+        // Outlast the interval: the 26th call passes the spent counter and
+        // reports the waiter.
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(lf.inspect_has_waiter(false).unwrap());
+    }
+
+    /// `create` opens an existing lock file without truncating it: a
+    /// rewrite of a casacore table must not destroy its sync record.
+    #[cfg(unix)]
+    #[test]
+    fn create_does_not_truncate_an_existing_record() {
+        let dir = temp_dir("notrunc");
+        let opts = LockOptions::locking_default().effective();
+        let seeded = {
+            let lf = attach(&dir, &opts, true).unwrap().unwrap();
+            let lf = lf.lock().unwrap();
+            let data = TableSyncData {
+                nrrow: 99,
+                nrcolumn: 4,
+                modify_counter: 8,
+                table_change_counter: 2,
+                dm_counters: vec![1, 1, 1, 1],
+            };
+            lf.put_info(&data).unwrap();
+            data
+        };
+        // create=true on the same file (a rewrite re-attaches with create).
+        let lf = attach(&dir, &opts, true).unwrap().unwrap();
+        assert_eq!(lf.lock().unwrap().get_info().unwrap().unwrap(), seeded);
+    }
+
+    /// `NoLocking` attaches nothing and leaves no lock file behind.
+    #[cfg(unix)]
+    #[test]
+    fn no_locking_attaches_nothing() {
+        let dir = temp_dir("nolock");
+        let opts = LockOptions::no_locking().effective();
+        assert!(attach(&dir, &opts, true).unwrap().is_none());
+        assert!(!dir.join("table.lock").exists());
+    }
+
+    /// The v1/v2 switch sits exactly at `u32::MAX` (casacore's
+    /// `DataManager::MAXROWNR32`), so record widths match casacore's for
+    /// every row count.
+    #[test]
+    fn sync_record_version_boundary_at_u32_max() {
+        for (nrrow, version) in [(u64::from(u32::MAX), 1u32), (u64::from(u32::MAX) + 1, 2)] {
+            let data = TableSyncData {
+                nrrow,
+                nrcolumn: 1,
+                modify_counter: 1,
+                table_change_counter: 1,
+                dm_counters: vec![1],
+            };
+            let bytes = data.to_bytes();
+            assert_eq!(&bytes[16..20], &version.to_be_bytes(), "nrrow {nrrow}");
+            assert_eq!(TableSyncData::parse(&bytes).unwrap().nrrow, nrrow);
+        }
+    }
 }

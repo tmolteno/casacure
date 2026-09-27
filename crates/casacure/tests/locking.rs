@@ -7,7 +7,7 @@
 //! runs a child copy of this test binary (the `locking_child` entry) under
 //! an env-selected role.
 
-use casacure::lockfile::{LockMode, LockOptions};
+use casacure::lockfile::{attach, LockMode, LockOptions, TableSyncData};
 use casacure::record::RecordValue;
 use casacure::tabledesc::TableDesc;
 use casacure::{Table, WritableTable};
@@ -260,4 +260,145 @@ fn created_table_writes_a_sync_record() {
     // the open sees all rows.
     let t = Table::open(&dir, true).unwrap();
     assert_eq!(t.nrows(), 3);
+}
+
+/// A `user`-mode handle holds nothing at rest: the open's read lock is
+/// released immediately, and only explicit `lock` calls hold one.
+#[test]
+fn user_mode_open_releases_the_open_lock() {
+    let dir = temp_dir("usermode");
+    create_table(&dir, 2);
+    let mut t = Table::open_with_lock(
+        &dir,
+        true,
+        LockOptions {
+            mode: LockMode::UserLocking,
+            ..LockOptions::locking_default()
+        },
+    )
+    .unwrap();
+    assert_eq!(t.nrows(), 2);
+    assert!(!t.has_lock(false));
+    assert!(!t.has_lock(true));
+
+    t.lock(true, 0).unwrap();
+    assert!(t.has_lock(true));
+    assert!(t.has_lock(false)); // a write lock covers reads
+                                // A second request is satisfied without nesting.
+    t.lock(false, 0).unwrap();
+    assert!(t.has_lock(true));
+
+    t.unlock();
+    assert!(!t.has_lock(false));
+    assert!(!t.has_lock(true));
+}
+
+/// A writable flush stores the sync record with the authoritative row
+/// count and column count while PRESERVING the change counters — the
+/// contract that lets a casacore reader resync rows cheaply instead of
+/// re-reading the whole table.
+#[test]
+fn writable_flush_stores_the_sync_record_and_preserves_counters() {
+    let dir = temp_dir("syncrecord");
+    create_table(&dir, 2);
+    // Seed a distinctive record (as a previous casacore session would have
+    // left it).
+    let opts = LockOptions::locking_default().effective();
+    let seed = TableSyncData {
+        nrrow: 2,
+        nrcolumn: 1,
+        modify_counter: 7,
+        table_change_counter: 5,
+        dm_counters: vec![2, 3],
+    };
+    attach(&dir, &opts, false)
+        .unwrap()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .put_info(&seed)
+        .unwrap();
+
+    let (_read, mut wt) =
+        WritableTable::open_for_update_with_lock(&dir, LockOptions::locking_default()).unwrap();
+    wt.addrows(2);
+    wt.putcell(0, 2, RecordValue::Double(2.0)).unwrap();
+    wt.putcell(0, 3, RecordValue::Double(3.0)).unwrap();
+    wt.flush().unwrap();
+
+    let record = attach(&dir, &opts, false)
+        .unwrap()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .get_info()
+        .unwrap()
+        .expect("flush must write the sync record");
+    assert_eq!(record.nrrow, 4);
+    assert_eq!(record.nrcolumn, 1);
+    assert_eq!(record.modify_counter, 8, "modify counter increments");
+    assert_eq!(record.table_change_counter, 5, "table counter preserved");
+    assert_eq!(record.dm_counters, vec![2, 3], "DM counters preserved");
+    // And a fresh reader sees the new rows.
+    assert_eq!(Table::open(&dir, true).unwrap().nrows(), 4);
+}
+
+/// Regression: a rewrite through a handle without a lock file attached
+/// (the TaQL UPDATE/DELETE path) used to leave the lock file's sync record
+/// at the stale row count, so the next open trusted it and failed reads
+/// with "row N not covered by any indexed bucket". Every flush must
+/// refresh the record — downwards too.
+#[test]
+fn nolocking_rewrite_keeps_the_sync_record_fresh() {
+    let dir = temp_dir("shrink");
+    create_table(&dir, 6);
+    // Make the record exist (a real session's flush would have).
+    let (read, mut wt) =
+        WritableTable::open_for_update_with_lock(&dir, LockOptions::locking_default()).unwrap();
+    wt.putcell(0, 0, RecordValue::Double(0.0)).unwrap();
+    wt.flush().unwrap();
+    assert_eq!(read.nrows(), 6);
+    drop(read);
+    drop(wt);
+
+    // The shrink: a fresh (no-locking) handle rewrites the table with
+    // fewer rows — the full-rewrite path.
+    let desc = scalar_desc();
+    let mut wt = WritableTable::create(&dir, desc);
+    wt.addrows(3);
+    for r in 0..3 {
+        wt.putcell(0, r, RecordValue::Double(r as f64)).unwrap();
+    }
+    wt.flush().unwrap();
+
+    let t = Table::open(&dir, true).unwrap();
+    assert_eq!(t.nrows(), 3, "stale sync record must not shadow table.dat");
+    let ids = t.getcol(0, 0, 3).unwrap();
+    assert_eq!(ids.len(), 3);
+}
+
+/// A read snapshot and a writable backing of the same directory coexist in
+/// one process without self-deadlocking (POSIX record locks do not
+/// conflict within a process), and a flush under the held write lock
+/// neither blocks nor loses the lock.
+#[test]
+fn read_and_write_handles_coexist_in_one_process() {
+    let dir = temp_dir("coexist");
+    create_table(&dir, 2);
+    let (read, mut wt) =
+        WritableTable::open_for_update_with_lock(&dir, LockOptions::locking_default()).unwrap();
+    assert_eq!(read.nrows(), 2);
+
+    // Hold the write lock explicitly across flushes (the dask-ms
+    // _writelock_runner pattern).
+    wt.lock(true, 0).unwrap();
+    wt.addrows(1);
+    wt.putcell(0, 2, RecordValue::Double(2.0)).unwrap();
+    wt.flush().unwrap();
+    assert!(wt.has_lock(true), "an explicit hold survives a flush");
+    wt.unlock().unwrap();
+    assert!(!wt.has_lock(true));
+
+    // Fresh reader: the growth is visible through the sync record.
+    assert_eq!(Table::open(&dir, true).unwrap().nrows(), 3);
 }
