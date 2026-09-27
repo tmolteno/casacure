@@ -5,6 +5,31 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.12] - 2026-09-27
+
+### Fixed
+
+- **The auto-locking yield inspected every ~625 operations instead of 25.**
+  The Python auto-locking tick kept its own 25-operation counter in front of
+  `LockFile::inspect`, which applies casacore's exact throttle itself; the two
+  counters multiplied, so an `AutoLocking` reader held its read lock far longer
+  than casacore would while another process was waiting. The tick now delegates
+  all throttling to `LockFile::inspect`.
+- Three TaQL assertions comparing `Vec<i64>` against a bare `[]` were ambiguous
+  under rustc 1.98's inference (serde_json's `PartialEq<Value> for i64` is an
+  alternative candidate) and failed compilation on the first recompile with the
+  new toolchain; the element type is now explicit.
+
+### Tests
+
+- Ten new locking tests: the acquire/release state machine's writer-protection
+  guards, the inspect/waiter throttle, create-does-not-truncate, `NoLocking`
+  attaching nothing, the sync record's v1/v2 boundary at `u32::MAX`; user-mode
+  rest state, sync-record counter preservation on flush, a regression test for
+  the stale-record-after-shrink bug, read/write handle coexistence; and an
+  end-to-end auto-yield test (reader yields to a waiting writer, re-acquires
+  afterwards).
+
 ## [3.8.11] - 2026-09-27
 
 ### Fixed
