@@ -732,4 +732,63 @@ and ssh refuses it with "Bad owner or permissions"), and `gh` needs
 `main` does not trigger CI — the workflows are `tags: ["v*"]` only, so tag to
 release.
 
+## 2026-09-2x — verification pass after the 3.8.7/benchmark round (HEAD 63556a5)
+
+Context: HEAD is now `63556a5` (merge) over `6698f7d` "perf+fix:
+benchmark-round improvements" and `4c6dd3f` (release 3.8.7). The seven
+python-suite failures from the earlier session are all long fixed
+(`e31470e`, released in v3.8.5); this pass re-verified both suites from
+scratch and fixed three regressions that `6698f7d` introduced *after* the
+last green tag — CI never saw them because workflows only run on `v*` tags:
+
+1. **Rust test failure** `table::tests::empty_variable_shape_array_cells_read_back_empty`
+   panicked with `index out of bounds: len 0 index 0` at
+   `crates/casacure/src/record.rs:306`. Root cause: the new
+   `as_contiguous_bytes()` bulk-copy fast path (added in `6698f7d`, used by
+   `ssm::encode_array_data`) computed element size via `size_of_val(&$v[0])`,
+   which panics on an **empty** array cell — exactly the state of an MS array
+   column between `addrows` and the first write (the dask-ms smoke's WEIGHT
+   column). Fix: element size from `$v.first().map(size_of_val).unwrap_or(0)`;
+   an empty array now encodes to a valid empty byte slice. Note this bug was
+   invisible to the python suite (it only reproduces through the specific
+   empty-variable-shape read-back test / dask-ms smoke path).
+2. **`cargo fmt --check` failed** on `crates/casacure/src/lib.rs` (the
+   `pub use table::{...}` list re-wrapped incorrectly). Ran `cargo fmt`.
+3. **`cargo clippy --workspace --all-targets -- -D warnings` failed** with 8
+   deprecation warnings: pyo3 0.27 deprecated `Python::allow_threads` in
+   favour of `Python::detach` (the `6698f7d` code was written against the
+   older API name). Drop-in rename of all 8 call sites in
+   `crates/casacure-{python}/src/{table,convert}.rs`.
+
+State after the fixes: `cargo test` 154 lib + 15 + 5 + 6 integration all
+green; `cargo fmt --check` clean; `cargo clippy ... -D warnings` clean;
+python suite (`PYTHONPATH=target/devpkg:tests/shim .venv-bench/bin/python -m
+pytest tests/ -q`) **137 passed, 1 skipped** against the 3.8.7 wheel before
+the record.rs fix; a fresh wheel with all three fixes was rebuilt and the
+suite re-run green.
+
+**Update after `git pull` (same session):** the three local fixes turned out
+to be redundant — upstream `origin/main` had independently landed equivalents
+by v3.8.13 (`2ef7596`): `as_contiguous_bytes` computes the byte length as
+`size_of_val(&$v[..])`, the `pub use` list wraps correctly (with a new
+`lock_sync_nrrow` export), and all `allow_threads` sites are `detach`
+(casacure-python applied as a clean no-op). A stashed copy of the local fixes
+was re-applied on top of the pulled tree and conflicted on `lib.rs`/
+`record.rs`; both were resolved in upstream's favour (see below), so `main`
+carries no local divergence. The entry above is kept as the historical record
+of the verification pass; the open action "commit before tagging" is void.
+
+State at v3.8.13 (`2ef7596`): full re-verification on the pulled tree is
+**green** — `cargo fmt --check` clean, `cargo clippy --workspace --all-targets
+-- -D warnings` clean, `cargo test` 203 tests (169 lib + 34 integration), the
+python suite **167 passed, 1 skipped** against the freshly built 3.8.13
+wheel (upstream grew the suite 137 → 167 tests), and the dask-ms smoke all OK
+(read/write/casacore cross-check, xds_to_ms, xds_from_ms, 12 subtables).
+The conflicted stash (`stash@{0}`: the 3.8.7-era verification fixes) was fully
+accounted for — `record.rs`/`lib.rs` resolved to upstream,
+`convert.rs`/`table.rs` matched upstream exactly, `handover.md` kept — and
+dropped afterwards. `main` == `origin/main` with no local divergence.
+
+Same machine notes as above still apply (ssh/gh quirks, tag-only CI).
+
 
