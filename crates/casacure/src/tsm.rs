@@ -16,8 +16,22 @@
 //!   earlier dimensions are the fixed per-row array shape.
 //! - The tile data file (`table.f{seq}_TSM{fileSeqNr}`) is a bucket file in
 //!   the table's *data-file* endianness: tile `t` occupies
-//!   `fileOffset + t * tileSize * elemSize` bytes. A row's array cell spans
-//!   the full first `nrdim-1` tile dimensions (the common fixed-shape case).
+//!   `fileOffset + t * bucketSize` bytes, `bucketSize` being
+//!   `tileSize * elemSize` (Bool: `ceil(tileSize / 8)`, bit-packed).
+//!   Tiles are numbered first-axis-fastest over the tile grid
+//!   (`ceil(cubeShape / tileShape)` tiles per axis, `TSMCube::setupNrTiles`),
+//!   every tile a full bucket even at the cube edge; within a tile the
+//!   elements are first-axis-fastest in tile coordinates.
+//! - When the tile covers the whole cell (tile == cell in every non-row
+//!   dimension) a row's cell is one contiguous run inside one tile
+//!   ([`CellLocation`], the fast path).  Otherwise — dask-ms tiles the
+//!   channel axis at <= 64 channels, so this is the common MS case — a cell
+//!   is split over the tiles of its row layer ([`TiledCell`]): in each tile
+//!   the row's part starts at element `row_in_tile * prod(tile cell dims)`,
+//!   in tile-cell coordinates, of which only the in-cube part is valid.
+//! - Cubes created extensible (TiledShapeStMan, one per cell shape) each
+//!   get their own tile file (`TiledStMan::makeHypercube`), so the tile
+//!   data is kept per file sequence number.
 
 use crate::aipsio::{AipsIoError, Reader};
 use crate::record::{ArrayData, ArrayValue, DataType, RecordValue};
@@ -37,10 +51,20 @@ pub enum TsmError {
     UnexpectedType { expected: String, found: String },
     #[error("row {row} outside the {nrow} rows of the tiled data")]
     RowOutOfRange { row: u64, nrow: u64 },
+    /// The cell spans several tiles, so it has no single contiguous span:
+    /// the single-span accessors ([`TsmFile::cell_span`],
+    /// [`TsmFile::cell_location`]) return this; [`TsmFile::cell_place`]
+    /// describes such a cell as per-tile segments instead.
     #[error(
-        "tiles smaller than the cell are not supported (cube {cube_shape:?}, tile {tile_shape:?})"
+        "the cell spans several tiles (cube {cube_shape:?}, tile {tile_shape:?}); \
+         use TsmFile::cell_place"
     )]
     TileTooSmall {
+        cube_shape: Vec<i64>,
+        tile_shape: Vec<i64>,
+    },
+    #[error("invalid hypercube geometry (cube {cube_shape:?}, tile {tile_shape:?})")]
+    BadGeometry {
         cube_shape: Vec<i64>,
         tile_shape: Vec<i64>,
     },
@@ -98,13 +122,19 @@ pub struct TsmHeader {
     pub pos_map: Vec<u32>,
 }
 
-/// A parsed TiledColumnStMan storage manager: header plus the tile file.
+/// A parsed TiledColumnStMan storage manager: header plus the tile file(s).
 #[derive(Debug)]
 pub struct TsmFile {
     pub header: TsmHeader,
-    /// `table.f{seq}_TSM{fileSeqNr}` tile data, in the table's data-file
-    /// byte order (memory-mapped so chunked reads only touch their pages).
-    tile_data: crate::datafile::Buffer,
+    /// `table.f{seq}_TSM{fileSeqNr}` tile data per file sequence number, in
+    /// the table's data-file byte order (memory-mapped so chunked reads only
+    /// touch their pages).  One entry for TiledColumnStMan; TiledShapeStMan
+    /// keeps one file per extensible cube.
+    tile_files: Vec<(i32, crate::datafile::Buffer)>,
+    /// Per cube (same index as `header.cubes`): which `tile_files` entry
+    /// holds its data and, for a cube whose tiles are smaller than the cell,
+    /// the precomputed per-tile gather plan.
+    geoms: Vec<CubeGeom>,
     big_endian: bool,
 }
 
@@ -120,6 +150,8 @@ pub struct CellLocation {
     pub skip: usize,
     /// Elements in the cell.
     pub nelem: usize,
+    /// The tile file (`table.f{seq}_TSM{file_seq}`) holding the bytes.
+    pub file_seq: i32,
 }
 
 /// A stored cell's bytes in the tile file (see [`TsmFile::cell_span`]).
@@ -134,9 +166,254 @@ pub struct CellSpan<'a> {
     pub nelem: usize,
 }
 
+/// One contiguous run of a cell inside one tile of its cube's gather plan:
+/// `len` elements at element `src` of the row's block in tile `tile` (of
+/// the row layer) go to element `dst` of the cell (CASA order, first axis
+/// fastest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TileRun {
+    tile: usize,
+    src: usize,
+    dst: usize,
+    len: usize,
+}
+
+/// A cube's precomputed geometry.
+#[derive(Debug, Clone, Default)]
+struct CubeGeom {
+    /// Index into `TsmFile::tile_files` (None: no data file).
+    file: Option<usize>,
+    /// Empty for a cube whose tile covers the cell (the contiguous fast
+    /// path); otherwise the runs of one row's cell, ordered by tile then by
+    /// position within the tile (so file offsets increase).
+    runs: Vec<TileRun>,
+    /// Tiles in one row layer (`prod(ceil(cube / tile))` over cell dims).
+    layer_tiles: usize,
+    /// Elements of one row's block within a tile (`prod(tile cell dims)`).
+    tile_cell_elems: usize,
+    /// Whether the cell spans several tiles (or padded ones).
+    tiled: bool,
+}
+
+impl CubeGeom {
+    fn new(cube: &TsmCube, file: Option<usize>) -> CubeGeom {
+        let nrdim = cube.nrdim as usize;
+        let mut g = CubeGeom {
+            file,
+            ..CubeGeom::default()
+        };
+        if nrdim < 1 || cube.cube_shape.len() != nrdim || cube.tile_shape.len() != nrdim {
+            return g;
+        }
+        let cell = &cube.cube_shape[..nrdim - 1];
+        let tile = &cube.tile_shape[..nrdim - 1];
+        if cell == tile || tile.iter().any(|&t| t <= 0) || cell.iter().any(|&c| c < 0) {
+            return g;
+        }
+        g.tiled = true;
+        g.runs = tile_runs(cell, tile);
+        g.layer_tiles = cell
+            .iter()
+            .zip(tile)
+            .map(|(&c, &t)| (c as usize).div_ceil(t as usize))
+            .product();
+        g.tile_cell_elems = tile.iter().product::<i64>() as usize;
+        g
+    }
+}
+
+/// The gather plan of one cell of CASA shape `cell` stored in tiles of
+/// `tile` (both without the row axis): for every tile of the row layer
+/// (first axis fastest), the lines along axis 0 of its in-cube part, merged
+/// where they are contiguous both in the tile and in the cell.
+fn tile_runs(cell: &[i64], tile: &[i64]) -> Vec<TileRun> {
+    let n = cell.len();
+    let cell: Vec<usize> = cell.iter().map(|&c| c as usize).collect();
+    let tile: Vec<usize> = tile.iter().map(|&t| t as usize).collect();
+    let per_dim: Vec<usize> = (0..n).map(|d| cell[d].div_ceil(tile[d])).collect();
+    let layer: usize = per_dim.iter().product();
+    let mut cstride = vec![1usize; n];
+    let mut tstride = vec![1usize; n];
+    for d in 1..n {
+        cstride[d] = cstride[d - 1] * cell[d - 1];
+        tstride[d] = tstride[d - 1] * tile[d - 1];
+    }
+    let mut runs: Vec<TileRun> = Vec::new();
+    let mut tc = vec![0usize; n]; // tile coordinate in the grid
+    let mut valid = vec![0usize; n];
+    let mut p = vec![0usize; n]; // position inside the tile
+    for k in 0..layer {
+        let mut rem = k;
+        for d in 0..n {
+            tc[d] = rem % per_dim[d];
+            rem /= per_dim[d];
+            valid[d] = tile[d].min(cell[d] - tc[d] * tile[d]);
+        }
+        p.iter_mut().for_each(|x| *x = 0);
+        loop {
+            let src: usize = (1..n).map(|d| p[d] * tstride[d]).sum();
+            let dst: usize = (0..n).map(|d| (tc[d] * tile[d] + p[d]) * cstride[d]).sum();
+            let len = valid[0];
+            match runs.last_mut() {
+                Some(r) if r.tile == k && r.src + r.len == src && r.dst + r.len == dst => {
+                    r.len += len
+                }
+                _ => runs.push(TileRun {
+                    tile: k,
+                    src,
+                    dst,
+                    len,
+                }),
+            }
+            // Odometer over dims 1.. of the tile's valid part.
+            let mut d = 1;
+            while d < n {
+                p[d] += 1;
+                if p[d] < valid[d] {
+                    break;
+                }
+                p[d] = 0;
+                d += 1;
+            }
+            if d >= n {
+                break;
+            }
+        }
+    }
+    runs
+}
+
+/// One piece of a multi-tile cell in the tile file (see [`TiledCell`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellSegment {
+    /// Offset of the first byte covering the piece.
+    pub byte_off: usize,
+    /// Bytes covering the piece (Bool: `ceil((skip + len) / 8)`).
+    pub nbytes: usize,
+    /// Bit offset of the piece within its first byte (Bool only; else 0).
+    pub skip: usize,
+    /// First element of the cell (CASA order) the piece holds.
+    pub dst: usize,
+    /// Elements in the piece.
+    pub len: usize,
+}
+
+/// A stored cell that spans several tiles, borrowed from the mapped tile
+/// file: its per-tile [`CellSegment`]s plus gather helpers that assemble
+/// the cell in cell order (CASA, first axis fastest).
+#[derive(Debug, Clone, Copy)]
+pub struct TiledCell<'a> {
+    /// The tile file holding the cell.
+    pub file_seq: i32,
+    /// Elements in the cell.
+    pub nelem: usize,
+    is_bool: bool,
+    /// Bytes per element (1 for Bool, which is bit-packed).
+    esize: usize,
+    /// Byte offset of the first tile of the row's layer.
+    layer_off: usize,
+    /// Bytes per tile (bucket).
+    bucket: usize,
+    /// Element offset of the row's block within each tile.
+    row_elem: usize,
+    runs: &'a [TileRun],
+    data: &'a [u8],
+}
+
+impl<'a> TiledCell<'a> {
+    fn segment(&self, r: &TileRun) -> CellSegment {
+        let tile_off = self.layer_off + r.tile * self.bucket;
+        let elem = self.row_elem + r.src;
+        if self.is_bool {
+            let skip = elem % 8;
+            CellSegment {
+                byte_off: tile_off + elem / 8,
+                nbytes: (skip + r.len).div_ceil(8),
+                skip,
+                dst: r.dst,
+                len: r.len,
+            }
+        } else {
+            CellSegment {
+                byte_off: tile_off + elem * self.esize,
+                nbytes: r.len * self.esize,
+                skip: 0,
+                dst: r.dst,
+                len: r.len,
+            }
+        }
+    }
+
+    /// Identifies the row layer (and cube) the cell lives in: cells with the
+    /// same key have their `j`-th segments in the same tile.
+    pub fn layer_key(&self) -> (i32, usize, usize) {
+        (self.file_seq, self.layer_off, self.runs.len())
+    }
+
+    /// The `j`-th piece (`j < segments().len()`).
+    pub fn nth_segment(&self, j: usize) -> CellSegment {
+        self.segment(&self.runs[j])
+    }
+
+    /// The cell's pieces, in increasing file order.
+    pub fn segments(&self) -> impl ExactSizeIterator<Item = CellSegment> + '_ {
+        self.runs.iter().map(move |r| self.segment(r))
+    }
+
+    /// Byte offset one past the last byte the cell touches.
+    fn end(&self) -> usize {
+        self.runs.last().map_or(0, |r| {
+            let s = self.segment(r);
+            s.byte_off + s.nbytes
+        })
+    }
+
+    /// The cell's element bytes in cell order and in the data file's byte
+    /// order (non-Bool types): what a contiguous cell's span would hold.
+    pub fn gather_bytes(&self, out: &mut Vec<u8>) {
+        out.clear();
+        out.resize(self.nelem * self.esize, 0);
+        for s in self.segments() {
+            let d = s.dst * self.esize;
+            out[d..d + s.nbytes].copy_from_slice(&self.data[s.byte_off..s.byte_off + s.nbytes]);
+        }
+    }
+
+    /// Decode a Bool cell into `out` (`nelem` bools, cell order).
+    pub fn gather_bools(&self, out: &mut [bool]) {
+        for s in self.segments() {
+            decode_bits_into(
+                &self.data[s.byte_off..s.byte_off + s.nbytes],
+                s.skip,
+                &mut out[s.dst..s.dst + s.len],
+            );
+        }
+    }
+
+    /// A Bool cell's bits packed LSB-first from bit 0 of `out` (cell order),
+    /// the form a contiguous cell's span holds with `skip == 0`.
+    pub fn gather_bits(&self, out: &mut Vec<u8>) {
+        out.clear();
+        out.resize(self.nelem.div_ceil(8), 0);
+        for s in self.segments() {
+            or_bits_from(out, s.dst, &self.data[s.byte_off..], s.skip, s.len);
+        }
+    }
+}
+
+/// Where a stored cell lives (see [`TsmFile::cell_place`]).
+#[derive(Debug, Clone, Copy)]
+pub enum CellPlace<'a> {
+    /// The cell is one contiguous run inside one tile (the tile covers the
+    /// cell): the fast path.
+    Contiguous(CellLocation),
+    /// The cell spans several tiles (tiles smaller than the cell).
+    Tiled(TiledCell<'a>),
+}
+
 impl TsmFile {
-    /// Read `<table_dir>/table.f{seq}` (header) plus its first tile data
-    /// file, and parse the geometry.
+    /// Read `<table_dir>/table.f{seq}` (header) plus its tile data files,
+    /// and parse the geometry.
     pub fn open(
         table_dir: impl AsRef<std::path::Path>,
         seq_nr: u32,
@@ -147,56 +424,112 @@ impl TsmFile {
         let data = std::fs::read(&header_path)
             .map_err(|e| TsmError::FileIo(crate::datafile::FileIoError::new(&header_path, e)))?;
         let header = parse_header(&data)?;
-        // The first cube holding data names the tile file (a shape-stman
-        // placeholder cube for not-yet-set cells carries -1); a column with
-        // no cubes at all (every cell unset) still has a tile-file entry.
-        // The first cube holding data names the tile file (a shape-stman
-        // placeholder cube for not-yet-set cells carries -1). A column with
-        // no cube holding data (every cell unset — casacore skips writing
-        // the tile file entirely) opens with an empty buffer; every read
-        // resolves to the column default.
-        let file_seq = header.cubes.iter().map(|c| c.file_seq_nr).find(|&f| f >= 0);
-        let tile_data = match file_seq {
-            Some(file_seq) => {
-                let path = dir.join(format!("table.f{seq_nr}_TSM{file_seq}"));
-                let tile_file = std::fs::File::open(&path)
-                    .map_err(|e| TsmError::FileIo(crate::datafile::FileIoError::new(&path, e)))?;
-                crate::datafile::Buffer::from_file(tile_file)
-                    .map_err(|e| TsmError::FileIo(crate::datafile::FileIoError::new(&path, e)))?
+        // Each cube names its tile file (a shape-stman placeholder cube for
+        // not-yet-set cells carries -1; every extensible cube has a file of
+        // its own). A column with no cube holding data (every cell unset —
+        // casacore skips writing the tile file entirely) opens with no
+        // buffer; every read resolves to the column default.
+        let mut tile_files: Vec<(i32, crate::datafile::Buffer)> = Vec::new();
+        for cube in &header.cubes {
+            let f = cube.file_seq_nr;
+            if f < 0 || tile_files.iter().any(|(s, _)| *s == f) {
+                continue;
             }
-            None => crate::datafile::Buffer::from(Vec::new()),
-        };
-        Ok(TsmFile {
-            header,
-            tile_data,
-            big_endian: table_big_endian,
-        })
+            let path = dir.join(format!("table.f{seq_nr}_TSM{f}"));
+            let has_rows = header
+                .cubes
+                .iter()
+                .any(|c| c.file_seq_nr == f && c.cube_shape.last().is_some_and(|&r| r > 0));
+            let tile_file = match std::fs::File::open(&path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !has_rows => continue,
+                Err(e) => {
+                    return Err(TsmError::FileIo(crate::datafile::FileIoError::new(
+                        &path, e,
+                    )))
+                }
+            };
+            let buf = crate::datafile::Buffer::from_file(tile_file)
+                .map_err(|e| TsmError::FileIo(crate::datafile::FileIoError::new(&path, e)))?;
+            tile_files.push((f, buf));
+        }
+        Ok(TsmFile::assemble(header, tile_files, table_big_endian))
     }
 
-    /// Assemble a `TsmFile` from an already-parsed header (tests).
+    fn assemble(
+        header: TsmHeader,
+        tile_files: Vec<(i32, crate::datafile::Buffer)>,
+        big_endian: bool,
+    ) -> TsmFile {
+        let geoms = header
+            .cubes
+            .iter()
+            .map(|c| {
+                let file = tile_files.iter().position(|(s, _)| *s == c.file_seq_nr);
+                CubeGeom::new(c, file)
+            })
+            .collect();
+        TsmFile {
+            header,
+            tile_files,
+            geoms,
+            big_endian,
+        }
+    }
+
+    /// Assemble a `TsmFile` from an already-parsed header (tests): the
+    /// same tile bytes back every file the cubes name.
     #[cfg(test)]
     fn from_header(
         header: TsmHeader,
         tile_data: impl Into<crate::datafile::Buffer>,
         big_endian: bool,
     ) -> TsmFile {
-        TsmFile {
-            header,
-            tile_data: tile_data.into(),
-            big_endian,
+        let buf: crate::datafile::Buffer = tile_data.into();
+        let mut seqs: Vec<i32> = header
+            .cubes
+            .iter()
+            .map(|c| c.file_seq_nr)
+            .filter(|&f| f >= 0)
+            .collect();
+        seqs.dedup();
+        if seqs.is_empty() {
+            seqs.push(0);
         }
+        let files = seqs
+            .iter()
+            .map(|&s| (s, crate::datafile::Buffer::from(buf.as_slice().to_vec())))
+            .collect();
+        TsmFile::assemble(header, files, big_endian)
+    }
+
+    /// Assemble a `TsmFile` with one tile buffer per file sequence number
+    /// (tests of multi-file TiledShapeStMan columns).
+    #[cfg(test)]
+    fn from_header_files(
+        header: TsmHeader,
+        files: Vec<(i32, Vec<u8>)>,
+        big_endian: bool,
+    ) -> TsmFile {
+        let files = files
+            .into_iter()
+            .map(|(s, v)| (s, crate::datafile::Buffer::from(v)))
+            .collect();
+        TsmFile::assemble(header, files, big_endian)
     }
 
     /// Drop this file's mapped tile pages (used after a bulk read has copied
     /// the cells out, to keep streaming scans resident at ~the working set).
     pub fn drop_data_pages(&self) {
-        self.tile_data.drop_pages();
+        for (_, b) in &self.tile_files {
+            b.drop_pages();
+        }
     }
 
-    /// Read the fixed-shape array cell of `desc` (an array column of the
-    /// hypercolumn) at `row`, returning the logical shape and values.
+    /// Read the array cell of `desc` (an array column of the hypercolumn)
+    /// at `row`, returning the logical shape and values.
     pub fn read_cell(&self, desc: &ColumnDesc, row: u64) -> Result<RecordValue, TsmError> {
-        let Some((cube, span)) = self.cell_span(desc, row)? else {
+        let Some((cube, place)) = self.cell_place(desc, row)? else {
             return self.read_default_cell(desc);
         };
         let nrdim = cube.nrdim as usize;
@@ -206,10 +539,26 @@ impl TsmFile {
             .rev()
             .map(|&d| d as u32)
             .collect();
-        let data = if desc.data_type == DataType::Bool {
-            decode_bits(span.bytes, span.skip, span.nelem)?
-        } else {
-            decode_tile_data(span.bytes, desc.data_type, span.nelem, self.big_endian)?
+        let data = match place {
+            CellPlace::Contiguous(loc) => {
+                let bytes = self.location_bytes(&loc);
+                if desc.data_type == DataType::Bool {
+                    decode_bits(bytes, loc.skip, loc.nelem)?
+                } else {
+                    decode_tile_data(bytes, desc.data_type, loc.nelem, self.big_endian)?
+                }
+            }
+            CellPlace::Tiled(tc) => {
+                if desc.data_type == DataType::Bool {
+                    let mut v = vec![false; tc.nelem];
+                    tc.gather_bools(&mut v);
+                    ArrayData::Bool(v)
+                } else {
+                    let mut buf = Vec::new();
+                    tc.gather_bytes(&mut buf);
+                    decode_tile_data(&buf, desc.data_type, tc.nelem, self.big_endian)?
+                }
+            }
         };
         Ok(RecordValue::Array(ArrayValue {
             shape: logical,
@@ -217,11 +566,25 @@ impl TsmFile {
         }))
     }
 
+    /// The bytes a [`CellLocation`] from this file covers.
+    pub fn location_bytes(&self, loc: &CellLocation) -> &[u8] {
+        &self.file_data(loc.file_seq)[loc.byte_off..loc.byte_off + loc.nbytes]
+    }
+
+    fn file_data(&self, file_seq: i32) -> &[u8] {
+        self.tile_files
+            .iter()
+            .find(|(s, _)| *s == file_seq)
+            .map_or(&[][..], |(_, b)| b.as_slice())
+    }
+
     /// Where the stored cell of `desc` at `row` lives in the tile file,
     /// borrowed from the mapped data (no decode, no allocation), with the
     /// cube holding it. `None` is an unset cell (it reads as the column
     /// default). Bool cells are bit-packed: the cell starts `skip` bits into
-    /// `bytes`; every other type is byte-aligned (`skip == 0`).
+    /// `bytes`; every other type is byte-aligned (`skip == 0`).  A cell that
+    /// spans several tiles has no single span: this returns
+    /// [`TsmError::TileTooSmall`] for it (use [`TsmFile::cell_place`]).
     pub fn cell_span(
         &self,
         desc: &ColumnDesc,
@@ -231,7 +594,7 @@ impl TsmFile {
             (
                 cube,
                 CellSpan {
-                    bytes: &self.tile_data[loc.byte_off..loc.byte_off + loc.nbytes],
+                    bytes: self.location_bytes(&loc),
                     skip: loc.skip,
                     nelem: loc.nelem,
                 },
@@ -240,7 +603,9 @@ impl TsmFile {
     }
 
     /// The tile-file sequence number (`table.f{seq}_TSM{n}`) holding this
-    /// column's data, if any cube stores data.
+    /// column's data, if any cube stores data (the first such file; a
+    /// multi-cube TiledShapeStMan column has one file per cube, see
+    /// [`CellLocation::file_seq`]).
     pub fn tile_file_seq(&self) -> Option<i32> {
         self.header
             .cubes
@@ -252,11 +617,26 @@ impl TsmFile {
     /// Where the stored cell of `desc` at `row` sits in the tile file (see
     /// [`TsmFile::cell_span`]) as byte offsets, so a writer can patch the
     /// cell in place at exactly the position the reader reads it from.
+    /// A cell spanning several tiles returns [`TsmError::TileTooSmall`]
+    /// (use [`TsmFile::cell_place`]).
     pub fn cell_location(
         &self,
         desc: &ColumnDesc,
         row: u64,
     ) -> Result<Option<(&TsmCube, CellLocation)>, TsmError> {
+        match self.cell_place(desc, row)? {
+            None => Ok(None),
+            Some((cube, CellPlace::Contiguous(loc))) => Ok(Some((cube, loc))),
+            Some((cube, CellPlace::Tiled(_))) => Err(TsmError::TileTooSmall {
+                cube_shape: cube.cube_shape.clone(),
+                tile_shape: cube.tile_shape.clone(),
+            }),
+        }
+    }
+
+    /// The cube index holding `row` and the row's index within that cube,
+    /// or `None` for an unset cell.
+    fn locate(&self, row: u64) -> Result<Option<(usize, u64)>, TsmError> {
         if row >= self.header.nrrow {
             return Err(TsmError::RowOutOfRange {
                 row,
@@ -267,76 +647,71 @@ impl TsmFile {
         // header's maps are authoritative: a row they do not mention is an
         // unset cell. Without one (TiledColumnStMan) cubes cover consecutive
         // row ranges in creation order, so the ranges partition the rows.
-        let located = if !self.header.row_map.is_empty() {
+        if !self.header.row_map.is_empty() {
             // Interval maps: entry i covers the rows down to the previous
             // entry, with the cell position counting back from pos_map[i]
             // ("rowMap gives the last row number for which the cubeMap
             // applies"; cube number 0 is the placeholder for "no value").
             let i = self.header.row_map.partition_point(|&r| u64::from(r) < row);
-            match self.header.row_map.get(i).copied() {
+            return Ok(match self.header.row_map.get(i).copied() {
                 Some(last_row) if u64::from(last_row) >= row => {
                     let back = u64::from(last_row) - row;
                     let pos = i64::from(self.header.pos_map[i]) - back as i64;
                     if pos < 0 {
                         return Ok(None);
                     }
-                    self.header
-                        .cubes
-                        .get(self.header.cube_map[i] as usize)
-                        .and_then(|cube| {
-                            // A placeholder cube (casacore writes one for
-                            // not-yet-set cells, with no shape) means the
-                            // row is unset.
-                            let rows = *cube.cube_shape.last().unwrap_or(&0);
-                            (rows > 0).then_some((cube, pos as u64))
-                        })
+                    let ci = self.header.cube_map[i] as usize;
+                    self.header.cubes.get(ci).and_then(|cube| {
+                        // A placeholder cube (casacore writes one for
+                        // not-yet-set cells, with no shape) means the
+                        // row is unset.
+                        let rows = *cube.cube_shape.last().unwrap_or(&0);
+                        (rows > 0).then_some((ci, pos as u64))
+                    })
                 }
                 _ => None,
-            }
-        } else {
-            let mut covered: u64 = 0;
-            let mut found = None;
-            for c in &self.header.cubes {
-                let rows = *c.cube_shape.last().unwrap_or(&0);
-                if rows <= 0 {
-                    continue;
-                }
-                if row < covered + rows as u64 {
-                    found = Some((c, row - covered));
-                    break;
-                }
-                covered += rows as u64;
-            }
-            found
-        };
-        let (cube, row_in_cube) = match located {
-            Some((c, r)) => (c, r),
-            None => return Ok(None),
-        };
-        let nrdim = cube.nrdim as usize;
-        if nrdim < 1 || cube.cube_shape.len() != nrdim || cube.tile_shape.len() != nrdim {
-            return Err(TsmError::TileTooSmall {
-                cube_shape: cube.cube_shape.clone(),
-                tile_shape: cube.tile_shape.clone(),
             });
+        }
+        let mut covered: u64 = 0;
+        for (ci, c) in self.header.cubes.iter().enumerate() {
+            let rows = *c.cube_shape.last().unwrap_or(&0);
+            if rows <= 0 {
+                continue;
+            }
+            if row < covered + rows as u64 {
+                return Ok(Some((ci, row - covered)));
+            }
+            covered += rows as u64;
+        }
+        Ok(None)
+    }
+
+    /// Where the stored cell of `desc` at `row` lives: one contiguous span
+    /// when the tile covers the cell, else the per-tile segments of a cell
+    /// that spans several tiles.  `None` is an unset cell.
+    pub fn cell_place(
+        &self,
+        desc: &ColumnDesc,
+        row: u64,
+    ) -> Result<Option<(&TsmCube, CellPlace<'_>)>, TsmError> {
+        let Some((ci, row_in_cube)) = self.locate(row)? else {
+            return Ok(None);
+        };
+        let cube = &self.header.cubes[ci];
+        let geom = &self.geoms[ci];
+        let nrdim = cube.nrdim as usize;
+        let bad = || TsmError::BadGeometry {
+            cube_shape: cube.cube_shape.clone(),
+            tile_shape: cube.tile_shape.clone(),
+        };
+        if nrdim < 1 || cube.cube_shape.len() != nrdim || cube.tile_shape.len() != nrdim {
+            return Err(bad());
         }
         // The per-row cell spans all but the (extensible) row dimension.
         let cell_size: i64 = cube.cube_shape[..nrdim - 1].iter().product::<i64>();
         let row_tiles: i64 = cube.tile_shape[nrdim - 1];
-        if row_tiles <= 0 {
-            return Err(TsmError::TileTooSmall {
-                cube_shape: cube.cube_shape.clone(),
-                tile_shape: cube.tile_shape.clone(),
-            });
-        }
-        // Tiles must match the cell in the non-row dimensions.
-        for i in 0..nrdim - 1 {
-            if cube.tile_shape[i] != cube.cube_shape[i] {
-                return Err(TsmError::TileTooSmall {
-                    cube_shape: cube.cube_shape.clone(),
-                    tile_shape: cube.tile_shape.clone(),
-                });
-            }
+        if row_tiles <= 0 || cube.tile_shape.iter().any(|&t| t <= 0) {
+            return Err(bad());
         }
         let tile_nr = row_in_cube / row_tiles as u64;
         let row_in_tile = (row_in_cube % row_tiles as u64) as i64;
@@ -350,27 +725,60 @@ impl TsmFile {
         } else {
             elem_size(desc.data_type)? as i64 * 8
         };
+        let tile_bits = tile_size * elem_bits;
+        // Each tile occupies a whole, byte-aligned bucket (casacore
+        // `TSMDataColumn::dataLength`: `(nrPixels + 7) / 8` for Bool; the
+        // writer pads the final byte of a bit-packed tile), so a tile starts
+        // at `tile_nr * bucket_bytes` — never at a raw bit count, which
+        // drifts when the per-tile bit count is not a whole number of bytes
+        // (an MS FLAG tile: 158 bools x 26214 rows/tile = 4141812 bits, 4
+        // bits over a byte boundary).
+        let bucket_bytes = (tile_bits as usize).div_ceil(8);
+        let data = geom
+            .file
+            .map_or(&[][..], |i| self.tile_files[i].1.as_slice());
+        let file_seq = cube.file_seq_nr;
+        if geom.tiled {
+            // Tiles are numbered first-axis-fastest over the tile grid, the
+            // row axis last: row layer `tile_nr` starts at tile
+            // `tile_nr * layer_tiles`.
+            let tc = TiledCell {
+                file_seq,
+                nelem: cell_elems,
+                is_bool,
+                esize: if is_bool {
+                    1
+                } else {
+                    elem_size(desc.data_type)?
+                },
+                layer_off: cube.file_offset as usize
+                    + tile_nr as usize * geom.layer_tiles * bucket_bytes,
+                bucket: bucket_bytes,
+                row_elem: row_in_tile as usize * geom.tile_cell_elems,
+                runs: &geom.runs,
+                data,
+            };
+            if tc.end() > data.len() {
+                return Err(TsmError::RowOutOfRange {
+                    row,
+                    nrow: self.header.nrrow,
+                });
+            }
+            return Ok(Some((cube, CellPlace::Tiled(tc))));
+        }
         let cell_bits = if is_bool {
             // from the cube: the desc's shape may be absent (variable-shape)
             cell_elems
         } else {
             cell_elems * elem_size(desc.data_type)? * 8
         };
-        let tile_bits = tile_size * elem_bits;
-        // Each tile occupies a whole, byte-aligned bucket (the writer pads
-        // the final byte of a bit-packed tile), so a tile starts at
-        // `tile_nr * bucket_bytes` — never at a raw bit count, which drifts
-        // when the per-tile bit count is not a whole number of bytes (an MS
-        // FLAG tile: 158 bools x 26214 rows/tile = 4141812 bits, 4 bits over
-        // a byte boundary).
-        let bucket_bytes = (tile_bits as usize).div_ceil(8);
         let bit_off = row_in_tile * cell_bits as i64;
         let byte_off =
             cube.file_offset as usize + tile_nr as usize * bucket_bytes + (bit_off / 8) as usize;
         let skip = (bit_off % 8) as usize;
         let nbytes = (skip + cell_bits).div_ceil(8);
         let end = byte_off + nbytes;
-        if end > self.tile_data.len() {
+        if end > data.len() {
             return Err(TsmError::RowOutOfRange {
                 row,
                 nrow: self.header.nrrow,
@@ -378,12 +786,13 @@ impl TsmFile {
         }
         Ok(Some((
             cube,
-            CellLocation {
+            CellPlace::Contiguous(CellLocation {
                 byte_off,
                 nbytes,
                 skip,
                 nelem: cell_elems,
-            },
+                file_seq,
+            }),
         )))
     }
 
@@ -829,6 +1238,33 @@ pub fn or_bytes_at(out: &mut [u8], src: &[u8], bit: usize) {
     }
 }
 
+/// OR `n` bits of `src`, starting at bit `src_bit` (LSB-first), into `out`
+/// starting at bit `out_bit`: the general (both sides unaligned) form of
+/// [`or_bytes_at`], eight bits per step.  Bits of `out` outside
+/// `out_bit..out_bit + n` are left untouched.
+pub fn or_bits_from(out: &mut [u8], out_bit: usize, src: &[u8], src_bit: usize, n: usize) {
+    let mut k = 0usize;
+    while k < n {
+        let take = (n - k).min(8);
+        let sb = src_bit + k;
+        let (i, sh) = (sb >> 3, sb & 7);
+        let mut byte = src[i] >> sh;
+        if sh != 0 && sh + take > 8 {
+            byte |= src[i + 1] << (8 - sh);
+        }
+        if take < 8 {
+            byte &= (1u8 << take) - 1;
+        }
+        let ob = out_bit + k;
+        let (o, osh) = (ob >> 3, ob & 7);
+        out[o] |= byte << osh;
+        if osh != 0 && osh + take > 8 {
+            out[o + 1] |= byte >> (8 - osh);
+        }
+        k += take;
+    }
+}
+
 /// The writes both TSM writers pass to [`tsm_header`].
 struct TsmHeaderParams<'a> {
     stman_type: &'a str,
@@ -840,6 +1276,9 @@ struct TsmHeaderParams<'a> {
     nrow: u64,
     layout: &'a TsmLayout,
     tile_file_len: usize,
+    /// The tile shape's cell dimensions when they differ from the cell
+    /// (tests of casacore's sub-cell tiling); `None` = tiles cover the cell.
+    tile_cell: Option<&'a [i64]>,
 }
 
 /// The canonical big-endian AipsIO TSM header, shared by both writers.  For
@@ -859,10 +1298,11 @@ fn tsm_header(p: TsmHeaderParams<'_>) -> Vec<u8> {
         nrow,
         layout,
         tile_file_len,
+        tile_cell,
     } = p;
     let mut cube_shape = cell_shape.to_vec();
     cube_shape.push(nrow as i64);
-    let mut tile_shape = cell_shape.to_vec();
+    let mut tile_shape = tile_cell.unwrap_or(cell_shape).to_vec();
     tile_shape.push(layout.rows_per_tile as i64);
 
     let mut hw = crate::aipsio::Writer::new();
@@ -988,6 +1428,7 @@ pub(crate) fn tsm_grown_header(
         nrow,
         layout: &layout,
         tile_file_len,
+        tile_cell: None,
     });
     let file_seq = u32::from(stman_type == "TiledShapeStMan");
     Ok((hdr, tile_file_len as u64, file_seq))
@@ -1078,6 +1519,7 @@ pub fn write_tsm_file_bool(
         nrow,
         layout: &layout,
         tile_file_len: tile_file.len(),
+        tile_cell: None,
     });
     let real_file_seq = if stman_type == "TiledShapeStMan" {
         1
@@ -1148,6 +1590,7 @@ pub fn write_tsm_file(
         nrow,
         layout: &layout,
         tile_file_len: tile_file.len(),
+        tile_cell: None,
     });
     let real_file_seq = if stman_type == "TiledShapeStMan" {
         1
@@ -1215,6 +1658,143 @@ pub fn tsm_encode_cell(
     }
     crate::ssm::encode_array_data(big_endian, data)
         .map_err(|_| TsmError::UnsupportedType(data_type))
+}
+
+/// Test support: casacore-layout tile files with tiles smaller than the
+/// cell, built element by element from the layout rules (independently of
+/// the reader's run plan).
+#[cfg(test)]
+pub(crate) mod subtile_testutil {
+    use super::*;
+
+    /// Linear first-axis-fastest index of `pos` in a grid of `shape`.
+    fn linear(pos: &[usize], shape: &[usize]) -> usize {
+        pos.iter()
+            .zip(shape)
+            .rev()
+            .fold(0usize, |acc, (&p, &s)| acc * s + p)
+    }
+
+    /// Where element `k` (CASA linear index within the cell) of `row` lives:
+    /// (tile number, element within the tile).
+    pub(crate) fn element_slot(cell: &[i64], tile: &[i64], row: usize, k: usize) -> (usize, usize) {
+        let n = cell.len();
+        let mut pos = Vec::with_capacity(n + 1);
+        let mut rem = k;
+        for &c in cell {
+            pos.push(rem % c as usize);
+            rem /= c as usize;
+        }
+        pos.push(row);
+        let tile_u: Vec<usize> = tile.iter().map(|&t| t as usize).collect();
+        let tcoord: Vec<usize> = pos.iter().zip(&tile_u).map(|(p, t)| p / t).collect();
+        let within: Vec<usize> = pos.iter().zip(&tile_u).map(|(p, t)| p % t).collect();
+        let mut grid: Vec<usize> = cell
+            .iter()
+            .zip(&tile_u)
+            .map(|(&c, &t)| (c as usize).div_ceil(t))
+            .collect();
+        grid.push(usize::MAX); // the row axis is last: its extent never matters
+        (linear(&tcoord, &grid), linear(&within, &tile_u))
+    }
+
+    /// The pieces [`write_subtiled`] returns.
+    pub(crate) struct SubTiled {
+        pub header: Vec<u8>,
+        pub tile_file: Vec<u8>,
+        /// Per bit of `tile_file`: whether it belongs to a valid element
+        /// (everything else is padding, filled with `pad`).
+        pub valid_bits: Vec<bool>,
+        pub file_seq: u32,
+    }
+
+    /// Serialise `cells` (one per row, CASA shape `cell`) with tile shape
+    /// `tile` (cell dims + rows per tile) in casacore's layout, padding
+    /// bytes/bits set from `pad`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_subtiled(
+        stman_type: &str,
+        big_endian: bool,
+        seq_nr: u32,
+        hypercolumn_name: &str,
+        data_type: DataType,
+        cell: &[i64],
+        tile: &[i64],
+        cells: &[ArrayData],
+        pad: u8,
+    ) -> SubTiled {
+        assert_eq!(tile.len(), cell.len() + 1);
+        let nrow = cells.len();
+        let is_bool = data_type == DataType::Bool;
+        let es = elem_size(data_type).unwrap();
+        let tile_elems: usize = tile.iter().product::<i64>() as usize;
+        let bucket = if is_bool {
+            tile_elems.div_ceil(8)
+        } else {
+            tile_elems * es
+        };
+        let layer: usize = cell
+            .iter()
+            .zip(tile)
+            .map(|(&c, &t)| (c as usize).div_ceil(t as usize))
+            .product();
+        let row_tiles = nrow.div_ceil(tile[cell.len()] as usize).max(1);
+        let n_tiles = layer * row_tiles;
+        let mut out = vec![pad; bucket * n_tiles];
+        let mut valid = vec![false; out.len() * 8];
+        let cell_elems: usize = cell.iter().product::<i64>() as usize;
+        for (row, data) in cells.iter().enumerate() {
+            let enc = tsm_encode_cell(big_endian, data_type, data).unwrap();
+            for k in 0..cell_elems {
+                let (t, e) = element_slot(cell, tile, row, k);
+                if is_bool {
+                    let bit = t * bucket * 8 + e;
+                    let v = enc[k / 8] >> (k % 8) & 1;
+                    out[bit / 8] = (out[bit / 8] & !(1 << (bit % 8))) | (v << (bit % 8));
+                    valid[bit] = true;
+                } else {
+                    let off = t * bucket + e * es;
+                    out[off..off + es].copy_from_slice(&enc[k * es..(k + 1) * es]);
+                    valid[off * 8..(off + es) * 8]
+                        .iter_mut()
+                        .for_each(|b| *b = true);
+                }
+            }
+        }
+        let layout = TsmLayout {
+            rows_per_tile: tile[cell.len()] as u64,
+            n_tiles: n_tiles as u64,
+            bucket_size: bucket,
+        };
+        let header = tsm_header(TsmHeaderParams {
+            stman_type,
+            big_endian,
+            seq_nr,
+            hypercolumn_name,
+            data_type,
+            cell_shape: cell,
+            nrow: nrow as u64,
+            layout: &layout,
+            tile_file_len: out.len(),
+            tile_cell: Some(&tile[..cell.len()]),
+        });
+        SubTiled {
+            header,
+            tile_file: out,
+            valid_bits: valid,
+            file_seq: u32::from(stman_type == "TiledShapeStMan"),
+        }
+    }
+
+    /// Assert every padding bit of `file` still holds `pad`'s bit.
+    pub(crate) fn assert_padding_intact(file: &[u8], valid_bits: &[bool], pad: u8) {
+        for (bit, &v) in valid_bits.iter().enumerate() {
+            if !v {
+                let got = file[bit / 8] >> (bit % 8) & 1;
+                assert_eq!(got, pad >> (bit % 8) & 1, "padding bit {bit} changed");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1625,37 +2205,267 @@ mod tests {
         ));
     }
 
+    /// A deterministic value for every element type: element `k` of `row`.
+    fn elem_values(dt: DataType, row: usize, n: usize) -> ArrayData {
+        let v = |k: usize| (row * 1000 + k) as i64;
+        match dt {
+            DataType::Bool => ArrayData::Bool((0..n).map(|k| (row * 7 + k * 3) % 5 < 2).collect()),
+            DataType::UChar => ArrayData::UChar((0..n).map(|k| v(k) as u8).collect()),
+            DataType::Short => ArrayData::Short((0..n).map(|k| -(v(k) as i16)).collect()),
+            DataType::UShort => ArrayData::UShort((0..n).map(|k| v(k) as u16).collect()),
+            DataType::Int => ArrayData::Int((0..n).map(|k| -(v(k) as i32)).collect()),
+            DataType::UInt => ArrayData::UInt((0..n).map(|k| v(k) as u32).collect()),
+            DataType::Int64 => ArrayData::Int64((0..n).map(|k| -v(k) << 20).collect()),
+            DataType::Float => ArrayData::Float((0..n).map(|k| v(k) as f32 + 0.5).collect()),
+            DataType::Double => ArrayData::Double((0..n).map(|k| v(k) as f64 * 1.25).collect()),
+            DataType::Complex => {
+                ArrayData::Complex((0..n).map(|k| (v(k) as f32, -(k as f32) - 0.5)).collect())
+            }
+            DataType::DComplex => {
+                ArrayData::DComplex((0..n).map(|k| (v(k) as f64, -(k as f64) - 0.25)).collect())
+            }
+            other => panic!("{other:?} is not a tiled element type"),
+        }
+    }
+
+    fn desc_for(dt: DataType, cell: &[i64]) -> ColumnDesc {
+        let mut d = array_desc(dt);
+        d.shape = Some(cell.to_vec());
+        d.ndim = cell.len() as i32;
+        d
+    }
+
+    const ALL_TILED_TYPES: [DataType; 11] = [
+        DataType::Bool,
+        DataType::UChar,
+        DataType::Short,
+        DataType::UShort,
+        DataType::Int,
+        DataType::UInt,
+        DataType::Int64,
+        DataType::Float,
+        DataType::Double,
+        DataType::Complex,
+        DataType::DComplex,
+    ];
+
+    /// Tiles smaller than the cell (casacore/dask-ms layout): every cell
+    /// reads back for every element type, both endians and both storage
+    /// managers, with edge padding on both cell axes and a partial last row
+    /// tile.  Padding is filled with 0xA5 so a read of it shows up.
     #[test]
-    fn rejects_tiles_smaller_than_cell() {
-        // cube_shape[0] != tile_shape[0]: non-data dims must match the tile.
-        let header = TsmHeader {
-            root_type: "TiledColumnStMan".into(),
-            subclass_shape: Vec::new(),
-            version: 2,
-            seq_nr: 0,
-            nrrow: 7,
-            data_types: vec![DataType::Int],
-            hypercolumn_name: "g".into(),
-            nrdim: 3,
-            files: Vec::new(),
-            row_map: Vec::new(),
-            cube_map: Vec::new(),
-            pos_map: Vec::new(),
-            cubes: vec![TsmCube {
-                extensible: true,
-                nrdim: 3,
-                cube_shape: vec![2, 3, 7],
-                tile_shape: vec![1, 3, 4],
-                file_seq_nr: 0,
-                file_offset: 0,
-            }],
-        };
-        let tile_data = crate::datafile::Buffer::from(vec![0u8; 1024]);
-        let tsm = TsmFile::from_header(header, tile_data, false);
+    fn sub_cell_tiles_read_back() {
+        use super::subtile_testutil::write_subtiled;
+        // (cell, tile) pairs in CASA order, the last tile dim = rows/tile.
+        let geoms: [(&[i64], &[i64]); 5] = [
+            (&[3, 5], &[2, 2, 3]),  // padding on both cell axes
+            (&[2, 79], &[2, 8, 4]), // the MS case (8-channel tiles)
+            (&[4], &[3, 2]),        // 1-D cell
+            (&[3, 5], &[4, 8, 2]),  // tile larger than the cell
+            (&[2, 3, 4], &[1, 2, 3, 2]),
+        ];
+        for (cell, tile) in geoms {
+            let nelem: usize = cell.iter().product::<i64>() as usize;
+            for stman in ["TiledColumnStMan", "TiledShapeStMan"] {
+                for &big in &[false, true] {
+                    for dt in ALL_TILED_TYPES {
+                        let data: Vec<ArrayData> =
+                            (0..7).map(|r| elem_values(dt, r, nelem)).collect();
+                        let st = write_subtiled(stman, big, 0, "g", dt, cell, tile, &data, 0xA5);
+                        let header = parse_header(&st.header).unwrap();
+                        let tsm = TsmFile::from_header(header, st.tile_file, big);
+                        let desc = desc_for(dt, cell);
+                        let logical: Vec<u32> = cell.iter().rev().map(|&d| d as u32).collect();
+                        for (row, d) in data.iter().enumerate() {
+                            let got = tsm.read_cell(&desc, row as u64).unwrap();
+                            assert_eq!(
+                                got,
+                                RecordValue::Array(ArrayValue {
+                                    shape: logical.clone(),
+                                    data: d.clone()
+                                }),
+                                "{stman} big={big} {dt:?} cell {cell:?} tile {tile:?} row {row}"
+                            );
+                            // The single-span accessors refuse a multi-tile
+                            // cell rather than return part of it.
+                            assert!(matches!(
+                                tsm.cell_span(&desc, row as u64),
+                                Err(TsmError::TileTooSmall { .. })
+                            ));
+                            // The raw gathers agree with the encoder.
+                            let Some((_, CellPlace::Tiled(tc))) =
+                                tsm.cell_place(&desc, row as u64).unwrap()
+                            else {
+                                panic!("expected a multi-tile cell");
+                            };
+                            let enc = tsm_encode_cell(big, dt, d).unwrap();
+                            let mut buf = Vec::new();
+                            if dt == DataType::Bool {
+                                tc.gather_bits(&mut buf);
+                            } else {
+                                tc.gather_bytes(&mut buf);
+                            }
+                            assert_eq!(buf, enc, "{dt:?} raw gather row {row}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The MS geometry's gather plan: [2, 79] cells in [2, 8] tiles merge
+    /// to one run per tile (16 contiguous elements, 14 in the edge tile).
+    #[test]
+    fn sub_cell_runs_merge_per_tile() {
+        let runs = tile_runs(&[2, 79], &[2, 8]);
+        assert_eq!(runs.len(), 10);
+        for (k, r) in runs.iter().enumerate() {
+            assert_eq!((r.tile, r.src, r.dst), (k, 0, 16 * k));
+            assert_eq!(r.len, if k == 9 { 14 } else { 16 });
+        }
+        // Axis 0 split: lines along axis 0 of 2 (then 1) elements.
+        let runs = tile_runs(&[3, 2], &[2, 2]);
+        assert_eq!(
+            runs,
+            vec![
+                TileRun {
+                    tile: 0,
+                    src: 0,
+                    dst: 0,
+                    len: 2
+                },
+                TileRun {
+                    tile: 0,
+                    src: 2,
+                    dst: 3,
+                    len: 2
+                },
+                TileRun {
+                    tile: 1,
+                    src: 0,
+                    dst: 2,
+                    len: 1
+                },
+                TileRun {
+                    tile: 1,
+                    src: 2,
+                    dst: 5,
+                    len: 1
+                },
+            ]
+        );
+    }
+
+    /// A multi-cube TiledShapeStMan column (one cube per cell shape, each in
+    /// its own tile file, rows interleaved through the maps — the layout
+    /// casacore writes for alternating shapes), both cubes sub-cell tiled.
+    #[test]
+    fn multi_file_multi_cube_sub_cell_tiles() {
+        use super::subtile_testutil::write_subtiled;
+        let (ca, cb): (&[i64], &[i64]) = (&[2, 5], &[3, 7]);
+        let tile: &[i64] = &[2, 3, 4];
+        for &big in &[false, true] {
+            for dt in [DataType::Int, DataType::Bool, DataType::Complex] {
+                let na = 10usize;
+                let nb = 21usize;
+                // Rows 0,2,4 in cube A (positions 0..3), 1,3,5 in cube B.
+                let da: Vec<ArrayData> = (0..3).map(|p| elem_values(dt, 2 * p, na)).collect();
+                let db: Vec<ArrayData> = (0..3).map(|p| elem_values(dt, 2 * p + 1, nb)).collect();
+                let sa = write_subtiled("TiledShapeStMan", big, 0, "g", dt, ca, tile, &da, 0x5A);
+                let sb = write_subtiled("TiledShapeStMan", big, 0, "g", dt, cb, tile, &db, 0x5A);
+                let ha = parse_header(&sa.header).unwrap();
+                let hb = parse_header(&sb.header).unwrap();
+                let mut cube_b = hb.cubes[1].clone();
+                cube_b.file_seq_nr = 2;
+                let mut header = ha.clone();
+                header.nrrow = 6;
+                header.cubes.push(cube_b);
+                header.row_map = (0..6).collect();
+                header.cube_map = vec![1, 2, 1, 2, 1, 2];
+                header.pos_map = vec![0, 0, 1, 1, 2, 2];
+                let tsm = TsmFile::from_header_files(
+                    header,
+                    vec![(1, sa.tile_file), (2, sb.tile_file)],
+                    big,
+                );
+                let desc = desc_for(dt, &[]);
+                for row in 0..6usize {
+                    let (want, cell) = if row % 2 == 0 {
+                        (da[row / 2].clone(), ca)
+                    } else {
+                        (db[row / 2].clone(), cb)
+                    };
+                    let got = tsm.read_cell(&desc, row as u64).unwrap();
+                    assert_eq!(
+                        got,
+                        RecordValue::Array(ArrayValue {
+                            shape: cell.iter().rev().map(|&d| d as u32).collect(),
+                            data: want
+                        }),
+                        "big={big} {dt:?} row {row}"
+                    );
+                    let Some((_, CellPlace::Tiled(tc))) =
+                        tsm.cell_place(&desc, row as u64).unwrap()
+                    else {
+                        panic!("expected a multi-tile cell");
+                    };
+                    assert_eq!(tc.file_seq, if row % 2 == 0 { 1 } else { 2 });
+                }
+            }
+        }
+    }
+
+    /// A tiled cell whose tiles are missing from the file is out of range,
+    /// not a panic.
+    #[test]
+    fn sub_cell_tiles_truncated_file_is_an_error() {
+        use super::subtile_testutil::write_subtiled;
+        let data: Vec<ArrayData> = (0..5).map(|r| elem_values(DataType::Int, r, 15)).collect();
+        let st = write_subtiled(
+            "TiledColumnStMan",
+            false,
+            0,
+            "g",
+            DataType::Int,
+            &[3, 5],
+            &[2, 2, 3],
+            &data,
+            0,
+        );
+        let header = parse_header(&st.header).unwrap();
+        let mut short = st.tile_file.clone();
+        // Drop the last tile (12 Ints) of the second row layer.
+        short.truncate(short.len() - 48);
+        let tsm = TsmFile::from_header(header, short, false);
+        let desc = desc_for(DataType::Int, &[3, 5]);
+        assert!(tsm.read_cell(&desc, 0).is_ok());
         assert!(matches!(
-            tsm.read_cell(&array_desc(DataType::Int), 0),
-            Err(TsmError::TileTooSmall { .. })
+            tsm.read_cell(&desc, 4),
+            Err(TsmError::RowOutOfRange { .. })
         ));
+    }
+
+    /// `or_bits_from` places arbitrary bit ranges like a per-bit loop and
+    /// leaves the surrounding bits alone.
+    #[test]
+    fn or_bits_from_matches_per_bit_loop() {
+        let src: Vec<u8> = (0..12u32)
+            .map(|i| (i.wrapping_mul(0x9d) ^ 0x3c) as u8)
+            .collect();
+        for src_bit in 0..17 {
+            for out_bit in 0..17 {
+                for n in 0..40 {
+                    let mut got = vec![0u8; 12];
+                    or_bits_from(&mut got, out_bit, &src, src_bit, n);
+                    let mut want = vec![0u8; 12];
+                    for i in 0..n {
+                        let b = src[(src_bit + i) / 8] >> ((src_bit + i) % 8) & 1;
+                        want[(out_bit + i) / 8] |= b << ((out_bit + i) % 8);
+                    }
+                    assert_eq!(got, want, "src_bit {src_bit} out_bit {out_bit} n {n}");
+                }
+            }
+        }
     }
 
     /// casacore writes a placeholder cube at index 0 (no shape, no file)

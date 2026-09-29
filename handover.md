@@ -792,3 +792,61 @@ dropped afterwards. `main` == `origin/main` with no local divergence.
 Same machine notes as above still apply (ssh/gh quirks, tag-only CI).
 
 
+
+## 2026-09-29 — tiles smaller than the cell (dask-ms / tricolour FLAG)
+
+Problem: `TsmFile::cell_location` rejected any hypercube whose tile shape
+differs from the cell shape in a non-row axis (`TileTooSmall`), but that is
+dask-ms's default (`_fit_tile_shape`: <= 64 channels per tile; measured here
+DATA `[2, 8, 8192]`, FLAG `[2, 8, 65536]` for a `[2, 79]` cell), so every
+dask-ms/skarabina MS failed in casacure (tricolour died reading FLAG).
+
+casacore layout, checked against casacore master sources
+(casacore master c7892c0, `tables/DataMan/TSMCube.cc` `setupNrTiles` 333-344: tiles per axis
+`ceil(cube/tile)`, row axis last; `accessSection` 862/899:
+`expandedTilesPerDim_p.offset(tile)` = first-axis-fastest tile number,
+`expandedTileShape_p.offset(pixel)` inside a tile; `TSMDataColumn::dataLength`
+62-67: Bool bucket = `(nrPixels + 7) / 8` bytes; `TiledStMan::makeHypercube`
+758-776: every extensible cube gets its own tile file) and empirically with
+python-casacore 3.8.1 (tile file dump of a `[2, 5]` Int cell in `[2, 3, 4]`
+tiles: full padded buckets, zero padding).
+
+Design (`crates/casacure/src/tsm.rs`): `CubeGeom` per cube, precomputed at
+open — for a sub-cell-tiled cube a list of `TileRun`s (tile within the row
+layer, src/dst element, length), axis-0 lines merged where contiguous in both
+tile and cell (a `[2,79]` cell in `[2,8]` tiles = 10 runs).  `cell_place`
+returns `CellPlace::Contiguous(CellLocation)` (unchanged fast path) or
+`CellPlace::Tiled(TiledCell)` with `segments()` / `gather_bytes` /
+`gather_bools` / `gather_bits`.  `cell_span`/`cell_location` still return
+single spans and give `TileTooSmall` for a multi-tile cell.  `TsmFile` now
+keeps one buffer per tile file (`CellLocation.file_seq`), fixing multi-cube
+TiledShapeStMan columns (cube 2+ was read from file 1).  `table.rs`:
+`getcol_raw`/`getcol_raw_bits` gather multi-tile cells into a reused buffer;
+`patch_tsm_column` patches per piece (per file, pieces emitted tile-by-tile so
+consecutive rows coalesce into one run per tile), Bool via the new
+`tsm::or_bits_from`.  Slices go through `getcell`, so they are covered.
+
+Verification (this machine, `~/.venvs/ccdev`, python-casacore 3.8.1, dask-ms
+0.2.32): `cargo test --workspace` 203 -> 208 passed (new: 5 tsm tests incl.
+all 11 element types x both endians x both stmans x 5 geometries, multi-file
+multi-cube, truncated file, `or_bits_from`; 1 table test patching Bool TCS +
+Complex TSS in place and checking header unchanged + padding bits intact;
+`rejects_tiles_smaller_than_cell` removed); fmt + clippy `-D warnings` clean;
+pytest (`PYTHONPATH=target/devpkg:tests/shim`) 167 -> 170 passed, 1 skipped
+(new `tests/test_subcell_tiles.py`: casacore-built tables little+big endian
+read/written by casacure and verified by casacore incl. unchanged tile
+shapes, plus a dask-ms MS round trip with FLAG written via
+`DASK_MS_BACKEND=casacure`); `tests/daskms_smoke.py` all OK.
+
+Perf, 682651-row `[2,79]` table (FLAG `[2,8,65536]`, DATA complex
+`[2,8,8192]`), best of 3: casacure FLAG getcol 0.15 s (casacore 0.06-0.09),
+DATA getcol 0.35-0.48 s (casacore 0.34-0.57), FLAG putcol in 100k chunks +
+flush 0.36 s (casacore 0.07; the same table with single tiles 0.23-0.25 s),
+DATA putcol 1.2 s (casacore 0.4; single tiles 0.8).  The single-tile table
+reads/writes at HEAD speed within run-to-run noise.
+
+Known, not fixed: `putcell` with a float32/complex64/int32 ndarray fails
+("string cannot be stored in column") — pre-existing in casacure-python's
+`pyobject_to_record`, independent of storage manager (the new pytest uses
+one-row `putcol`).  Hypercolumns with several data columns in one bucket are
+still unsupported (per-column bucket offsets not applied), as before.

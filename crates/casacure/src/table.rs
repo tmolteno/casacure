@@ -1839,10 +1839,19 @@ impl Table {
                     });
                 }
                 let zeros = self.tsm_default_bytes(desc)?;
+                // A cell spanning several tiles is gathered into cell order
+                // (one reused buffer) before the visit.
+                let mut gathered = Vec::new();
                 let mut done = 0u64;
                 for r in startrow..startrow + nrow {
-                    match file.cell_span(desc, r)? {
-                        Some((_, span)) => visit(&[], span.bytes)?,
+                    match file.cell_place(desc, r)? {
+                        Some((_, crate::tsm::CellPlace::Contiguous(loc))) => {
+                            visit(&[], file.location_bytes(&loc))?
+                        }
+                        Some((_, crate::tsm::CellPlace::Tiled(tc))) => {
+                            tc.gather_bytes(&mut gathered);
+                            visit(&[], &gathered)?
+                        }
                         None => visit(&[], &zeros[..])?,
                     }
                     done += 1;
@@ -1884,10 +1893,18 @@ impl Table {
             .shape
             .as_deref()
             .map_or(0, |s| s.iter().product::<i64>().max(0) as usize);
+        let mut gathered = Vec::new();
         let mut done = 0u64;
         for r in startrow..startrow + nrow {
-            match file.cell_span(desc, r)? {
-                Some((_, span)) => visit(span.bytes, span.skip, span.nelem)?,
+            match file.cell_place(desc, r)? {
+                Some((_, crate::tsm::CellPlace::Contiguous(loc))) => {
+                    visit(file.location_bytes(&loc), loc.skip, loc.nelem)?
+                }
+                Some((_, crate::tsm::CellPlace::Tiled(tc))) => {
+                    // A multi-tile cell: its bits packed from bit 0.
+                    tc.gather_bits(&mut gathered);
+                    visit(&gathered, 0, tc.nelem)?
+                }
                 None => visit(&zeros[..], 0, nelem_default)?,
             }
             done += 1;
@@ -3754,14 +3771,32 @@ impl WritableTable {
         if tsm.header.nrrow != nrow {
             return Ok(None); // row growth: needs a full rebuild
         }
-        let Some(file_seq) = tsm.tile_file_seq() else {
+        if tsm.tile_file_seq().is_none() {
             return Ok(None);
-        };
+        }
         let is_bool = cd.data_type == DataType::Bool;
+        let esize = if is_bool {
+            1
+        } else {
+            crate::tsm::elem_size(cd.data_type)
+                .map_err(|e| WriteTableError::Storage(e.to_string()))?
+        };
 
         // Locate and encode every pending cell first: nothing is written
-        // unless the whole patch can be applied.
-        let mut pending: Vec<(crate::tsm::CellLocation, Vec<u8>)> = Vec::new();
+        // unless the whole patch can be applied.  Each piece is a byte range
+        // of one tile file plus the cell (`cells[idx]`) and element (`src`)
+        // it takes its values from: a contiguous cell is one piece
+        // (`src == 0`, the whole cell), a cell spanning several tiles one
+        // piece per tile run.
+        struct Piece {
+            loc: crate::tsm::CellLocation,
+            cell: usize,
+            src: usize,
+            whole: bool,
+        }
+        let mut cells: Vec<Vec<u8>> = Vec::new();
+        let mut pending: Vec<Piece> = Vec::new();
+        let mut tiled: Vec<(crate::tsm::TiledCell<'_>, usize)> = Vec::new();
         for (r, value) in self.pending_cells(col) {
             if r >= nrow {
                 return Ok(None);
@@ -3769,67 +3804,151 @@ impl WritableTable {
             let RecordValue::Array(arr) = value else {
                 return Ok(None);
             };
-            let Ok(Some((_, loc))) = tsm.cell_location(cd, r) else {
+            let Ok(Some((cube, place))) = tsm.cell_place(cd, r) else {
                 return Ok(None); // unset cell / out of range: rebuild
             };
             let cell = crate::tsm::tsm_encode_cell(big_endian, cd.data_type, &arr.data)
                 .map_err(|e| WriteTableError::Storage(e.to_string()))?;
-            let fits = if is_bool {
-                cell.len() == loc.nelem.div_ceil(8)
-            } else {
-                cell.len() == loc.nbytes
-            };
-            if !fits {
-                return Ok(None);
+            let idx = cells.len();
+            match place {
+                crate::tsm::CellPlace::Contiguous(loc) => {
+                    let fits = if is_bool {
+                        cell.len() == loc.nelem.div_ceil(8)
+                    } else {
+                        cell.len() == loc.nbytes
+                    };
+                    if !fits {
+                        return Ok(None);
+                    }
+                    pending.push(Piece {
+                        loc,
+                        cell: idx,
+                        src: 0,
+                        whole: true,
+                    });
+                }
+                crate::tsm::CellPlace::Tiled(tc) => {
+                    let want = if is_bool {
+                        tc.nelem.div_ceil(8)
+                    } else {
+                        tc.nelem * esize
+                    };
+                    // The value must have the stored cell's exact shape (a
+                    // multi-tile cell's pieces are placed by position).
+                    let nd = cube.cube_shape.len().saturating_sub(1);
+                    let same_shape = arr.shape.len() == nd
+                        && arr
+                            .shape
+                            .iter()
+                            .rev()
+                            .zip(&cube.cube_shape[..nd])
+                            .all(|(&a, &c)| i64::from(a) == c);
+                    if cell.len() != want || !same_shape {
+                        return Ok(None);
+                    }
+                    tiled.push((tc, idx));
+                }
             }
-            pending.push((loc, cell));
+            cells.push(cell);
         }
+        // Multi-tile cells: emit their pieces tile by tile within each row
+        // layer (rows ascending), which is file order, so the sort below is
+        // a linear pass and consecutive rows' pieces coalesce into one run
+        // per tile.
+        let mut g = 0;
+        while g < tiled.len() {
+            let key = tiled[g].0.layer_key();
+            let mut h = g + 1;
+            while h < tiled.len() && tiled[h].0.layer_key() == key {
+                h += 1;
+            }
+            for j in 0..tiled[g].0.segments().len() {
+                for (tc, idx) in &tiled[g..h] {
+                    let seg = tc.nth_segment(j);
+                    pending.push(Piece {
+                        loc: crate::tsm::CellLocation {
+                            byte_off: seg.byte_off,
+                            nbytes: seg.nbytes,
+                            skip: seg.skip,
+                            nelem: seg.len,
+                            file_seq: tc.file_seq,
+                        },
+                        cell: *idx,
+                        src: seg.dst,
+                        whole: false,
+                    });
+                }
+            }
+            g = h;
+        }
+        drop(tiled);
         drop(tsm); // release the mapping before writing the file
         if pending.is_empty() {
             return Ok(Some(())); // nothing to patch
         }
-        pending.sort_by_key(|(loc, _)| (loc.byte_off, loc.skip));
+        pending.sort_by_key(|p| (p.loc.file_seq, p.loc.byte_off, p.loc.skip));
 
-        let tile_path = dir.join(format!("table.f{seq}_TSM{file_seq}"));
-        let io = |e: std::io::Error| WriteTableError::Storage(storage_error(&tile_path, e));
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&tile_path)
-            .map_err(io)?;
-        // Coalesce cells whose byte ranges touch into runs, one read-modify-
-        // write (Bool) or one write (byte-aligned types) per run.
         let mut i = 0;
         while i < pending.len() {
-            let start = pending[i].0.byte_off;
-            let mut end = start + pending[i].0.nbytes;
-            let mut j = i + 1;
-            while j < pending.len() && pending[j].0.byte_off <= end {
-                end = end.max(pending[j].0.byte_off + pending[j].0.nbytes);
-                j += 1;
-            }
-            // One slack byte: `or_bytes_at` may OR (zero) padding bits one
-            // byte past a straddling cell.
-            let mut buf = vec![0u8; end - start + 1];
-            if is_bool {
-                // Bool cells share edge bytes with neighbouring rows: read
-                // the run, clear each cell's bits, OR in the new bits.
+            let file_seq = pending[i].loc.file_seq;
+            let tile_path = dir.join(format!("table.f{seq}_TSM{file_seq}"));
+            let io = |e: std::io::Error| WriteTableError::Storage(storage_error(&tile_path, e));
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&tile_path)
+                .map_err(io)?;
+            // Coalesce pieces whose byte ranges touch into runs, one read-
+            // modify-write (Bool) or one write (byte-aligned types) per run.
+            while i < pending.len() && pending[i].loc.file_seq == file_seq {
+                let start = pending[i].loc.byte_off;
+                let mut end = start + pending[i].loc.nbytes;
+                let mut j = i + 1;
+                while j < pending.len()
+                    && pending[j].loc.file_seq == file_seq
+                    && pending[j].loc.byte_off <= end
+                {
+                    end = end.max(pending[j].loc.byte_off + pending[j].loc.nbytes);
+                    j += 1;
+                }
+                // One slack byte: `or_bytes_at` may OR (zero) padding bits
+                // one byte past a straddling cell.
+                let mut buf = vec![0u8; end - start + 1];
+                if is_bool {
+                    // Bool cells share edge bytes with neighbouring rows:
+                    // read the run, clear each piece's bits, OR in the new
+                    // bits.
+                    file.seek(SeekFrom::Start(start as u64)).map_err(io)?;
+                    file.read_exact(&mut buf[..end - start]).map_err(io)?;
+                    for p in &pending[i..j] {
+                        let bit = (p.loc.byte_off - start) * 8 + p.loc.skip;
+                        clear_bits(&mut buf, bit, p.loc.nelem);
+                        if p.whole {
+                            crate::tsm::or_bytes_at(&mut buf, &cells[p.cell], bit);
+                        } else {
+                            crate::tsm::or_bits_from(
+                                &mut buf,
+                                bit,
+                                &cells[p.cell],
+                                p.src,
+                                p.loc.nelem,
+                            );
+                        }
+                    }
+                } else {
+                    // Every byte of the run is covered by a piece (pieces
+                    // of a run touch), so no read is needed.
+                    for p in &pending[i..j] {
+                        let off = p.loc.byte_off - start;
+                        let from = p.src * esize;
+                        buf[off..off + p.loc.nbytes]
+                            .copy_from_slice(&cells[p.cell][from..from + p.loc.nbytes]);
+                    }
+                }
                 file.seek(SeekFrom::Start(start as u64)).map_err(io)?;
-                file.read_exact(&mut buf[..end - start]).map_err(io)?;
-                for (loc, cell) in &pending[i..j] {
-                    let bit = (loc.byte_off - start) * 8 + loc.skip;
-                    clear_bits(&mut buf, bit, loc.nelem);
-                    crate::tsm::or_bytes_at(&mut buf, cell, bit);
-                }
-            } else {
-                for (loc, cell) in &pending[i..j] {
-                    let off = loc.byte_off - start;
-                    buf[off..off + cell.len()].copy_from_slice(cell);
-                }
+                file.write_all(&buf[..end - start]).map_err(io)?;
+                i = j;
             }
-            file.seek(SeekFrom::Start(start as u64)).map_err(io)?;
-            file.write_all(&buf[..end - start]).map_err(io)?;
-            i = j;
         }
         Ok(Some(()))
     }
@@ -5542,6 +5661,185 @@ mod tests {
         for (r, v) in scan.iter().enumerate() {
             assert_eq!(*v, RecordValue::Int(r as i32), "SCAN_NUMBER row {r}");
         }
+    }
+
+    /// Tiles smaller than the cell (dask-ms's default: 8-channel tiles on a
+    /// [2, 79] cell), for a bit-packed Bool TiledColumnStMan column and a
+    /// Complex TiledShapeStMan column: the table reads every cell (getcell,
+    /// getcol, the raw bulk paths), and an update rewrites only the pending
+    /// cells' pieces in place — the header is untouched (no fallback
+    /// rebuild) and every padding bit keeps its fill.
+    #[test]
+    fn sub_cell_tiled_columns_read_and_patch_in_place() {
+        use crate::record::{ArrayData, ArrayValue};
+        use crate::tsm::subtile_testutil::{assert_padding_intact, write_subtiled};
+        let arr_col = |name: &str, dt: DataType, stman: &str, group: &str| ColumnDesc {
+            name: name.into(),
+            comment: String::new(),
+            data_type: dt,
+            data_manager_type: stman.into(),
+            data_manager_group: group.into(),
+            options: 4,
+            ndim: 2,
+            shape: Some(vec![2, 79]),
+            max_length: 0,
+            keywords: empty_record(),
+            kind: ColumnKind::Array,
+        };
+        let mut desc = typed_desc();
+        desc.columns = vec![
+            arr_col("FLAG", DataType::Bool, "TiledColumnStMan", "TiledFlag"),
+            arr_col("DATA", DataType::Complex, "TiledShapeStMan", "TiledData"),
+            scalar_col("ID", DataType::Int, 0),
+        ];
+        let nrows = 150usize; // three 64-row tile layers, the last partial
+        let cell: &[i64] = &[2, 79];
+        let tile: &[i64] = &[2, 8, 64];
+        let flag = |r: usize, gen: usize| {
+            ArrayData::Bool((0..158).map(|k| (r * 5 + k * 3 + gen) % 7 < 3).collect())
+        };
+        let data = |r: usize, gen: usize| {
+            ArrayData::Complex(
+                (0..158)
+                    .map(|k| ((r * 1000 + k) as f32, (gen * 10) as f32 - k as f32))
+                    .collect(),
+            )
+        };
+        let cellv = |d: ArrayData| {
+            RecordValue::Array(ArrayValue {
+                shape: vec![79, 2],
+                data: d,
+            })
+        };
+        let dir = temp_dir("subtile");
+        {
+            let mut wt = WritableTable::create(&dir, desc.clone());
+            wt.addrows(nrows as u64);
+            for r in 0..nrows {
+                wt.putcell(0, r as u64, cellv(flag(r, 0))).unwrap();
+                wt.putcell(1, r as u64, cellv(data(r, 0))).unwrap();
+                wt.putcell(2, r as u64, RecordValue::Int(r as i32)).unwrap();
+            }
+            wt.flush().unwrap();
+        }
+        // Re-tile both columns the way casacore/dask-ms would have.
+        let dat = parse_table_dat(&std::fs::read(dir.join("table.dat")).unwrap()).unwrap();
+        let big = dat.header.big_endian;
+        let mut written = Vec::new();
+        for (col, dt) in [(0usize, DataType::Bool), (1, DataType::Complex)] {
+            let seq = dat.column_set.columns[col].data_manager_seq;
+            let dm = dat
+                .column_set
+                .data_managers
+                .iter()
+                .find(|d| d.sequence_nr == seq)
+                .unwrap();
+            let old = crate::tsm::TsmFile::open(&dir, seq, big).unwrap();
+            let cells: Vec<ArrayData> = (0..nrows)
+                .map(|r| if col == 0 { flag(r, 0) } else { data(r, 0) })
+                .collect();
+            let st = write_subtiled(
+                &dm.type_name,
+                big,
+                seq,
+                &old.header.hypercolumn_name,
+                dt,
+                cell,
+                tile,
+                &cells,
+                0xA5,
+            );
+            drop(old);
+            std::fs::write(dir.join(format!("table.f{seq}")), &st.header).unwrap();
+            std::fs::write(
+                dir.join(format!("table.f{seq}_TSM{}", st.file_seq)),
+                &st.tile_file,
+            )
+            .unwrap();
+            written.push((seq, st));
+        }
+        let expect = |r: usize, gen_of: &dyn Fn(usize) -> usize| {
+            (cellv(flag(r, gen_of(r))), cellv(data(r, gen_of(r))))
+        };
+        let check = |gen_of: &dyn Fn(usize) -> usize| {
+            let t = Table::open(&dir, false).unwrap();
+            for r in 0..nrows {
+                let (f, d) = expect(r, gen_of);
+                assert_eq!(t.getcell(0, r as u64).unwrap(), f, "FLAG row {r}");
+                assert_eq!(t.getcell(1, r as u64).unwrap(), d, "DATA row {r}");
+            }
+            let col = t.getcol(1, 0, nrows as u64).unwrap();
+            for (r, v) in col.iter().enumerate() {
+                assert_eq!(*v, expect(r, gen_of).1, "DATA getcol row {r}");
+            }
+            // The raw bulk paths (the python getcol fast paths).
+            let mut r = 0usize;
+            t.getcol_raw_bits(0, 0, nrows as u64, |bytes, skip, nelem| {
+                let mut v = vec![false; nelem];
+                crate::tsm::decode_bits_into(bytes, skip, &mut v);
+                assert_eq!(
+                    cellv(ArrayData::Bool(v)),
+                    expect(r, gen_of).0,
+                    "raw FLAG {r}"
+                );
+                r += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(r, nrows);
+            let mut r = 0usize;
+            t.getcol_raw(1, 0, nrows as u64, |_, bytes| {
+                let RecordValue::Array(a) = expect(r, gen_of).1 else {
+                    unreachable!()
+                };
+                let enc = crate::tsm::tsm_encode_cell(big, DataType::Complex, &a.data).unwrap();
+                assert_eq!(bytes, &enc[..], "raw DATA {r}");
+                r += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(r, nrows);
+        };
+        check(&|_| 0);
+
+        // Update a scattered set of rows (within one layer, across layers,
+        // the partial last layer), flushing twice.
+        let gen_of = |r: usize| {
+            if (5..70).contains(&r) || r >= 140 {
+                if (60..65).contains(&r) {
+                    2
+                } else {
+                    1
+                }
+            } else {
+                0
+            }
+        };
+        {
+            let (_snap, mut wt) = WritableTable::open_for_update(&dir).unwrap();
+            for r in (5..70).chain(140..nrows) {
+                wt.putcell(0, r as u64, cellv(flag(r, 1))).unwrap();
+                wt.putcell(1, r as u64, cellv(data(r, 1))).unwrap();
+            }
+            wt.flush().unwrap();
+            for r in 60..65 {
+                wt.putcell(0, r as u64, cellv(flag(r, 2))).unwrap();
+                wt.putcell(1, r as u64, cellv(data(r, 2))).unwrap();
+            }
+            wt.flush().unwrap();
+        }
+        check(&gen_of);
+        for (seq, st) in &written {
+            let hdr = std::fs::read(dir.join(format!("table.f{seq}"))).unwrap();
+            assert_eq!(
+                &hdr, &st.header,
+                "header of DM {seq} rewritten (not patched)"
+            );
+            let file = std::fs::read(dir.join(format!("table.f{seq}_TSM{}", st.file_seq))).unwrap();
+            assert_eq!(file.len(), st.tile_file.len());
+            assert_padding_intact(&file, &st.valid_bits, 0xA5);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An incremental (patch-in-place) StandardStMan flush must leave the

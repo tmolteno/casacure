@@ -5,6 +5,26 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Tiled columns whose tiles are smaller than the cell could not be read or
+  written** (`tiles smaller than the cell are not supported (cube [2, 79,
+  682651], tile [2, 8, 65536])`). casacore tiles every axis of a hypercube,
+  and dask-ms tiles channel axes at <= 64 channels, so every MS written by
+  dask-ms/skarabina stores DATA, FLAG, WEIGHT_SPECTRUM, ... this way (and
+  tricolour, reading and writing FLAG through dask-ms, died on them).
+  TiledColumnStMan and TiledShapeStMan cells that span several tiles (edge
+  padding included, every element type, bit-packed Bool, both endians) are
+  now read (`getcell`/`getcol`/`getcolnp`/`getcolslice` and the raw bulk
+  paths) and patched in place on write (`putcol`/`putcell`/`putcolslice`),
+  leaving the tile layout unchanged. The single-tile layout keeps its
+  contiguous fast path.
+- **Multi-cube TiledShapeStMan columns read cube 2+ from the wrong file.**
+  casacore gives every extensible hypercube (one per cell shape) its own tile
+  file (`table.f<n>_TSM1`, `_TSM2`, ...); casacure opened only the first. All
+  of a column's tile files are now opened and each cube reads (and is patched)
+  in its own file.
+
 ## [3.8.13] - 2026-09-27
 
 ### Fixed
