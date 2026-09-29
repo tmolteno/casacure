@@ -5,6 +5,8 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.14] - 2026-09-29
+
 ### Fixed
 
 - **Tiled columns whose tiles are smaller than the cell could not be read or
