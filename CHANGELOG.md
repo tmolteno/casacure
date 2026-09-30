@@ -5,6 +5,27 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.15] - 2026-10-01
+
+### Fixed
+
+- **TaQL query results piled up in the temp directory.** `taql()` (and
+  `table.taql()`) materialise a result as a table under the temp dir
+  (`casacure-taql-<pid>-<nanos>`), where casacore keeps it as a reference
+  table or a scratch table deleted on close -- and nothing ever removed them;
+  the process-wide write registry also held each result for the life of the
+  process. A pipeline host's `/tmp` (a RAM tmpfs) had collected 848 of them,
+  710 MB, up to 85 per process. A result's directory is now removed when its
+  last handle is dropped, by an `atexit` hook for results still referenced at
+  interpreter exit (dask-ms caches table proxies for the whole process), and
+  by a sweep at the first TaQL call of a process of directories left by dead
+  processes (only if older than a day, so a `/tmp` shared across pid
+  namespaces cannot lose a live table). Tables TaQL is told to create
+  (`CREATE TABLE`) are the caller's and are kept.
+- `casacure.run_tests()` (the self-test) and the Rust test helpers removed
+  none of their temporary tables (`cargo test` left ~93 directories a run);
+  they now clean up after themselves.
+
 ## [3.8.14] - 2026-09-29
 
 ### Fixed
