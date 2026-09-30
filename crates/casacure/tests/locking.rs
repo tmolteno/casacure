@@ -7,6 +7,9 @@
 //! runs a child copy of this test binary (the `locking_child` entry) under
 //! an env-selected role.
 
+#[path = "../src/testdir.rs"]
+#[allow(dead_code)]
+mod testdir;
 use casacure::lockfile::{attach, LockMode, LockOptions, TableSyncData};
 use casacure::record::RecordValue;
 use casacure::tabledesc::TableDesc;
@@ -14,14 +17,13 @@ use casacure::{Table, WritableTable};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+fn temp_dir(tag: &str) -> testdir::TestDir {
+    let dir = testdir::TestDir::new(format!(
         "casacure-locking-{tag}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&*dir).unwrap();
     dir
 }
 

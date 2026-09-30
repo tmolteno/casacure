@@ -17,6 +17,8 @@ pub mod ssm;
 pub mod table;
 pub mod tabledesc;
 pub mod taql;
+#[cfg(test)]
+mod testdir;
 pub mod tsm;
 pub mod types;
 

@@ -145,6 +145,7 @@ fn tables_submodule(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<table::Table>()?;
     m.add_function(wrap_pyfunction!(table::table, &m)?)?;
     m.add_function(wrap_pyfunction!(table::taql, &m)?)?;
+    m.add_function(wrap_pyfunction!(table::_cleanup_scratch, &m)?)?;
     m.add_function(wrap_pyfunction!(default_ms, &m)?)?;
     m.add_function(wrap_pyfunction!(default_ms_subtable, &m)?)?;
     m.add_function(wrap_pyfunction!(required_ms_desc, &m)?)?;
@@ -164,6 +165,13 @@ fn tables_submodule(parent: &Bound<'_, PyModule>) -> PyResult<()> {
         let f = m.getattr(name)?;
         f.setattr("__module__", "casacure.tables")?;
     }
+    // TaQL result tables still referenced at interpreter exit (dask-ms caches
+    // table proxies for the process's life) would otherwise outlive it in the
+    // temp dir; see table::ScratchDir.
+    parent
+        .py()
+        .import("atexit")?
+        .call_method1("register", (m.getattr("_cleanup_scratch")?,))?;
     parent.add_submodule(&m)?;
     parent
         .py()

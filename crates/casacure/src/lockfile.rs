@@ -919,14 +919,13 @@ mod tests {
     use std::path::PathBuf;
 
     #[cfg(unix)]
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+    fn temp_dir(tag: &str) -> crate::testdir::TestDir {
+        let dir = crate::testdir::TestDir::new(format!(
             "casacure-lockfile-{tag}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&*dir).unwrap();
         dir
     }
 

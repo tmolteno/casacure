@@ -179,13 +179,12 @@ mod tests {
 
     #[test]
     fn default_ms_creates_main_and_subtables() {
-        let base = std::env::temp_dir().join(format!(
+        let base = crate::testdir::TestDir::new(format!(
             "casacure-ms-default-{}-{n}",
             std::process::id(),
             n = std::sync::atomic::AtomicUsize::new(0)
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        let _ = std::fs::remove_dir_all(&base);
         let path = base.join("test.ms");
         default_ms(&path, None).unwrap();
 
@@ -277,12 +276,11 @@ mod tests {
             ("SYSCAL", 5),
             ("WEATHER", 3),
         ] {
-            let path = std::env::temp_dir().join(format!(
+            let path = crate::testdir::TestDir::new(format!(
                 "casacure-mssub-{}-{}",
                 std::process::id(),
                 name
             ));
-            let _ = std::fs::remove_dir_all(&path);
             default_ms_subtable(name, &path).unwrap();
             let t = Table::open(&path, true).unwrap();
             assert_eq!(t.colnames().len(), ncols, "{name} column count");
@@ -300,8 +298,8 @@ mod tests {
 
     #[test]
     fn default_ms_merges_extra_columns() {
-        let path = std::env::temp_dir().join(format!("casacure-ms-extra-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
+        let path =
+            crate::testdir::TestDir::new(format!("casacure-ms-extra-{}", std::process::id()));
         let extra = r#"{"DATA":{"_c_order":true,"comment":"DATA column","dataManagerGroup":"StandardStMan","dataManagerType":"StandardStMan","keywords":{},"maxlen":0,"ndim":2,"option":0,"valueType":"COMPLEX"}}"#;
         default_ms(&path, Some(extra)).unwrap();
         let t = Table::open(&path, true).unwrap();

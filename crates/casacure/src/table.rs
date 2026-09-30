@@ -4630,14 +4630,12 @@ mod tests {
         vec![b, u1, i2, i4, u4, r4, r8, c4, c8, s]
     }
 
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+    fn temp_dir(tag: &str) -> crate::testdir::TestDir {
+        crate::testdir::TestDir::new(format!(
             "casacure-test-{tag}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+        ))
     }
 
     #[test]

@@ -66,6 +66,115 @@ struct WriteData {
     dirty: bool,
     /// The table directory this backing belongs to (see [`DirPin`]).
     pin: DirPin,
+    /// Set for a TaQL query result materialised under the temp dir: the
+    /// directory is removed when the last handle on this backing drops.
+    /// Declared LAST so `read`/`wt` are closed before it is removed.
+    scratch: Option<ScratchDir>,
+}
+
+/// A TaQL result table's temp directory, removed when dropped (casacore keeps
+/// query results in memory or as scratch tables deleted on close; casacure
+/// materialises them on disk, so it has to delete them itself).  Every live one
+/// is also in [`SCRATCH_DIRS`], which the `atexit` hook sweeps: dask-ms caches
+/// table proxies for the life of the process, and objects still referenced at
+/// interpreter shutdown are not reliably dropped.
+struct ScratchDir(std::path::PathBuf);
+
+static SCRATCH_DIRS: std::sync::OnceLock<Mutex<std::collections::HashSet<std::path::PathBuf>>> =
+    std::sync::OnceLock::new();
+
+fn scratch_dirs() -> &'static Mutex<std::collections::HashSet<std::path::PathBuf>> {
+    SCRATCH_DIRS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+impl ScratchDir {
+    fn new(dir: std::path::PathBuf) -> ScratchDir {
+        scratch_dirs().lock().unwrap().insert(dir.clone());
+        ScratchDir(dir)
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+        if let Ok(mut set) = scratch_dirs().lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+impl Drop for Table {
+    /// A TaQL result's backing is also held (strongly) by the write registry,
+    /// so it would otherwise live -- and keep its temp directory -- for the
+    /// whole process.  When this is the last handle (its reference + the
+    /// registry's), take it out of the registry; dropping this handle's
+    /// reference then drops the backing and its [`ScratchDir`].
+    fn drop(&mut self) {
+        let Ok(inner) = self.inner.get_mut() else {
+            return;
+        };
+        if let Inner::Write { shared } = inner {
+            let scratch = shared.lock().map(|w| w.scratch.is_some()).unwrap_or(false);
+            if scratch && std::sync::Arc::strong_count(shared) <= 2 {
+                if let Ok(mut reg) = write_registry().lock() {
+                    reg.remove(std::path::Path::new(&self.path));
+                }
+            }
+        }
+    }
+}
+
+/// Remove every TaQL result directory this process still holds (the `atexit`
+/// hook, `casacure.tables._cleanup_scratch`).  Returns how many were removed.
+#[pyfunction]
+pub(crate) fn _cleanup_scratch() -> usize {
+    let dirs: Vec<std::path::PathBuf> = match scratch_dirs().lock() {
+        Ok(mut set) => set.drain().collect(),
+        Err(_) => return 0,
+    };
+    dirs.iter()
+        .filter(|d| std::fs::remove_dir_all(d).is_ok())
+        .count()
+}
+
+/// Once per process, before the first TaQL result is written: remove
+/// `casacure-taql-<pid>-<nanos>` directories left in the temp dir by processes
+/// that no longer exist (a crash or a kill skips both the drop and the atexit
+/// hook).  Conservative on purpose -- a directory goes only if its pid is not
+/// alive on this host AND it is more than a day old, so a /tmp shared across
+/// pid namespaces (docker) cannot lose a live table.  Linux only (/proc).
+fn sweep_stale_scratch() {
+    static DONE: std::sync::Once = std::sync::Once::new();
+    DONE.call_once(|| {
+        if !std::path::Path::new("/proc/self").exists() {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        let day = std::time::Duration::from_secs(24 * 3600);
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let Some(rest) = name.to_str().and_then(|n| n.strip_prefix("casacure-taql-")) else {
+                continue;
+            };
+            let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+                continue;
+            };
+            if pid == std::process::id() || std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                continue;
+            }
+            let old = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > day);
+            if old {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    });
 }
 
 /// Identifies the on-disk table directory a [`WriteData`] was built for, so
@@ -789,6 +898,7 @@ user,usernoread,permanent,permanentwait"
                 wt,
                 dirty: false,
                 pin: DirPin::new(&dir),
+                scratch: None,
             }));
             register_write(&dir, &shared);
             return Ok(Table {
@@ -877,6 +987,7 @@ user,usernoread,permanent,permanentwait"
             wt,
             dirty: false,
             pin: DirPin::new(&dir),
+            scratch: None,
         }));
         register_write(&dir, &shared);
         Ok(Table {
@@ -3076,8 +3187,12 @@ fn taql_result_to_table(_py: Python<'_>, out: core::taql::TaqlTable) -> PyResult
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
+    sweep_stale_scratch();
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(err)?;
+    // from here on the directory is owned by this guard: an error below
+    // removes it again, and success hands it to the table's backing
+    let scratch = ScratchDir::new(dir.clone());
 
     let nrows = out.nrows() as u64;
     let mut desc = TableDesc {
@@ -3161,6 +3276,7 @@ fn taql_result_to_table(_py: Python<'_>, out: core::taql::TaqlTable) -> PyResult
         wt,
         dirty: false,
         pin: DirPin::new(&dir),
+        scratch: Some(scratch),
     }));
     register_write(&dir, &shared);
     Ok(Table {

@@ -21,6 +21,7 @@ pub fn run_tests(py: Python<'_>) -> PyResult<usize> {
         tables: py.import("casacure.tables")?.into_any(),
         passed: 0,
         failed: 0,
+        tmpdirs: std::cell::RefCell::new(Vec::new()),
     };
     let checks: Vec<(&str, FnCheck)> = vec![
         ("scalar double round-trip", scalar_roundtrip),
@@ -57,6 +58,17 @@ struct Runner<'py> {
     tables: Bound<'py, PyAny>,
     passed: usize,
     failed: usize,
+    /// Every table directory handed out by [`Runner::tmpdir`], removed when the
+    /// runner drops (they used to be left in the temp dir, one set per run).
+    tmpdirs: std::cell::RefCell<Vec<String>>,
+}
+
+impl Drop for Runner<'_> {
+    fn drop(&mut self) {
+        for d in self.tmpdirs.borrow().iter() {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
 }
 
 impl<'py> Runner<'py> {
@@ -78,7 +90,7 @@ impl<'py> Runner<'py> {
     }
 
     fn tmpdir(&self, tag: &str) -> String {
-        std::env::temp_dir()
+        let d = std::env::temp_dir()
             .join(format!(
                 "casacure-selftest-{}-{}-{tag}",
                 std::process::id(),
@@ -88,7 +100,9 @@ impl<'py> Runner<'py> {
                     .unwrap_or(0)
             ))
             .display()
-            .to_string()
+            .to_string();
+        self.tmpdirs.borrow_mut().push(d.clone());
+        d
     }
 
     /// `casacure.tables.table(path, desc, nrow)` — writable create.

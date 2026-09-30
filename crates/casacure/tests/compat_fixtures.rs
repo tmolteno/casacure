@@ -9,6 +9,9 @@
 //! fixtures. The tests are skipped (with a message) when the manifest is
 //! absent, e.g. on a fresh clone.
 
+#[path = "../src/testdir.rs"]
+#[allow(dead_code)]
+mod testdir;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -841,10 +844,8 @@ fn fixture_subtable_keywords_match_casacore() {
     assert_eq!(t.getkeywords(), moved_expected);
 }
 
-fn tempdir() -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!("casacure-fixture-subcopy-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&p);
-    p
+fn tempdir() -> testdir::TestDir {
+    testdir::TestDir::new(format!("casacure-fixture-subcopy-{}", std::process::id()))
 }
 
 fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {

@@ -4575,19 +4575,17 @@ mod tests {
         }
     }
 
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
+    fn temp_dir(tag: &str) -> crate::testdir::TestDir {
         static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let p =
-            std::env::temp_dir().join(format!("casacure-taql-{tag}-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        p
+        crate::testdir::TestDir::new(format!("casacure-taql-{tag}-{}-{n}", std::process::id()))
     }
 
     /// The /tmp/tq probe table: ANT=[1,2,0,2,1] WHAT=[10,20,30,40,50]
     /// VAL=[5.5,2.0,9.0,2.0,1.0] NAME=[a..e].
     fn probe_table() -> (std::path::PathBuf, Table) {
-        let dir = temp_dir("probe");
+        // by value: the guard is kept until the test's thread exits (testdir.rs)
+        let dir: std::path::PathBuf = temp_dir("probe").into();
         let mut desc = TableDesc {
             name: String::new(),
             version: String::new(),

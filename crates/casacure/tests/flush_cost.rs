@@ -21,6 +21,9 @@
 //! counter is thread-local so tests running in parallel do not see each
 //! other's allocations.
 
+#[path = "../src/testdir.rs"]
+#[allow(dead_code)]
+mod testdir;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
@@ -195,14 +198,12 @@ fn uvw_cell(r: u64) -> RecordValue {
     })
 }
 
-fn temp_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+fn temp_dir(tag: &str) -> testdir::TestDir {
+    testdir::TestDir::new(format!(
         "casacure-flushcost-{tag}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+    ))
 }
 
 /// Create an `nrows`-row MS-like table with every column written, on disk.
@@ -221,7 +222,8 @@ fn build_table(tag: &str, nrows: u64) -> std::path::PathBuf {
         wt.putcell(WEIGHT, r, weight_cell(1.0)).unwrap();
     }
     wt.flush().unwrap();
-    dir
+    // by value: removed when the test's thread exits (testdir.rs)
+    dir.into()
 }
 
 /// Average bytes allocated by one `putcell` of a single row of `col` plus
