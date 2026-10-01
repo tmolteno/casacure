@@ -5,6 +5,80 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.16] - 2026-10-02
+
+### Fixed
+
+- **A same-process reader could crash or read misaligned garbage while a
+  writer flushed.** Whole-file rewrites (a full-table regrowth, a
+  preserving flush's column rebuilds, a TSM grown header, the `table.dat`
+  row-count patches) wrote data files in place — truncate then write —
+  while every read handle of the table holds those files memory-mapped: a
+  page fault past the truncated end is a SIGBUS, a fault during the rewrite
+  serves bytes at the new file's offsets through the old mapping (a reader
+  saw row 79 come back as `original-row-77`). Every whole-file write now
+  stages a uniquely-named temp file next to the target and `rename`s it
+  into place (`datafile::write_atomic`): a mapping follows the inode, so an
+  open snapshot keeps the file it captured and a concurrent opener sees the
+  whole old or the whole new file. `create_table` no longer deletes files
+  it is about to replace, so a concurrent open never finds one missing.
+- **In-place patch writes could tear a cell mid-decode.** The StandardStMan
+  bucket patches, the TiledColumnStMan tile-run patches and the array-file
+  record rewrites change bytes of the mapped inode itself (their cost must
+  track the written chunk, not the column — see `tests/flush_cost.rs`), so
+  a reader decoding a cell while the write was in flight observed a
+  half-written cell; a cell straddling a page boundary tore when its two
+  pages faulted to either side of the write (a reader saw a float array
+  whose first four elements were the old values and last two the new).
+  Patch write phases now hold the table directory's flush gate
+  (`flushgate`, a per-directory RwLock) for writing and every read that
+  decodes cells (`Table::getcell`/`getcol`/`getcol_raw`/`getcol_raw_bits`
+  and `read_table_dir`) holds it for reading, so a reader observes each
+  cell wholly before or wholly after a patch — casacore's unlocked-reader
+  semantics, minus the tearing.
+- **`putcol` could deadlock the process under dask's threaded scheduler.**
+  The batch store held the shared cell-store mutex across its
+  `py.detach(...)`, whose end re-attaches the GIL: a thread waiting for the
+  GIL there deadlocks against any thread that holds the GIL and wants the
+  store (another handle's `putcol`/`flush`, an `open` joining the shared
+  backing, even `col_index`'s descriptor lookup). Found by
+  `tests/test_threading.py::test_parallel_column_writes_merge_into_one_table`
+  (all four writers wedged on futexes). The store is now locked inside the
+  detach and no Rust lock is held across a GIL re-acquire; a batch that
+  fails mid-way also keeps its already-written cells pending for the next
+  flush instead of silently dropping them (`dirty` was never set on that
+  path).
+
+### Added
+
+- **Multi-threaded tests, in both languages** — until now no test in the
+  repo ran casacure code on two threads, although `Table` is documented
+  `Send + Sync` ("safe across dask's threaded executor") and the bindings
+  release the GIL around reads and whole `putcol` batches.
+  `crates/casacure/tests/thread_safety.rs` pins the core contracts: the
+  `Send`/`Sync` bounds, concurrent readers on one shared snapshot,
+  concurrent lock-file attaches landing on one shared instance, and reader
+  snapshots surviving concurrent SSM/TSM/string flush cycles.
+  `tests/test_threading.py` drives the Python surface: parallel readers
+  through one handle, four threads' chunked column writes merging through
+  the process-wide write registry, a read handle overlapping a writer's
+  flushes, and concurrent `taql()` queries racing the scratch-directory
+  registry. CI now runs on pushes to `main` and pull requests (it used to
+  run only on release tags) and gains a ThreadSanitizer job (the `casacure`
+  suite under `-Zsanitizer=thread`, which passes with zero reports).
+- **Free-threaded CPython actually runs without the GIL.** The module now
+  declares `Py_MOD_GIL_NOT_USED` (`#[pymodule(gil_used = false)]`, and the
+  hand-built `tables`/`quanta` submodules likewise), so a no-GIL 3.14t
+  interpreter no longer re-enables the GIL on `import casacure` — until now
+  the free-threaded wheels shipped in the build matrix silently ran with
+  the GIL back on (`RuntimeWarning: The global interpreter lock (GIL) has
+  been enabled...`). With the GIL gone the pyo3 layer's Rust locks are the
+  only protection, and that is exactly what the new threading tests
+  exercise: `tests/test_threading.py` plus the full suite pass on
+  free-threaded 3.14.6, 30/30 repeated runs, and a CI job now installs
+  3.14t via `uv`, asserts the GIL stays disabled across the import, and
+  runs the suite GIL-free.
+
 ## [3.8.15] - 2026-10-01
 
 ### Fixed
