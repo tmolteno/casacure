@@ -507,6 +507,8 @@ fn units_dict(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
 /// Build the `quanta` submodule.
 pub fn quanta_submodule(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let m = PyModule::new(parent.py(), "quanta")?;
+    // Free-threading declaration, as the parent module (see `casacure`).
+    m.gil_used(false)?;
     m.add_class::<Quantity>()?;
     m.add_function(wrap_pyfunction!(quantity, &m)?)?;
     m.add_function(wrap_pyfunction!(is_quantity, &m)?)?;

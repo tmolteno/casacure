@@ -142,6 +142,7 @@ fn complete_ms_desc(py: Python<'_>, name: Option<String>) -> PyResult<Py<PyAny>>
 /// The `tables` submodule (drop-in for `casacore.tables`).
 fn tables_submodule(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let m = PyModule::new(parent.py(), "tables")?;
+    m.gil_used(false)?;
     m.add_class::<table::Table>()?;
     m.add_function(wrap_pyfunction!(table::table, &m)?)?;
     m.add_function(wrap_pyfunction!(table::taql, &m)?)?;
@@ -181,7 +182,14 @@ fn tables_submodule(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-#[pymodule]
+// The crate is free-threading-safe: every pyclass synchronises itself with
+// Rust locks (the table's `Mutex<Inner>` and the shared cell store; reads
+// and writes also release the "GIL" via `py.detach` on GIL builds), so the
+// module declares `Py_MOD_GIL_NOT_USED` and the free-threaded (no-GIL)
+// interpreters no longer re-enable the GIL on import.  Each submodule
+// created by hand below must declare the same, or its import switches the
+// GIL back on.  `gil_used(false)` is a no-op on GIL builds.
+#[pymodule(gil_used = false)]
 fn casacure(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // The crate and the wheel share the same A.B.P version (casacore-interface
     // + casacure patch): take it from Cargo's [workspace.package] so
