@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
+  pull_request:
 
 jobs:
   test:
@@ -40,3 +42,52 @@ jobs:
         # to `casacure.tables` (real python-casacore is installed above only to
         # generate the fixture tables).
         run: PYTHONPATH=tests/shim pytest tests/
+
+  # Concurrency: the threaded stress tests (crates/casacure/tests/
+  # thread_safety.rs, tests/test_threading.py) and the whole casacure suite
+  # under ThreadSanitizer.  The bindings crate is excluded: it links the
+  # (uninstrumented) CPython interpreter, whose own internals TSan cannot
+  # see; the GIL-release paths are driven by tests/test_threading.py in the
+  # test job instead.
+  tsan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: casacure tests under ThreadSanitizer
+        run: >
+          RUSTFLAGS="-Zsanitizer=thread" cargo -Zbuild-std test -p casacure
+          --tests --target x86_64-unknown-linux-gnu
+
+  # The free-threaded (no-GIL) CPython build.  The module declares
+  # `Py_MOD_GIL_NOT_USED` (`#[pymodule(gil_used = false)]`), so the GIL
+  # must stay disabled across the import — with it gone, the pyo3 layer's
+  # Rust locks are the only protection, which is exactly what
+  # tests/test_threading.py exercises.
+  freethreaded:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install free-threaded CPython 3.14 and build
+        run: |
+          uv python install 3.14t
+          uv venv --python 3.14t .venv-ft
+          uv pip install --python .venv-ft/bin/python numpy pytest maturin
+          source .venv-ft/bin/activate
+          maturin develop
+
+      - name: The GIL must stay disabled across the import
+        run: .venv-ft/bin/python -c "import casacure, casacure.tables, casacure.quanta, sys; assert not sys._is_gil_enabled()"
+
+      - name: Test suite (no GIL)
+        run: PYTHONPATH=tests/shim .venv-ft/bin/python -m pytest tests/
+
