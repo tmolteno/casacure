@@ -115,10 +115,20 @@ Work areas follow `CASACORE_TO_CASA_RS.md` (tracked as GitHub issues).
 - [~] Full dask-ms test suite passing against casacure — dask-ms 0.2.32's own tests via the `casacore.tables` shim: **test_table_proxy 14/14; ~82 combined across proxy/ordering/table/columns/dataset**, incl. `test_dataset_multidim_string_column`; MS lifecycle + example_ms work end-to-end (`tests/daskms_smoke.py`). Added: chunked `putcolslice`, dict-form putcol (incl. numpy scalars and `{"shape","array"}` multidim strings split per row), logical-orientation fixed defaults, SSM multidim **string-array** cells (read+write via string buckets). Added: `addcols` (append columns to writable tables, incl. TiledColumnStMan layouts), TSM Bool tiles, Bool scalar storage verified as byte-per-row (bucket layout was wrongly bit-packing — fixed). Upstream store dispatch — VALIDATED by a prototype: an env-gated
 `DASK_MS_BACKEND=casacure` alias in dask-ms's `__init__` routes `casacore.tables`
 to `casacure.tables`, and the full dask-ms 0.2.32 suite passes 219/219 with
-**no shim** (only `casacure` on the path). Remaining: submit that small backend
-selection patch to dask-ms upstream (real python-casacore, when installed,
-still wins by default).
-- [ ] Register as a store type in `fsspec_store.py`/`dask_ms.py` dispatch (upstream, later)
+  **no shim** (only `casacure` on the path). ~~Remaining: submit that small
+  backend selection patch to dask-ms upstream~~ **2026-10-02**: the patch is
+  moot — dask-ms 0.3.0 (alpha now) opens tables through **arcae**
+  (`arcae.lib.arrow_tables` in `casa_table.py`) and never imports
+  `casacore`, so neither the shim nor the `DASK_MS_BACKEND` swap has a site
+  to intercept (verified against 0.3.0a1). The harness pins `dask-ms<0.3`
+  (README); upstream conversation: casacure issue #13 +
+  ratt-ru/dask-ms#392.
+- [ ] dask-ms 0.3 backend: hook casacure into the arcae surface — either an
+      upstream backend-selection point at the function-level `import arcae`
+      seams (`open_table`/`taql_table`/`create_ms`/`create_table`) or an
+      `arcae`-shaped shim module implementing its Arrow-based data-transfer
+      API on casacure. Supersedes the 0.2-era
+      "`fsspec_store.py`/`dask_ms.py` store dispatch" item (upstream, later)
 
 ## 8. python-casacore dependent-package surveys
 

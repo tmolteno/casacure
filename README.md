@@ -138,6 +138,13 @@ by the casacore ephemeris data) is not implemented.
 
 ### Driving dask-ms on casacure
 
+> Applies to **dask-ms 0.2.x** (`pip install "dask-ms<0.3"`). dask-ms 0.3.0
+> (now in alpha) opens tables through **arcae** instead of
+> `casacore.tables`, so neither routing below has an import site to
+> intercept there — the 0.3 integration point is tracked in
+> [issue #13](https://github.com/tmolteno/casacure/issues/13) and
+> [ratt-ru/dask-ms#392](https://github.com/ratt-ru/dask-ms/discussions/392).
+
 dask-ms imports `casacore.tables`; point it at casacure in one of two ways:
 
 **1. A drop-in `casacore` shim** — a two-file package that re-exports
