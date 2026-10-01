@@ -2500,10 +2500,16 @@ impl Table {
 
     /// Store a whole `putcol` batch of cells (one `RecordValue` per row).
     ///
-    /// Like [`Table::put_cells`]: the handle and shared-store locks are taken
-    /// once for the whole batch and per-cell type/shape validation is kept,
-    /// but the store loop runs with the GIL released so the dask scheduler can
-    /// overlap independent writes.
+    /// Like [`Table::put_cells`]: the shared-store lock is taken once for the
+    /// whole batch and per-cell type/shape validation is kept, but the store
+    /// loop runs with the GIL released so the dask scheduler can overlap
+    /// independent writes.
+    ///
+    /// NO Rust lock may be held across the detach: re-attaching the GIL at
+    /// its end while holding the store lock deadlocks against any thread
+    /// that holds the GIL and wants the store (`col_index` -> `desc`, a
+    /// concurrent `flush`, another handle's `open`).  The backing is cloned
+    /// out and locked inside the detach instead.
     fn put_cells_batch(
         &self,
         py: Python<'_>,
@@ -2511,17 +2517,18 @@ impl Table {
         startrow: u64,
         values: Vec<RecordValue>,
     ) -> PyResult<()> {
-        let mut inner = self.inner.lock().unwrap();
-        let Inner::Write { shared, .. } = &mut *inner else {
-            return Err(PyValueError::new_err("table is not writable"));
+        let shared = {
+            let inner = self.inner.lock().unwrap();
+            let Inner::Write { shared, .. } = &*inner else {
+                return Err(PyValueError::new_err("table is not writable"));
+            };
+            std::sync::Arc::clone(shared)
         };
-        let mut s = shared.lock().unwrap();
-        // Validate against the column's declared type and fixed shape before
-        // writing (parity with the per-cell `put_cell` checks).  The desc is
-        // cloned so the whole validation + store loop can run GIL-free.
-        let desc = s.wt.desc().clone();
-        let wt = &mut s.wt;
         py.detach(|| -> PyResult<()> {
+            let mut s = shared.lock().unwrap();
+            // Validate against the column's declared type and fixed shape
+            // before writing (parity with the per-cell `put_cell` checks).
+            let desc = s.wt.desc().clone();
             for (row, value) in (startrow..).zip(values) {
                 if let Some(col) = desc.columns.get(col_idx) {
                     if !record_fits_column(col, &value) {
@@ -2549,12 +2556,14 @@ impl Table {
                         }
                     }
                 }
-                wt.putcell(col_idx, row, value).map_err(err)?;
+                s.wt.putcell(col_idx, row, value).map_err(err)?;
+                // Mark the store dirty per stored cell: a batch that fails
+                // mid-way keeps the cells it already wrote pending for the
+                // next flush instead of silently dropping them.
+                s.dirty = true;
             }
             Ok(())
-        })?;
-        s.dirty = true;
-        Ok(())
+        })
     }
 
     /// Convert user `putcol` data into one `RecordValue` per row.
