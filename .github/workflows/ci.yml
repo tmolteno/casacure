@@ -59,9 +59,11 @@ jobs:
           components: rust-src
 
       - name: casacure tests under ThreadSanitizer
+        # `+nightly` explicitly: the repo's rust-toolchain.toml pins stable
+        # and wins over the toolchain action's default for plain `cargo`.
         run: >
-          RUSTFLAGS="-Zsanitizer=thread" cargo -Zbuild-std test -p casacure
-          --tests --target x86_64-unknown-linux-gnu
+          RUSTFLAGS="-Zsanitizer=thread" cargo +nightly -Zbuild-std test
+          -p casacure --tests --target x86_64-unknown-linux-gnu
 
   # The free-threaded (no-GIL) CPython build.  The module declares
   # `Py_MOD_GIL_NOT_USED` (`#[pymodule(gil_used = false)]`), so the GIL
