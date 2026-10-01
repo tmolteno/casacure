@@ -125,7 +125,9 @@ pub(crate) fn patch_table_dat_nrow(dir: &Path, nrow: u64) -> Result<(), String> 
         }
         bytes[off..off + width].copy_from_slice(&nrow.to_be_bytes()[8 - width..]);
     }
-    std::fs::write(&path, bytes).map_err(io_err(&path))
+    // A whole-file write must replace the inode (see `write_atomic`), never
+    // truncate it in place.
+    crate::datafile::write_atomic(&path, &bytes).map_err(io_err(&path))
 }
 
 /// Rewrite the row count of every `sync` record in `dir/table.lock`
@@ -270,7 +272,9 @@ pub(crate) fn tsm_grow(
     }
     drop(tile);
     let path = dir.join(format!("table.f{seq}"));
-    std::fs::write(&path, hdr).map_err(io_err(&path))?;
+    // The TSM header is memory-mapped by every open read handle of this
+    // table; replacing it atomically keeps those mappings on the old inode.
+    crate::datafile::write_atomic(&path, &hdr).map_err(io_err(&path))?;
     Ok(true)
 }
 
@@ -397,11 +401,19 @@ impl ArrayFile {
         Ok(())
     }
 
-    /// Write everything queued and the header's file length.
+    /// Write everything queued and the header's file length.  The mutations
+    /// of the existing file (record rewrites, the length field) run under
+    /// the table directory's flush gate — readers must never decode a
+    /// half-rewritten record.
     pub(crate) fn finish(mut self) -> Result<(), String> {
         if self.append.is_empty() && self.rewrites.is_empty() && self.exists {
             return Ok(());
         }
+        let Some(dir) = self.path.parent().map(std::path::Path::to_path_buf) else {
+            return Ok(());
+        };
+        let gate = crate::flushgate::gate(&dir);
+        let _gate_w = gate.write().unwrap();
         self.write_appended()?;
         let mut f = self.file()?;
         let path = self.path.clone();

@@ -173,8 +173,16 @@ in-memory / tests) or `Mapped(memmap2::Mmap)`.
   pages as a long scan advances. Scalar/array bool (bit-packed) is handled;
   strings, records, ISM and TSM, and variable-shape arrays keep the generic
   path.
-- A read handle stays an open snapshot (documented): a concurrent flush
-  rewrites the file, so a stale handle reads its own captured state.
+- A read handle stays an open snapshot (documented, and pinned by
+  `tests/thread_safety.rs`): whole-file rewrites swap in a fresh inode
+  atomically (`datafile::write_atomic`), so a live mapping keeps the file
+  it captured, while the byte-patch flush paths (SSM buckets, TSM tile
+  runs, array-file records — bounded writes whose cost tracks the written
+  chunk, see `flush_cost.rs`) mutate the mapped inode under the
+  directory's flush gate (`src/flushgate.rs`): reads hold the gate for
+  reading, so a cell is observed wholly before or wholly after a patch —
+  casacore's unlocked-reader semantics, minus the tearing a page-boundary
+  cell used to suffer.
 - **Lazy, sparse write store:** `WritableTable` keeps the table's row count
   and, per column, a map from row to buffered cell that holds ONLY the rows
   written (or loaded) — never one slot per table row. `addrows` only bumps

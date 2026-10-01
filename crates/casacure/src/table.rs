@@ -148,7 +148,7 @@ pub fn patch_copy_nrow(dir: &std::path::Path, nrow: u64) -> Result<(), TableDatE
         .into());
     }
     bytes[off..off + width].copy_from_slice(&nrow.to_be_bytes()[8 - width..]);
-    std::fs::write(&path, bytes)?;
+    crate::datafile::write_atomic(&path, &bytes)?;
     Ok(())
 }
 
@@ -437,33 +437,52 @@ pub fn create_table(
 
     // Regenerate in place: remove this table's own data files so stale
     // columns / renumbered data-manager files cannot linger. Subtable
-    // subdirectories and `table.info`/`table.lock` are preserved.
+    // subdirectories and `table.info`/`table.lock` are preserved. Files the
+    // rewrite emits again are NOT removed here — each is replaced by an
+    // atomic rename (`write_atomic`), so a concurrent opener sees the whole
+    // old or the whole new file, never a missing one.
     std::fs::create_dir_all(table_dir)?;
+    // The whole file-swap sequence runs under the flush gate: an opener
+    // must never mix the new `table.dat` with old data files (or the
+    // reverse) while the rewrite is mid-flight.
+    let gate = crate::flushgate::gate(table_dir);
+    let _gate_w = gate.write().unwrap();
+    let dat_path = table_dir.join("table.dat");
+    let mut written = vec![dat_path.clone()];
+    for (seq, _) in &data_files {
+        written.push(table_dir.join(format!("table.f{seq}")));
+    }
+    for (seq, _) in &index_files {
+        written.push(table_dir.join(format!("table.f{seq}i")));
+    }
+    for (seq, file_seq, _) in &tile_files {
+        written.push(table_dir.join(format!("table.f{seq}_TSM{file_seq}")));
+    }
+    let rewritten: std::collections::HashSet<_> = written.iter().cloned().collect();
     if let Ok(entries) = std::fs::read_dir(table_dir) {
         for e in entries.flatten() {
             let name = e.file_name().into_string().unwrap_or_default();
-            if name == "table.dat" || name.starts_with("table.f") {
+            if (name == "table.dat" || name.starts_with("table.f"))
+                && !rewritten.contains(&e.path())
+            {
                 let _ = std::fs::remove_file(e.path());
             }
         }
     }
-    let mut written = Vec::new();
-    let dat_path = table_dir.join("table.dat");
-    std::fs::write(&dat_path, table_dat)?;
-    written.push(dat_path);
+    crate::datafile::write_atomic(&dat_path, &table_dat)?;
     for (seq, file) in data_files {
         let f_path = table_dir.join(format!("table.f{seq}"));
-        std::fs::write(&f_path, file)?;
+        crate::datafile::write_atomic(&f_path, &file)?;
         written.push(f_path);
     }
     for (seq, file) in index_files {
         let f_path = table_dir.join(format!("table.f{seq}i"));
-        std::fs::write(&f_path, file)?;
+        crate::datafile::write_atomic(&f_path, &file)?;
         written.push(f_path);
     }
     for (seq, file_seq, file) in tile_files {
         let f_path = table_dir.join(format!("table.f{seq}_TSM{file_seq}"));
-        std::fs::write(&f_path, file)?;
+        crate::datafile::write_atomic(&f_path, &file)?;
         written.push(f_path);
     }
     // Every casacore table carries a `table.lock` — the fcntl target of the
@@ -967,6 +986,13 @@ fn build_tsm_data(
 /// so a `Table` is `Send` + `Sync` and safe to hold across threads (dask-ms
 /// serializes access on its side).
 ///
+/// Concurrent same-process writers never tear a read: whole-file rewrites
+/// replace the file's inode atomically (`crate::datafile::write_atomic`), so
+/// an open mapping keeps the snapshot it captured, and in-place patch writes
+/// run under the directory's flush gate (`crate::flushgate`), which every
+/// read holds for reading — a cell is observed wholly before or wholly after
+/// a patch (casacore's unlocked-reader semantics, minus the tearing).
+///
 /// Locking follows casacore's protocol on `<dir>/table.lock` (fcntl record
 /// locks; see [`crate::lockfile`]). Which locks are taken depends on the
 /// [`crate::lockfile::LockOptions`] the handle was opened with; plain
@@ -1082,6 +1108,11 @@ pub(crate) type DataFiles = (
 );
 
 fn read_table_dir(path: &std::path::Path) -> Result<DataFiles, TableDatError> {
+    // Gated for reading: a same-process writer's patch/rewrite phases hold
+    // the gate for writing, so an open never parses a half-written file
+    // set (whole-file rewrites are atomic renames regardless).
+    let flush_gate = crate::flushgate::gate(path);
+    let _gate_r = flush_gate.read().unwrap();
     let buf = std::fs::read(path.join("table.dat"))?;
     let mut dat = parse_table_dat(&buf)?;
     if let Some(n) = lock_sync_nrrow(path) {
@@ -1716,6 +1747,10 @@ impl Table {
 
     /// Read one cell (`table.getcell(col, row)`).
     pub fn getcell(&self, col_idx: usize, row: u64) -> Result<RecordValue, TableReadError> {
+        // Under the flush gate for reading: a same-process patch write must
+        // not be in flight while this cell decodes off the mapped files.
+        let flush_gate = crate::flushgate::gate(&self.path);
+        let _gate_r = flush_gate.read().unwrap();
         let src = self.column_source(col_idx)?;
         self.read_cell_from(&src, &self.dat.desc.columns[col_idx], row)
     }
@@ -1803,6 +1838,9 @@ impl Table {
         F: FnMut(&[u32], &[u8]) -> Result<(), TableReadError>,
     {
         use crate::tabledesc::ColumnKind;
+        // Under the flush gate for reading (see `getcell`).
+        let flush_gate = crate::flushgate::gate(&self.path);
+        let _gate_r = flush_gate.read().unwrap();
         let desc = &self.dat.desc.columns[col_idx];
         let src = self.column_source(col_idx).map_err(|e| match e {
             TableReadError::UnsupportedColumn(name, reason) => {
@@ -1881,6 +1919,9 @@ impl Table {
     where
         F: FnMut(&[u8], usize, usize) -> Result<(), TableReadError>,
     {
+        // Under the flush gate for reading (see `getcell`).
+        let flush_gate = crate::flushgate::gate(&self.path);
+        let _gate_r = flush_gate.read().unwrap();
         let desc = &self.dat.desc.columns[col_idx];
         let ColumnSource::Tsm { file } = self.column_source(col_idx)? else {
             return Err(TableReadError::UnsupportedRaw {
@@ -1944,6 +1985,9 @@ impl Table {
         startrow: u64,
         nrow: u64,
     ) -> Result<Vec<RecordValue>, TableReadError> {
+        // Under the flush gate for reading (see `getcell`).
+        let flush_gate = crate::flushgate::gate(&self.path);
+        let _gate_r = flush_gate.read().unwrap();
         let desc = &self.dat.desc.columns[col_idx];
         let src = self.column_source(col_idx)?;
         let mut out = Vec::with_capacity(nrow as usize);
@@ -3082,7 +3126,8 @@ impl WritableTable {
             dat.column_set.seq_count.max(dms.len() as u32),
         )?;
         let path = dir.join("table.dat");
-        std::fs::write(&path, bytes).map_err(|e| WriteTableError::Storage(storage_error(&path, e)))
+        crate::datafile::write_atomic(&path, &bytes)
+            .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))
     }
 
     /// The whole cell store as per-column value lists — the input for a
@@ -3317,11 +3362,11 @@ impl WritableTable {
                             )
                             .map_err(storage)?;
                             let path = dir.join(format!("table.f{seq}"));
-                            std::fs::write(&path, f0)
+                            crate::datafile::write_atomic(&path, &f0)
                                 .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
                             if let Some(i) = f0i {
                                 let index_path = dir.join(format!("table.f{seq}i"));
-                                std::fs::write(&index_path, i).map_err(|e| {
+                                crate::datafile::write_atomic(&index_path, &i).map_err(|e| {
                                     WriteTableError::Storage(storage_error(&index_path, e))
                                 })?;
                             }
@@ -3336,7 +3381,7 @@ impl WritableTable {
                             )
                             .map_err(storage)?;
                             let path = dir.join(format!("table.f{seq}"));
-                            std::fs::write(&path, f0)
+                            crate::datafile::write_atomic(&path, &f0)
                                 .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
                         }
                     }
@@ -3367,10 +3412,10 @@ impl WritableTable {
                         )
                         .map_err(storage)?;
                         let path = dir.join(format!("table.f{seq}"));
-                        std::fs::write(&path, hdr)
+                        crate::datafile::write_atomic(&path, &hdr)
                             .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
                         let tile_path = dir.join(format!("table.f{seq}_TSM{file_seq}"));
-                        std::fs::write(&tile_path, tile)
+                        crate::datafile::write_atomic(&tile_path, &tile)
                             .map_err(|e| WriteTableError::Storage(storage_error(&tile_path, e)))?;
                     }
                     self.clear_pending(col);
@@ -3655,32 +3700,38 @@ impl WritableTable {
         }
         let buckets: std::collections::BTreeSet<u32> =
             bit_ops.keys().chain(byte_patches.keys()).copied().collect();
-        for number in buckets {
-            let base = DATA_START + number as usize * bucket_size;
-            let mut buf = vec![0u8; bucket_size];
-            file.seek(SeekFrom::Start(base as u64))
-                .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
-            file.read_exact(&mut buf)
-                .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
-            if let Some(ops) = bit_ops.get(&number) {
-                for (&byte, &(set, clear)) in ops {
-                    if let Some(b) = buf.get_mut(byte) {
-                        *b = (*b | set) & !clear;
+        // Bucket writes change bytes of the mapped data file; readers are
+        // excluded for the whole read-modify-write (flush gate).
+        {
+            let flush_gate = crate::flushgate::gate(dir);
+            let _gate_w = flush_gate.write().unwrap();
+            for number in buckets {
+                let base = DATA_START + number as usize * bucket_size;
+                let mut buf = vec![0u8; bucket_size];
+                file.seek(SeekFrom::Start(base as u64))
+                    .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
+                file.read_exact(&mut buf)
+                    .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
+                if let Some(ops) = bit_ops.get(&number) {
+                    for (&byte, &(set, clear)) in ops {
+                        if let Some(b) = buf.get_mut(byte) {
+                            *b = (*b | set) & !clear;
+                        }
                     }
                 }
-            }
-            if let Some(patches) = byte_patches.get(&number) {
-                for (off, bytes) in patches {
-                    let (off, end) = (*off, off + bytes.len());
-                    if end <= buf.len() {
-                        buf[off..end].copy_from_slice(bytes);
+                if let Some(patches) = byte_patches.get(&number) {
+                    for (off, bytes) in patches {
+                        let (off, end) = (*off, off + bytes.len());
+                        if end <= buf.len() {
+                            buf[off..end].copy_from_slice(bytes);
+                        }
                     }
                 }
+                file.seek(SeekFrom::Start(base as u64))
+                    .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
+                file.write_all(&buf)
+                    .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
             }
-            file.seek(SeekFrom::Start(base as u64))
-                .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
-            file.write_all(&buf)
-                .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
         }
         if let Some(af) = array_file {
             af.finish().map_err(WriteTableError::Storage)?;
@@ -3760,7 +3811,6 @@ impl WritableTable {
         nrow: u64,
     ) -> Result<Option<()>, WriteTableError> {
         use crate::record::DataType;
-        use std::io::{Read, Seek, SeekFrom, Write};
 
         let Some(cd) = self.desc.columns.get(col) else {
             return Ok(None);
@@ -3888,6 +3938,15 @@ impl WritableTable {
         }
         pending.sort_by_key(|p| (p.loc.file_seq, p.loc.byte_off, p.loc.skip));
 
+        // The write phase runs under the directory's flush gate: read
+        // handles map this file, and a cell patched in place can tear — a
+        // cell straddling a page boundary reads half old, half new bytes
+        // when its pages fault around the write.  Readers gate their
+        // decodes, so they observe each cell wholly before or wholly after
+        // the patch.
+        let flush_gate = crate::flushgate::gate(dir);
+        let _gate_w = flush_gate.write().unwrap();
+        use std::io::{Read, Seek, SeekFrom, Write};
         let mut i = 0;
         while i < pending.len() {
             let file_seq = pending[i].loc.file_seq;

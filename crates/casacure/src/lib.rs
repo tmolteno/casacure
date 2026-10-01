@@ -6,6 +6,7 @@
 pub mod aipsio;
 pub mod columnset;
 pub mod datafile;
+mod flushgate;
 mod grow;
 pub mod ism;
 pub mod lockfile;
