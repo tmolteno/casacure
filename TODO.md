@@ -114,8 +114,19 @@ Work areas follow `CASACORE_TO_CASA_RS.md` (tracked as GitHub issues).
 - [X] Cross-implementation round-trip gate (Rust-write → casacore-read and vice versa)
 - [~] Full dask-ms test suite passing against casacure — dask-ms 0.2.32's own tests via the `casacore.tables` shim: **test_table_proxy 14/14; ~82 combined across proxy/ordering/table/columns/dataset**, incl. `test_dataset_multidim_string_column`; MS lifecycle + example_ms work end-to-end (`tests/daskms_smoke.py`). Added: chunked `putcolslice`, dict-form putcol (incl. numpy scalars and `{"shape","array"}` multidim strings split per row), logical-orientation fixed defaults, SSM multidim **string-array** cells (read+write via string buckets). Added: `addcols` (append columns to writable tables, incl. TiledColumnStMan layouts), TSM Bool tiles, Bool scalar storage verified as byte-per-row (bucket layout was wrongly bit-packing — fixed). Upstream store dispatch — VALIDATED by a prototype: an env-gated
 `DASK_MS_BACKEND=casacure` alias in dask-ms's `__init__` routes `casacore.tables`
-to `casacure.tables`, and the full dask-ms 0.2.32 suite passes 219/219 with
-  **no shim** (only `casacure` on the path). ~~Remaining: submit that small
+to `casacure.tables`. **2026-10-02 correction (does not reproduce here):** the
+"full suite passes 219/219 with no shim" claim above was **not** observed on
+`moist`. The default (python-casacore) backend does pass — 219 passed / 10
+skipped on the rebased ratt-ru/dask-ms#383 head — but under
+`DASK_MS_BACKEND=casacure` **70 tests fail** with
+`RuntimeError: storage error: <ms>/table.lock: pread` out of
+`table_proxy.py:107 table.unlock()`, only under dask-ms's threaded
+`TableProxy` (single-threaded casacure lock/unlock probes pass). The failure
+list is byte-identical on the pre-rebase and rebased PR heads, with casacure
+3.8.11/3.8.16 on py3.11/3.13/3.14, with python-casacore absent, and with the
+PR's perf-flush commit removed — so it is neither the rebase nor that change.
+**Re-check on the host where 219/219 was measured before calling this done.**
+ ~~Remaining: submit that small
   backend selection patch to dask-ms upstream~~ **2026-10-02**: the patch is
   moot — dask-ms 0.3.0 (alpha now) opens tables through **arcae**
   (`arcae.lib.arrow_tables` in `casa_table.py`) and never imports
