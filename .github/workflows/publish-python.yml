@@ -48,9 +48,6 @@ jobs:
             sdist: false
           - platform: macos-14
             target: aarch64-apple-darwin
-            python: "3.10"
-          - platform: macos-14
-            target: aarch64-apple-darwin
             python: "3.11"
           - platform: macos-14
             target: aarch64-apple-darwin
