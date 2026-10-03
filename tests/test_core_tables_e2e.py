@@ -527,3 +527,149 @@ def test_tiled_shape_stman_round_trip(tmp_path):
     assert t.getdminfo()["*1"]["TYPE"] == "TiledShapeStMan"
     np.testing.assert_array_equal(t.getcol("DATA"), data)
     t.close()
+
+
+# ---------------------------------------------------------------------------
+# addcols dminfo (storage-manager selection) and removerows.
+# ---------------------------------------------------------------------------
+
+
+def _table_files(directory):
+    return [path.name for path in directory.iterdir() if path.name.startswith("table.f")]
+
+
+def test_addcols_dminfo_flat_record_selects_storage(tmp_path):
+    """A flat ``{TYPE, NAME, SPEC}`` record — python-casacore's documented
+    `addcols` form — puts the new columns in their own manager block.  This
+    is the layout skarabina's ``--write-changed-only`` sharing tests build a
+    real-MS fixture with: one block file per bulk column, which is what the
+    sharing path keys off."""
+    p = str(tmp_path / "t.tab")
+    t = table(p, maketabdesc([makescacoldesc("TIME", 0.0)]), 3)
+    t.putcol("TIME", [1.0, 2.0, 3.0])
+    t.addcols(
+        maketabdesc(makearrcoldesc("DATA", 0.0 + 0.0j, ndim=2, shape=[2, 4])),
+        {"TYPE": "TiledShapeStMan", "NAME": "TiledData",
+         "SPEC": {"DEFAULTTILESHAPE": np.array([2, 4], dtype=np.int32)}},
+    )
+    values = np.arange(3 * 2 * 4, dtype=np.float64).reshape(3, 2, 4) * (1.0 + 1.0j)
+    t.putcol("DATA", values)
+    t.close()
+
+    t = table(p, readonly=True, ack=False)
+    dm = {v["NAME"]: v for v in t.getdminfo().values()}
+    assert dm["TiledData"]["TYPE"] == "TiledShapeStMan"
+    assert dm["TiledData"]["COLUMNS"] == ["DATA"]
+    np.testing.assert_array_equal(t.getcol("TIME"), [1.0, 2.0, 3.0])
+    np.testing.assert_array_equal(t.getcol("DATA"), values)
+    t.close()
+    # Its own block file — what a hard-linking writer shares per column.
+    files = _table_files(tmp_path / "t.tab")
+    assert any("_TSM" in name for name in files), files
+
+
+def test_addcols_dminfo_columns_records_select_storage(tmp_path):
+    """The `getdminfo()`-shaped mapping dask-ms passes assigns each record
+    to the columns it names in COLUMNS; the other columns stay put."""
+    p = str(tmp_path / "t.tab")
+    t = table(p, maketabdesc([makescacoldesc("TIME", 0.0)]), 2)
+    t.putcol("TIME", [1.0, 2.0])
+    t.addcols(
+        maketabdesc(makearrcoldesc("UVW", 0.0, ndim=2, shape=[3, 1])),
+        {"UVW_GROUP": {"COLUMNS": ["UVW"], "NAME": "UVW_GROUP",
+                       "TYPE": "TiledColumnStMan"}},
+    )
+    t.close()
+
+    t = table(p, readonly=True, ack=False)
+    dm = {v["NAME"]: v for v in t.getdminfo().values()}
+    assert dm["UVW_GROUP"]["TYPE"] == "TiledColumnStMan"
+    assert dm["UVW_GROUP"]["COLUMNS"] == ["UVW"]
+    assert dm["StandardStMan"]["COLUMNS"] == ["TIME"]
+    np.testing.assert_array_equal(t.getcol("TIME"), [1.0, 2.0])
+    t.close()
+
+
+def test_addcols_dminfo_rejects_unknown_type_and_column(tmp_path):
+    """A dminfo casacure cannot honour fails at addcols, not at the close()
+    that flushes, and changes nothing."""
+    p = str(tmp_path / "t.tab")
+    t = table(p, maketabdesc([makescacoldesc("TIME", 0.0)]), 1)
+    xdesc = maketabdesc(makearrcoldesc("X", 0.0, ndim=2, shape=[2, 2]))
+    with pytest.raises(ValueError, match="unsupported data-manager type"):
+        t.addcols(xdesc, {"TYPE": "NoSuchManager", "NAME": "XG"})
+    with pytest.raises(KeyError, match="not among the columns"):
+        t.addcols(xdesc, {"XG": {"COLUMNS": ["NOT_X"], "NAME": "XG",
+                                 "TYPE": "StandardStMan"}})
+    assert t.colnames() == ["TIME"]
+    t.close()
+
+
+def test_removerows_renumbers_and_persists(tmp_path):
+    """Row numbers address the table as it stands; survivors renumber in
+    order, immediately for reads and on close for the files."""
+    p = str(tmp_path / "t.tab")
+    t = table(p, maketabdesc([makescacoldesc("VAL", 0)]), 5)
+    t.putcol("VAL", [10, 20, 30, 40, 50])
+    t.removerows([1, 3])
+    assert t.nrows() == 3
+    assert np.asarray(t.getcol("VAL")).tolist() == [10, 30, 50]
+    t.close()
+
+    t2 = table(p, readonly=True, ack=False)
+    assert t2.nrows() == 3
+    assert np.asarray(t2.getcol("VAL")).tolist() == [10, 30, 50]
+    t2.close()
+
+
+def test_removerows_on_lazy_open_keeps_survivor_values(tmp_path):
+    """The default writable open buffers nothing, so removerows must keep
+    the *disk* values of the survivors, renumbered — deleting row 1 of
+    [5, 2, 9] reads [5, 9], not the pre-removal rows shifted or truncated."""
+    p = str(tmp_path / "t.tab")
+    t = table(p, maketabdesc([makescacoldesc("VAL", 0)]), 6)
+    t.putcol("VAL", [5, 2, 9, 7, 1, 4])
+    t.close()
+
+    t = table(p, readonly=False, ack=False)  # lazy: nothing buffered yet
+    t.removerows([1])
+    assert np.asarray(t.getcol("VAL")).tolist() == [5, 9, 7, 1, 4]
+    t.close()
+
+    t2 = table(p, readonly=True, ack=False)
+    assert np.asarray(t2.getcol("VAL")).tolist() == [5, 9, 7, 1, 4]
+    t2.close()
+
+
+def test_removerows_unordered_rows_and_persistence(tmp_path):
+    """Unsorted, repeated row numbers are accepted (they address the table
+    once, in any order), as python-casacore documents."""
+    p = str(tmp_path / "t.tab")
+    t = table(p, maketabdesc([makescacoldesc("VAL", 0)]), 5)
+    t.putcol("VAL", [1, 2, 3, 4, 5])
+    t.removerows([4, 0, 0, 2])
+    assert np.asarray(t.getcol("VAL")).tolist() == [2, 4]
+    t.close()
+    t2 = table(p, readonly=True, ack=False)
+    assert np.asarray(t2.getcol("VAL")).tolist() == [2, 4]
+    t2.close()
+
+
+def test_removerows_errors(tmp_path):
+    """A read-only table and an out-of-range row are errors, not silent
+    no-ops."""
+    p = str(tmp_path / "t.tab")
+    t = table(p, maketabdesc([makescacoldesc("VAL", 0)]), 2)
+    t.putcol("VAL", [1, 2])
+    t.close()
+
+    ro = table(p, readonly=True, ack=False)
+    with pytest.raises(ValueError, match="not writable"):
+        ro.removerows([0])
+    ro.close()
+
+    rw = table(p, readonly=False, ack=False)
+    with pytest.raises(ValueError, match="out of range"):
+        rw.removerows([5])
+    assert rw.nrows() == 2
+    rw.close()

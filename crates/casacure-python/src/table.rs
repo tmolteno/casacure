@@ -279,6 +279,114 @@ fn err<E: std::fmt::Display>(e: E) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
+/// The data-manager types the flush path can create (`create_table`'s
+/// supported managers); anything else fails fast in `addcols` rather than
+/// at the close() that flushes.
+const SUPPORTED_DM_TYPES: [&str; 4] = [
+    "StandardStMan",
+    "IncrementalStMan",
+    "TiledColumnStMan",
+    "TiledShapeStMan",
+];
+
+/// Set one column's data-manager type and group from a `dminfo` record's
+/// `TYPE`/`NAME` fields (either may be absent; the group defaults to the
+/// type, as casacore names a manager given without an explicit NAME).
+fn apply_dm_record(
+    cd: &mut core::tabledesc::ColumnDesc,
+    dm_type: Option<&str>,
+    name: Option<&str>,
+) -> PyResult<()> {
+    if let Some(t) = dm_type {
+        if !SUPPORTED_DM_TYPES.contains(&t) {
+            return Err(PyValueError::new_err(format!(
+                "unsupported data-manager type {t:?} in dminfo; casacure supports {}",
+                SUPPORTED_DM_TYPES.join(", ")
+            )));
+        }
+        cd.data_manager_type = t.to_string();
+    }
+    cd.data_manager_group = name
+        .map(str::to_string)
+        .unwrap_or_else(|| cd.data_manager_type.clone());
+    Ok(())
+}
+
+/// Apply `addcols`'s `dminfo` argument to the columns being added, so the
+/// flush that regenerates the table puts each new column in the manager the
+/// caller asked for (`create_table` groups columns by the descriptor's
+/// data-manager type/group, and writes one block file per group).
+///
+/// Both shapes callers use are accepted, matching casacore's
+/// `Table::addColumns(desc, dminfo)`:
+/// * a flat record `{TYPE, NAME, SPEC}` (python-casacore's documented form)
+///   applies to every column of this `addcols` call;
+/// * a `getdminfo()`-shaped mapping `{field: {TYPE, NAME, COLUMNS, ...}}` —
+///   what dask-ms's descriptor builders pass — applies each record to the
+///   columns it names in `COLUMNS`.
+///
+/// `SPEC` and `SEQNR` are not carried: casacure derives the storage spec
+/// from the column shape and numbers managers in column order, and the file
+/// it writes records the derived spec (a TSM's tile shape) for casacore to
+/// read back.
+fn apply_dminfo(
+    dminfo: &Bound<'_, PyAny>,
+    cols: &mut [core::tabledesc::ColumnDesc],
+) -> PyResult<()> {
+    let dict = dminfo
+        .cast::<PyDict>()
+        .map_err(|_| PyTypeError::new_err("dminfo must be a dict"))?;
+    if dict.is_empty() || cols.is_empty() {
+        return Ok(());
+    }
+    let field_str = |rec: &Bound<'_, PyDict>, key: &str| -> Option<String> {
+        rec.get_item(key)
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract::<String>().ok())
+    };
+    // A flat record has TYPE at the top level and applies to the whole call.
+    if dict.contains("TYPE")? {
+        let dm_type = field_str(dict, "TYPE");
+        let name = field_str(dict, "NAME");
+        for cd in cols.iter_mut() {
+            apply_dm_record(cd, dm_type.as_deref(), name.as_deref())?;
+        }
+        return Ok(());
+    }
+    // getdminfo()-shaped mapping: one record per data manager.
+    for (key, value) in dict.iter() {
+        let rec = value
+            .cast::<PyDict>()
+            .map_err(|_| PyTypeError::new_err("dminfo values must be dicts"))?;
+        let dm_type = field_str(rec, "TYPE");
+        let name = field_str(rec, "NAME").or_else(|| key.extract::<String>().ok());
+        match rec.get_item("COLUMNS")? {
+            Some(columns_value) => {
+                let names: Vec<String> = columns_value.extract()?;
+                for col_name in &names {
+                    let cd = cols
+                        .iter_mut()
+                        .find(|c| &c.name == col_name)
+                        .ok_or_else(|| {
+                            PyKeyError::new_err(format!(
+                                "dminfo names column {col_name:?}, which is not among the \
+                             columns being added"
+                            ))
+                        })?;
+                    apply_dm_record(cd, dm_type.as_deref(), name.as_deref())?;
+                }
+            }
+            None => {
+                for cd in cols.iter_mut() {
+                    apply_dm_record(cd, dm_type.as_deref(), name.as_deref())?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A `casacure.tables.table` object stored as an MS keyword becomes a table
 /// reference (like python-casacore's `TpTable`); anything else is a normal
 /// value.
@@ -916,9 +1024,16 @@ user,usernoread,permanent,permanentwait"
             // writes are file-visible) reads the files. Flush a dirty
             // backing before opening the files so this is not a stale
             // snapshot.
+            //
+            // If the flush fails — a read-only block, e.g. the hard-linked
+            // blocks of a `--write-changed-only` output — the writer's own
+            // flush()/close() has already reported that error and the
+            // writes stay pending on the backing; a reader must not be
+            // refused a read it had no part in failing, so it falls back to
+            // the files: the last state the writer actually persisted.
             if let Some(shared) = find_write(&dir) {
                 if shared.lock().unwrap().dirty {
-                    flush_if_dirty(&shared)?;
+                    let _ = flush_if_dirty(&shared);
                 }
             }
             let read = ::casacure::Table::open_with_lock(&dir, true, options).map_err(err)?;
@@ -1326,7 +1441,8 @@ impl Table {
     }
 
     /// `addcols(coldesc_dict, dminfo=None)` — append columns (each a
-    /// python-casacore column-desc dict) to the writable table.
+    /// python-casacore column-desc dict) to the writable table. `dminfo`
+    /// selects the storage manager of the new columns (`apply_dminfo`).
     #[pyo3(signature = (coldesc, dminfo = None))]
     fn addcols(
         &self,
@@ -1334,7 +1450,6 @@ impl Table {
         coldesc: &Bound<'_, PyDict>,
         dminfo: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
-        let _ = dminfo;
         {
             let mut inner = self.inner.lock().unwrap();
             match &mut *inner {
@@ -1348,7 +1463,11 @@ impl Table {
 
                     let parsed = core::tabledesc::TableDesc::from_desc_json(&json).map_err(err)?;
                     let mut s = shared.lock().unwrap();
-                    for cd in parsed.columns {
+                    let mut columns = parsed.columns;
+                    if let Some(dminfo) = dminfo {
+                        apply_dminfo(dminfo, &mut columns)?;
+                    }
+                    for cd in columns {
                         s.wt.addcol(cd);
                     }
                     s.dirty = true;
@@ -1419,6 +1538,76 @@ impl Table {
                 _ => return Err(PyValueError::new_err("table is not writable")),
             }
         }
+        Ok(())
+    }
+
+    /// `removerows(rownrs)` — remove rows (python-casacore parity). The row
+    /// numbers address the table as it stands and may come in any order;
+    /// survivors renumber in order, persisted at the next flush (like every
+    /// buffered write here: explicit `flush()` or `close()`).
+    ///
+    /// A lazy writable open buffers only written rows, so every row is first
+    /// materialised into the cell store as a session write — the
+    /// [`casacure::WritableTable::from_table`] pattern the taql `DELETE`
+    /// path uses. The store has to be the whole table before rows go: it
+    /// must out-rank the pre-removal on-disk rows for merged reads and for
+    /// `materialize_all` at flush, both of which would otherwise answer
+    /// with rows at their old positions. This costs one table's worth of
+    /// memory for the duration — row removal rewrites the table anyway.
+    fn removerows(&self, rownrs: &Bound<'_, PyAny>) -> PyResult<()> {
+        let rows: Vec<u64> = match rownrs.extract::<Vec<u64>>() {
+            Ok(rows) => rows,
+            Err(_) => {
+                let not_ints = || PyTypeError::new_err("rownrs must be a sequence of integers");
+                let iter = rownrs.try_iter().map_err(|_| not_ints())?;
+                let mut rows = Vec::new();
+                for item in iter {
+                    let item = item.map_err(|_| not_ints())?;
+                    rows.push(item.extract::<u64>().map_err(|_| not_ints())?);
+                }
+                rows
+            }
+        };
+        let mut inner = self.inner.lock().unwrap();
+        let Inner::Write { shared, .. } = &mut *inner else {
+            return Err(PyValueError::new_err("table is not writable"));
+        };
+        let mut s = shared.lock().unwrap();
+        let nrow = s.wt.nrows();
+        if let Some(&row) = rows.iter().find(|&&row| row >= nrow) {
+            return Err(row_out_of_range(row, nrow));
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // Materialise every row as a session write (see the doc comment).
+        let ncols = s.wt.desc().columns.len();
+        for col in 0..ncols {
+            let cd = s.wt.desc().columns[col].clone();
+            let missing = (0..nrow).any(|row| s.wt.cell(col, row).is_none());
+            let disk_vals = if missing {
+                disk_col_index(&s, col).and_then(|di| s.read.getcol(di, 0, s.read.nrows()).ok())
+            } else {
+                None
+            };
+            for row in 0..nrow {
+                let value =
+                    s.wt.cell(col, row)
+                        .cloned()
+                        .or_else(|| {
+                            disk_vals
+                                .as_ref()
+                                .and_then(|v| v.get(row as usize).cloned())
+                        })
+                        .or_else(|| ::casacure::default_cell_value(&cd));
+                let Some(value) = value else {
+                    continue;
+                };
+                s.wt.putcell(col, row, value).map_err(err)?;
+            }
+        }
+        s.wt.drop_rows(&rows);
+        s.dirty = true;
         Ok(())
     }
 
