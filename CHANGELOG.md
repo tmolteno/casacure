@@ -5,6 +5,53 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.17] - 2026-10-03
+
+### Added
+
+- **`table.removerows(rownrs)`** — the python-casacore row-removal API, the
+  last table-lifecycle method the binding lacked (`python-casacore` does not
+  work on arm64, so its absence blocked casacure-only consumers: skarabina's
+  `--split` reduces the copied FIELD/SOURCE subtables with `removerows`).
+  Row numbers address the table as it stands — any order, a row named twice
+  removed once — and survivors renumber in order, immediately for reads and
+  on the next flush (`close()`) for the files. A lazy writable open buffers
+  only written rows, so the call first materialises the whole table into the
+  cell store as session writes (the `WritableTable::from_table` pattern the
+  taql `DELETE` path uses): the store must out-rank the pre-removal on-disk
+  rows for merged reads and for `materialize_all`, which would otherwise
+  answer with rows at their old positions. Costs one table's worth of
+  memory for the duration — row removal rewrites the table anyway. Rows out
+  of range and read-only handles raise, as python-casacore's contract has
+  them (casacure's `ValueError`s).
+
+### Fixed
+
+- **`table.addcols(coldesc, dminfo)` honours `dminfo`** — it was accepted
+  and dropped (`let _ = dminfo`), so a column added with an explicit storage
+  manager landed in the table's default group instead of its own block file.
+  Both casacore shapes now assign the new columns' manager, which the
+  flush's `create_table` turns into one block file per group: python-casacore's
+  flat `{TYPE, NAME, SPEC}` record (applies to every column of the call —
+  how skarabina's `--write-changed-only` sharing fixture lays a real-MS
+  layout out), and dask-ms's `getdminfo()`-shaped mapping, whose `COLUMNS`
+  name the target columns. An unsupported `TYPE`, or a `COLUMNS` entry
+  naming a column that is not being added, raises at `addcols` — not at the
+  `close()` that flushes. `SPEC`/`SEQNR` are not carried: casacure derives
+  the storage spec from the column shape and records it in the file it
+  writes (a TSM's tile shape among them), which is what casacore reads back.
+- **A read-only open is no longer refused when a writer's flush failed.**
+  A process-shared backing that could not be flushed (a read-only block —
+  exactly what `skarabina --write-changed-only` leaves hard-linked into its
+  output, whose writer's `close()` correctly raises `Permission denied`)
+  stayed dirty, and the *next* open of that directory — including a plain
+  read — re-attempted the flush and raised, so a table could not even be
+  read back in the process that failed to write it. The writer's
+  `flush()`/`close()` still raises (and keeps the writes pending, so a
+  chmod-then-retry can persist them); a reader now falls back to the
+  on-disk state, which is the last state the writer actually persisted —
+  what python-casacore's file-visible tables show in the same situation.
+
 ## [3.8.16] - 2026-10-02
 
 ### Fixed
