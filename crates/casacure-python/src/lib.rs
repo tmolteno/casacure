@@ -4,6 +4,7 @@
 
 mod convert;
 mod helpers;
+mod measures;
 mod quanta;
 mod selftest;
 mod table;
@@ -11,7 +12,7 @@ mod table;
 use ::casacure::ValueType;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 
 /// Map a CASA type name (any alias) to its numpy dtype name.
 ///
@@ -139,6 +140,66 @@ fn complete_ms_desc(py: Python<'_>, name: Option<String>) -> PyResult<Py<PyAny>>
     Ok(table::desc_to_pydict(py, &desc, None)?.into_any().unbind())
 }
 
+/// `addImagingColumns(msname, ack=True)` — add MODEL_DATA, CORRECTED_DATA
+/// and IMAGING_WEIGHT to an MS (mirrors `casacore.tables.addImagingColumns`).
+///
+/// Goes through the shared writable backing (the same one a live
+/// `table(msname, readonly=False)` handle uses), so a table object opened
+/// before or after the call sees the new columns immediately.
+#[pyfunction]
+#[pyo3(name = "addImagingColumns", signature = (msname, ack = true))]
+fn add_imaging_columns(
+    py: Python<'_>,
+    msname: &Bound<'_, PyAny>,
+    ack: bool,
+) -> PyResult<Py<PyAny>> {
+    let path = table::path_string(msname)?;
+    let t = table::table(
+        py,
+        &PyString::new(py, &path).into_any(),
+        None,
+        0,
+        None,
+        false, // readonly=False: we mutate
+        true,
+        None,
+        &PyTuple::empty(py),
+        None,
+    )?;
+    let added = t.add_imaging_columns_impl(py)?;
+    if ack {
+        for name in &added {
+            py.import("builtins")?
+                .getattr("print")?
+                .call1((format!("added column {name}"),))?;
+        }
+    }
+    Ok(pyo3::types::PyList::new(py, added)?.into_any().unbind())
+}
+
+/// `removeImagingColumns(msname)` — remove MODEL_DATA, CORRECTED_DATA and
+/// IMAGING_WEIGHT from an MS (mirrors
+/// `casacore.tables.removeImagingColumns`).
+#[pyfunction]
+#[pyo3(name = "removeImagingColumns")]
+fn remove_imaging_columns(py: Python<'_>, msname: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    let path = table::path_string(msname)?;
+    let t = table::table(
+        py,
+        &PyString::new(py, &path).into_any(),
+        None,
+        0,
+        None,
+        false,
+        true,
+        None,
+        &PyTuple::empty(py),
+        None,
+    )?;
+    let removed = t.remove_imaging_columns_impl(py)?;
+    Ok(pyo3::types::PyList::new(py, removed)?.into_any().unbind())
+}
+
 /// The `tables` submodule (drop-in for `casacore.tables`).
 fn tables_submodule(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let m = PyModule::new(parent.py(), "tables")?;
@@ -160,6 +221,8 @@ fn tables_submodule(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(helpers::tableexists, &m)?)?;
     m.add_function(wrap_pyfunction!(helpers::tabledelete, &m)?)?;
     m.add_function(wrap_pyfunction!(helpers::tablecopy, &m)?)?;
+    m.add_function(wrap_pyfunction!(add_imaging_columns, &m)?)?;
+    m.add_function(wrap_pyfunction!(remove_imaging_columns, &m)?)?;
     // Give the factories a resolvable `__module__` so dask-ms can pickle the
     // TableProxy (which pickles the factory callable).
     for name in ["table", "taql", "default_ms", "default_ms_subtable"] {
@@ -201,6 +264,7 @@ fn casacure(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(selftest::run_benchmark, m)?)?;
     tables_submodule(m)?;
     quanta::quanta_submodule(m)?;
+    measures::measures_submodule(m)?;
     Ok(())
 }
 

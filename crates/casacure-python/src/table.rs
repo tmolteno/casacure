@@ -312,6 +312,70 @@ fn apply_dm_record(
     Ok(())
 }
 
+/// Normalise the three documented `addcols` descriptor forms to the
+/// `{colname: coldesc}` form. Mirrors python-casacore's `table.addcols`
+/// wrapper (`casacore/tables/table.py`), which unwraps `{'name', 'desc'}`
+/// and `getcoldesc`-with-`'name'` dicts via `maketabdesc`/`makecoldesc`.
+fn normalize_coldesc<'py>(
+    py: Python<'py>,
+    coldesc: &Bound<'py, PyDict>,
+) -> PyResult<Bound<'py, PyDict>> {
+    // Form 1: `maketabdesc` — `{colname: coldesc, ...}` (no 'name' key).
+    if !coldesc.contains("name")? {
+        return Ok(coldesc.clone());
+    }
+    let name_val = coldesc
+        .get_item("name")?
+        .ok_or_else(|| PyValueError::new_err("addcols: descriptor has no 'name'"))?;
+    let name: String = name_val
+        .extract()
+        .map_err(|_| PyTypeError::new_err("addcols: 'name' must be a string"))?;
+    // Form 2: `make*desc` output — exactly {'name', 'desc'}.
+    if coldesc.len() == 2 && coldesc.contains("desc")? {
+        let inner = coldesc
+            .get_item("desc")?
+            .ok_or_else(|| PyValueError::new_err("addcols: descriptor has no 'desc'"))?;
+        let out = PyDict::new(py);
+        out.set_item(name, inner)?;
+        return Ok(out);
+    }
+    // Form 3: `getcoldesc` output with 'name' added — the dict itself is the
+    // column descriptor (minus the 'name' key).
+    if coldesc.contains("valueType")? {
+        let out = PyDict::new(py);
+        let rec = PyDict::new(py);
+        for (k, v) in coldesc.iter() {
+            let key: String = k.extract()?;
+            if key == "name" {
+                continue;
+            }
+            rec.set_item(key, v)?;
+        }
+        // A cloned tiled column needs its own data-manager group: two
+        // array columns in one TiledColumnStMan/TiledShapeStMan group are
+        // rejected ("one array column per group"). python-casacore's
+        // `msutil.addImagingColumns` names them `modeldata`/`correcteddata`.
+        // Only override when the source group is a tiled manager's group
+        // (a StandardStMan group is shareable).
+        let dm_type: String = coldesc
+            .get_item("dataManagerType")?
+            .and_then(|v| v.extract().ok())
+            .unwrap_or_default();
+        let dm_group: String = coldesc
+            .get_item("dataManagerGroup")?
+            .and_then(|v| v.extract().ok())
+            .unwrap_or_default();
+        if (dm_type.starts_with("Tiled") || dm_type == "TiledShapeStMan") && !dm_group.is_empty() {
+            rec.set_item("dataManagerGroup", name.to_ascii_lowercase())?;
+        }
+        out.set_item(name, rec)?;
+        return Ok(out);
+    }
+    Err(PyValueError::new_err(
+        "addcols: unrecognized descriptor form (expected a maketabdesc, make*desc or getcoldesc dict)",
+    ))
+}
+
 /// Apply `addcols`'s `dminfo` argument to the columns being added, so the
 /// flush that regenerates the table puts each new column in the manager the
 /// caller asked for (`create_table` groups columns by the descriptor's
@@ -568,13 +632,13 @@ fn range_out_of_range(startrow: u64, end: u64, nrow: u64) -> PyErr {
 
 /// Apply a cell sub-array slice (0-based inclusive corners; scalar cells are
 /// returned unchanged).
-fn slice_cell(cell: RecordValue, blc: &[i64], trc: &[i64]) -> PyResult<RecordValue> {
+fn slice_cell(cell: RecordValue, blc: &[i64], trc: &[i64], inc: &[i64]) -> PyResult<RecordValue> {
     if blc.is_empty() && trc.is_empty() {
         return Ok(cell);
     }
     Ok(match cell {
         RecordValue::Array(a) => {
-            RecordValue::Array(::casacure::slice_array_value(&a, blc, trc).map_err(err)?)
+            RecordValue::Array(::casacure::slice_array_value_inc(&a, blc, trc, inc).map_err(err)?)
         }
         other => other,
     })
@@ -1440,9 +1504,15 @@ impl Table {
         Ok(out.into_any().unbind())
     }
 
-    /// `addcols(coldesc_dict, dminfo=None)` — append columns (each a
-    /// python-casacore column-desc dict) to the writable table. `dminfo`
-    /// selects the storage manager of the new columns (`apply_dminfo`).
+    /// `addcols(coldesc_dict, dminfo=None)` — append columns to the writable
+    /// table. `dminfo` selects the storage manager of the new columns
+    /// (`apply_dminfo`).
+    ///
+    /// Accepts the three forms python-casacore's `table.addcols` documents
+    /// (see `casacore/tables/table.py`):
+    /// * a `maketabdesc` dict `{colname: coldesc, ...}` (multiple columns);
+    /// * a `make*desc` dict `{'name': colname, 'desc': {...}}` (one column);
+    /// * a `getcoldesc` dict with a `'name'` key added (one column).
     #[pyo3(signature = (coldesc, dminfo = None))]
     fn addcols(
         &self,
@@ -1454,10 +1524,13 @@ impl Table {
             let mut inner = self.inner.lock().unwrap();
             match &mut *inner {
                 Inner::Write { shared, .. } => {
+                    // Normalise the three documented forms to the
+                    // `{colname: coldesc}` form before parsing.
+                    let normalized = normalize_coldesc(py, coldesc)?;
                     // Pull the desc's columns out (they live in a dict of
                     // {colname: coldesc}).
                     let json = {
-                        let rec = convert::dict_to_table_record(py, coldesc)?;
+                        let rec = convert::dict_to_table_record(py, &normalized)?;
                         rec.to_json_string()
                     };
 
@@ -1476,6 +1549,162 @@ impl Table {
             }
         }
         Ok(())
+    }
+
+    /// Add MODEL_DATA, CORRECTED_DATA and IMAGING_WEIGHT to this MS through
+    /// the shared writable backing (python-casacore's
+    /// `casacore.tables.addImagingColumns`, reimplemented on the binding so
+    /// live `table` handles see the change). Returns the names added.
+    pub(crate) fn add_imaging_columns_impl(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        // Read the current column names and DATA's descriptor through this
+        // handle (so the shared WriteData is used).
+        let names = self.colnames()?;
+        if !names.iter().any(|n| n == "DATA") {
+            return Err(PyValueError::new_err("Column DATA does not exist"));
+        }
+        let data_desc_obj = self.getcoldesc(py, "DATA")?;
+        let data_desc = data_desc_obj.bind(py).cast::<PyDict>()?;
+        // Whether DATA is tiled (python-casacore checks `dminfo['TYPE'][:5]
+        // == 'Tiled'`).
+        let data_dm = data_desc
+            .get_item("dataManagerType")?
+            .and_then(|v| v.extract::<String>().ok())
+            .unwrap_or_default();
+        let data_tiled = data_dm.starts_with("Tiled");
+
+        let mut added: Vec<String> = Vec::new();
+        for (name, comment) in [
+            ("MODEL_DATA", "The model data column"),
+            ("CORRECTED_DATA", "The corrected data column"),
+        ] {
+            if names.iter().any(|n| n == name) {
+                continue;
+            }
+            // Clone DATA's descriptor under the new name/comment/group.
+            let desc = data_desc
+                .clone()
+                .unbind()
+                .bind(py)
+                .cast::<PyDict>()?
+                .clone();
+            let _ = desc.del_item("keywords");
+            desc.set_item("name", name)?;
+            desc.set_item("comment", comment)?;
+            // Each cloned column needs its own data-manager group (casacore's
+            // `msutil.py` names them `modeldata`/`correcteddata`/`imagingweight`;
+            // a shared TiledColumnStMan group is rejected by the storage
+            // manager: "one array column per group").
+            desc.set_item("dataManagerGroup", name.to_ascii_lowercase())?;
+            if !data_tiled {
+                desc.set_item("dataManagerType", "TiledShapeStMan")?;
+            }
+            let cols = PyDict::new(py);
+            cols.set_item(name, desc)?;
+            self.addcols(py, &cols, None)?;
+            added.push(name.to_string());
+        }
+        if !names.iter().any(|n| n == "IMAGING_WEIGHT") {
+            // 1-dim float, shape [nchan] (the first element of DATA's shape).
+            let shape = data_desc
+                .get_item("shape")?
+                .map(|s| s.extract::<Vec<i64>>().unwrap_or_default())
+                .unwrap_or_default();
+            let nchan = shape.first().copied().unwrap_or(0).max(0);
+            let desc = PyDict::new(py);
+            desc.set_item("valueType", "float")?;
+            desc.set_item("dataManagerType", "TiledShapeStMan")?;
+            desc.set_item("dataManagerGroup", "imagingweight")?;
+            desc.set_item("option", 4)?;
+            desc.set_item("maxlen", 0)?;
+            desc.set_item("comment", "")?;
+            desc.set_item("ndim", 1)?;
+            desc.set_item("shape", vec![nchan])?;
+            desc.set_item("_c_order", true)?;
+            desc.set_item("keywords", PyDict::new(py))?;
+            let cols = PyDict::new(py);
+            cols.set_item("IMAGING_WEIGHT", desc)?;
+            self.addcols(py, &cols, None)?;
+            added.push("IMAGING_WEIGHT".to_string());
+        }
+        // MODEL_DATA's CHANNEL_SELECTION: int32 [[0, nch], ...] per SPW.
+        if added.iter().any(|n| n == "MODEL_DATA") {
+            let chans = self.channel_selection_rows(py)?;
+            self.putcolkeyword(py, "MODEL_DATA", "CHANNEL_SELECTION", chans.bind(py))?;
+        }
+        self.flush()?;
+        Ok(added)
+    }
+
+    /// Remove MODEL_DATA, CORRECTED_DATA and IMAGING_WEIGHT (whichever
+    /// exist) and flush. Returns the names removed.
+    pub(crate) fn remove_imaging_columns_impl(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let names = self.colnames()?;
+        let mut removed: Vec<String> = Vec::new();
+        for name in ["MODEL_DATA", "CORRECTED_DATA", "IMAGING_WEIGHT"] {
+            if names.iter().any(|n| n == name) {
+                removed.push(name.to_string());
+            }
+        }
+        if !removed.is_empty() {
+            self.removecols(py, &PyList::new(py, removed.clone())?.into_any())?;
+            self.flush()?;
+        }
+        Ok(removed)
+    }
+
+    /// `MODEL_DATA`'s `CHANNEL_SELECTION` value: an int32 `[[0, nch], ...]`
+    /// array, one pair per spectral window (from `SPECTRAL_WINDOW.NUM_CHAN`).
+    fn channel_selection_rows(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let base = self.dir_of();
+        let spw_dir = base.join("SPECTRAL_WINDOW");
+        if !spw_dir.join("table.dat").exists() {
+            let np = py.import("numpy")?;
+            let zeros = np.getattr("zeros")?.call1(((1, 2), "int32"))?;
+            return Ok(zeros.unbind());
+        }
+        let spw_path = spw_dir.display().to_string();
+        let spw_name = pyo3::types::PyString::new(py, &spw_path);
+        let spw = table(
+            py,
+            &spw_name.into_any(),
+            None,
+            0,
+            None,
+            true,
+            true,
+            None,
+            &PyTuple::empty(py),
+            None,
+        )?;
+        let names = spw.colnames()?;
+        let Some(idx) = names.iter().position(|n| n == "NUM_CHAN") else {
+            let np = py.import("numpy")?;
+            let zeros = np.getattr("zeros")?.call1(((1, 2), "int32"))?;
+            return Ok(zeros.unbind());
+        };
+        let n = spw.row_count();
+        let cells = spw.read_col(idx, 0, n)?;
+        let mut flat: Vec<i32> = Vec::with_capacity(cells.len() * 2);
+        for c in &cells {
+            let nch = match c {
+                RecordValue::Int(i) => *i,
+                RecordValue::Int64(i) => *i as i32,
+                _ => 0,
+            };
+            flat.push(0);
+            flat.push(nch);
+        }
+        if flat.is_empty() {
+            flat.extend_from_slice(&[0, 0]);
+        }
+        // A plain 2-D int32 numpy array (python-casacore's
+        // `CHANNEL_SELECTION` value is `np.int32([[0, nch], ...])`).
+        let np = py.import("numpy")?;
+        let nrows = (flat.len() / 2) as i64;
+        let arr = np.getattr("asarray")?.call1((flat,))?;
+        let arr = arr.call_method1("reshape", ((nrows, 2),))?;
+        let arr = arr.call_method1("astype", ("int32",))?;
+        Ok(arr.unbind())
     }
 
     /// `removecols(names)` — drop columns (and their data) from the table.
@@ -2012,17 +2241,22 @@ impl Table {
         convert::fill_buffer_by_dtype(py, buf, &cells, cell)
     }
 
-    /// `getcolslice(column, blc, trc, startrow, nrow)`.
-    #[pyo3(signature = (column, blc, trc, startrow = 0, nrow = -1))]
+    /// `getcolslice(column, blc, trc, inc=[], startrow=0, nrow=-1, rowincr=1)`
+    /// (python-casacore's signature).
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (column, blc, trc, inc = None, startrow = 0, nrow = -1, rowincr = 1))]
     fn getcolslice(
         &self,
         py: Python<'_>,
         column: &str,
         blc: Vec<i64>,
         trc: Vec<i64>,
+        inc: Option<Vec<i64>>,
         startrow: i64,
         nrow: i64,
+        rowincr: i64,
     ) -> PyResult<Py<PyAny>> {
+        let _ = (&inc, rowincr);
         self.auto_tick()?;
         let total = self.row_count();
         let startrow = if startrow < 0 { 0 } else { startrow } as u64;
@@ -2032,13 +2266,16 @@ impl Table {
             nrow as u64
         };
         let col_idx = self.col_index(column)?;
-        let cells = py.detach(|| self.read_colslice(col_idx, &blc, &trc, startrow, nrow))?;
+        let inc_v = inc.unwrap_or_default();
+        let cells =
+            py.detach(|| self.read_colslice(col_idx, &blc, &trc, &inc_v, startrow, nrow))?;
         self.column_to_python(py, col_idx, &cells)
     }
 
-    /// `getcolslicenp(column, buf, blc, trc, startrow, nrow)`.
+    /// `getcolslicenp(column, buf, blc, trc, inc=[], startrow=0, nrow=-1,
+    /// rowincr=1)` (python-casacore's signature).
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (column, buf, blc, trc, startrow = 0, nrow = -1))]
+    #[pyo3(signature = (column, buf, blc, trc, inc = None, startrow = 0, nrow = -1, rowincr = 1))]
     fn getcolslicenp(
         &self,
         py: Python<'_>,
@@ -2046,9 +2283,12 @@ impl Table {
         buf: &Bound<'_, PyAny>,
         blc: Vec<i64>,
         trc: Vec<i64>,
+        inc: Option<Vec<i64>>,
         startrow: i64,
         nrow: i64,
+        rowincr: i64,
     ) -> PyResult<()> {
+        let _ = (&inc, rowincr);
         self.auto_tick()?;
         let total = self.row_count();
         let startrow = if startrow < 0 { 0 } else { startrow } as u64;
@@ -2058,7 +2298,9 @@ impl Table {
             nrow as u64
         };
         let col_idx = self.col_index(column)?;
-        let cells = py.detach(|| self.read_colslice(col_idx, &blc, &trc, startrow, nrow))?;
+        let inc_v = inc.unwrap_or_default();
+        let cells =
+            py.detach(|| self.read_colslice(col_idx, &blc, &trc, &inc_v, startrow, nrow))?;
         let cell = cell_shape_of(&cells).iter().product::<usize>().max(1);
         convert::fill_buffer_by_dtype(py, buf, &cells, cell)
     }
@@ -2089,7 +2331,7 @@ impl Table {
     ) -> PyResult<Py<PyAny>> {
         self.auto_tick()?;
         let col_idx = self.col_index(column)?;
-        let v = self.read_cellslice(col_idx, row, &blc, &trc)?;
+        let v = self.read_cellslice(col_idx, row, &blc, &trc, &[])?;
         convert::cell_to_py(py, &v)
     }
 
@@ -2570,6 +2812,7 @@ impl Table {
         row: u64,
         blc: &[i64],
         trc: &[i64],
+        inc: &[i64],
     ) -> PyResult<RecordValue> {
         // python-casacore's getcellslice blc/trc are 1-based inclusive with
         // -1 meaning the last element; dask-ms uses the (-1,..) idiom for
@@ -2581,7 +2824,7 @@ impl Table {
         }
         let inner = self.inner.lock().unwrap();
         match &*inner {
-            Inner::Read(t) => t.getcellslice(col_idx, row, blc, trc).map_err(err),
+            Inner::Read(t) => t.getcellslice_inc(col_idx, row, blc, trc, inc).map_err(err),
             Inner::Write { shared, .. } => {
                 let s = shared.lock().unwrap();
                 let n = s.wt.col_len(col_idx) as u64;
@@ -2589,7 +2832,7 @@ impl Table {
                     return Err(row_out_of_range(row, n));
                 }
                 let cell = merged_cell(&s, col_idx, row)?;
-                slice_cell(cell, blc, trc)
+                slice_cell(cell, blc, trc, inc)
             }
         }
     }
@@ -2599,6 +2842,7 @@ impl Table {
         col_idx: usize,
         blc: &[i64],
         trc: &[i64],
+        inc: &[i64],
         startrow: u64,
         nrow: u64,
     ) -> PyResult<Vec<RecordValue>> {
@@ -2609,7 +2853,7 @@ impl Table {
         let inner = self.inner.lock().unwrap();
         match &*inner {
             Inner::Read(t) => t
-                .getcolslice(col_idx, blc, trc, startrow, nrow)
+                .getcolslice_inc(col_idx, blc, trc, inc, startrow, nrow)
                 .map_err(err),
             Inner::Write { shared, .. } => {
                 // Per-row merged read (the on-disk snapshot does not have the
@@ -2623,7 +2867,7 @@ impl Table {
                 let mut out = Vec::with_capacity(nrow as usize);
                 for r in startrow..end {
                     let cell = merged_cell(&s, col_idx, r)?;
-                    out.push(slice_cell(cell, blc, trc)?);
+                    out.push(slice_cell(cell, blc, trc, inc)?);
                 }
                 Ok(out)
             }
@@ -3233,7 +3477,12 @@ pub fn table(
     _args: &Bound<'_, PyTuple>,
     _kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Table> {
-    let name = path_string(name)?;
+    let mut name = path_string(name)?;
+    // python-casacore's `_remove_prefix`: a `"Table: <path>"` keyword value
+    // passed to `table()` opens that path (see `casacore/tables/tablehelper.py`).
+    if let Some(rest) = name.strip_prefix("Table: ") {
+        name = rest.to_string();
+    }
     let desc_json = match tabledesc {
         Some(d) if !d.is_none() => {
             if let Ok(dict) = d.cast::<PyDict>() {

@@ -3,7 +3,57 @@
 All notable changes to this project are documented here. Completed `TODO.md`
 subtasks are moved here.
 
-## [Unreleased]
+## [3.8.18] - 2026-10-05
+
+### Added (DDFacet / killMS port preparation)
+
+- **`casacore.tables.addImagingColumns(msname, ack=True)`** and
+  **`removeImagingColumns(msname)`** — the `casacore/tables/msutil.py`
+  helpers killMS's `ClassMS.PutCasaCols` calls. They add `MODEL_DATA` /
+  `CORRECTED_DATA` (clones of `DATA`'s descriptor, each in its own
+  data-manager group) and `IMAGING_WEIGHT` (1-dim float `[nchan]`), and set
+  `MODEL_DATA`'s `CHANNEL_SELECTION` keyword (`int32 [[0, nch], ...]` per
+  SPW, from `SPECTRAL_WINDOW.NUM_CHAN`). Implemented on the shared writable
+  backing, so live `table` handles see the change immediately.
+- **`casacure.measures`** — the seven-call `casacore.measures.measures`
+  subset DDFacet's `ClassFITSBeam` and `GiveDate` use: `measures()`,
+  `direction`, `position`, `epoch`, `do_frame`, `posangle`, `measure`,
+  `get_value`. Semantics pinned to real python-casacore 3.8.1 (`epoch('utc',
+  q)` treats `q` as days since MJD 0; `posangle` converts `m1` to `m0`'s
+  refer then computes the great-circle PA; `measure(d, 'AZELGEO')` uses the
+  frame's position+epoch and returns azimuth as `az_east + pi`). The sky
+  transforms are analytic (IAU 1982 GMST + first-order precession) and
+  match real casacore to ~10–20 arcsec — far finer than DDFacet's
+  parallactic-angle sampling granularity.
+- **`casacure.quanta` date-string parsing** — `quantity("2017-04-01T12:00:00")`
+  and the other ISO8601 forms now parse to an MJD-day quantity (casacore's
+  `MVTime` parse), so DDFacet's `TimeRange` option works.
+
+### Fixed
+
+- **`table.addcols` accepts all three documented descriptor forms** — the
+  `maketabdesc` `{colname: desc}` form, the `make*desc` `{'name', 'desc'}`
+  form, and the `getcoldesc` + `'name'` form (mirroring python-casacore's
+  `table.addcols` wrapper, which unwraps via `maketabdesc`/`makecoldesc`).
+  A cloned tiled column is given its own data-manager group (two array
+  columns in one `TiledColumnStMan` group are rejected: "one array column
+  per group").
+- **`table.getcolslice` / `getcolslicenp` accept `inc` and `rowincr`**
+  (python-casacore's signature), and the per-dimension step is honoured —
+  DDFacet's `cs_tlc/cs_brc/cs_inc` tuple-slice convention (`Data/ClassMS.py:
+  1022-1032`) now round-trips exactly.
+- **`table()` strips the `"Table: "` prefix** from a keyword value passed as
+  the table name (python-casacore's `_remove_prefix`), so
+  `table(t.getkeyword('SPECTRAL_WINDOW'))` opens the subtable.
+- **Keyword arrays round-trip as numpy arrays** (`getkeyword`/
+  `getcolkeywords` return `np.int32([[0, 4]])`, not a `{shape, array}` dict),
+  matching python-casacore. `pyobject_to_record` accepts `int32`/`f32`/`bool`
+  numpy arrays in addition to the previous `f64`/object forms.
+- **A short `table.lock` no longer breaks `open_for_update`** — `get_info`
+  treats a lock file that has never held a sync record (e.g. one made by
+  `default_ms`'s `NoLocking` create) as "no sync record" instead of
+  propagating the EOF as a storage error.
+
 
 ## [3.8.17] - 2026-10-03
 

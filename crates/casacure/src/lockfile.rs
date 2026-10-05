@@ -576,14 +576,20 @@ mod posix {
         }
 
         /// `LockFile::getInfo`: the info length at `SIZE_REQ_ID`, then the
-        /// stream. Missing/short info (a just-created or foreign file) ->
-        /// `None`.
+        /// stream. Missing/short info (a just-created or foreign file, or a
+        /// lock file that has never held a sync record — e.g. one made by
+        /// `default_ms`'s `NoLocking` create) -> `None`.
         pub fn get_info(&self) -> Result<Option<TableSyncData>, String> {
             if self.missing {
                 return Ok(None);
             }
             let mut len_buf = [0u8; 4];
-            pread_exact(&self.file, SIZE_REQ_ID as u64, &mut len_buf).map_err(|e| e.to_string())?;
+            // A short file has no info record at all: treat as `None` rather
+            // than propagating the EOF (the request-list area alone is a
+            // legitimate lock file state).
+            if pread_exact(&self.file, SIZE_REQ_ID as u64, &mut len_buf).is_err() {
+                return Ok(None);
+            }
             let len = u32::from_be_bytes(len_buf) as usize;
             if len == 0 || len > 64 * 1024 * 1024 {
                 return Ok(None);

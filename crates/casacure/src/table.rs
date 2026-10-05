@@ -2033,9 +2033,22 @@ impl Table {
         startrow: u64,
         nrow: u64,
     ) -> Result<Vec<RecordValue>, TableReadError> {
+        self.getcolslice_inc(col_idx, blc, trc, &[], startrow, nrow)
+    }
+
+    /// [`Table::getcolslice`] with a per-dimension step (`inc`).
+    pub fn getcolslice_inc(
+        &self,
+        col_idx: usize,
+        blc: &[i64],
+        trc: &[i64],
+        inc: &[i64],
+        startrow: u64,
+        nrow: u64,
+    ) -> Result<Vec<RecordValue>, TableReadError> {
         let mut out = Vec::with_capacity(nrow as usize);
         for r in startrow..startrow + nrow {
-            out.push(self.getcellslice(col_idx, r, blc, trc)?);
+            out.push(self.getcellslice_inc(col_idx, r, blc, trc, inc)?);
         }
         Ok(out)
     }
@@ -2049,6 +2062,18 @@ impl Table {
         blc: &[i64],
         trc: &[i64],
     ) -> Result<RecordValue, TableReadError> {
+        self.getcellslice_inc(col_idx, row, blc, trc, &[])
+    }
+
+    /// One array cell slice with a per-dimension step (`inc`).
+    pub fn getcellslice_inc(
+        &self,
+        col_idx: usize,
+        row: u64,
+        blc: &[i64],
+        trc: &[i64],
+        inc: &[i64],
+    ) -> Result<RecordValue, TableReadError> {
         let cell = self.getcell(col_idx, row)?;
         let RecordValue::Array(arr) = cell else {
             return Ok(cell);
@@ -2056,7 +2081,9 @@ impl Table {
         if blc.is_empty() && trc.is_empty() {
             return Ok(RecordValue::Array(arr));
         }
-        Ok(RecordValue::Array(slice_array_value(&arr, blc, trc)?))
+        Ok(RecordValue::Array(slice_array_value_inc(
+            &arr, blc, trc, inc,
+        )?))
     }
 
     /// Read all cells, keyed per row as `"r0"`, `"r1"`, ... (`getvarcol`).
@@ -2073,6 +2100,19 @@ pub fn slice_array_value(
     blc: &[i64],
     trc: &[i64],
 ) -> Result<crate::record::ArrayValue, TableReadError> {
+    let ones = vec![1i64; blc.len()];
+    slice_array_value_inc(arr, blc, trc, &ones)
+}
+
+/// Like [`slice_array_value`], but with a per-dimension step `inc`
+/// (python-casacore's `getcellslice(col, row, blc, trc, inc)`; an empty or
+/// all-1 `inc` is the plain slice).
+pub fn slice_array_value_inc(
+    arr: &crate::record::ArrayValue,
+    blc: &[i64],
+    trc: &[i64],
+    inc: &[i64],
+) -> Result<crate::record::ArrayValue, TableReadError> {
     let shape = &arr.shape;
     let ndim = shape.len();
     if blc.len() != ndim || trc.len() != ndim {
@@ -2082,6 +2122,13 @@ pub fn slice_array_value(
             shape.clone(),
         ));
     }
+    // An empty or short `inc` means step 1 on every axis.
+    let steps: Vec<i64> = (0..ndim)
+        .map(|d| match inc.get(d) {
+            Some(&s) if s > 0 => s,
+            _ => 1,
+        })
+        .collect();
     let mut new_shape = Vec::with_capacity(ndim);
     for d in 0..ndim {
         let b = blc[d];
@@ -2093,7 +2140,9 @@ pub fn slice_array_value(
                 shape.clone(),
             ));
         }
-        new_shape.push((t - b + 1) as u32);
+        let step = steps[d];
+        let n = (t - b) / step + 1;
+        new_shape.push(n.max(0) as u32);
     }
     // Linear indices of the sub-array in logical row-major order.
     let mut indices = Vec::with_capacity(new_shape.iter().product::<u32>() as usize);
@@ -2104,11 +2153,13 @@ pub fn slice_array_value(
         }
         s
     };
+    #[allow(clippy::too_many_arguments)]
     fn visit(
         shape: &[u32],
         new_shape: &[u32],
         strides: &[usize],
         blc: &[i64],
+        steps: &[i64],
         indices: &mut Vec<usize>,
         d: usize,
         offset: usize,
@@ -2118,19 +2169,20 @@ pub fn slice_array_value(
             return;
         }
         for k in 0..new_shape[d] {
-            let coord = (blc[d] + k as i64) as usize;
+            let coord = (blc[d] + k as i64 * steps[d]) as usize;
             visit(
                 shape,
                 new_shape,
                 strides,
                 blc,
+                steps,
                 indices,
                 d + 1,
                 offset + coord * strides[d],
             );
         }
     }
-    visit(shape, &new_shape, &strides, blc, &mut indices, 0, 0);
+    visit(shape, &new_shape, &strides, blc, &steps, &mut indices, 0, 0);
 
     use crate::record::ArrayData;
     macro_rules! slice_data {

@@ -575,19 +575,6 @@ pub(crate) fn cell_to_py(py: Python<'_>, v: &RecordValue) -> PyResult<Py<PyAny>>
     }
 }
 
-/// A keyword-array value as `{"shape": [..], "array": flat list}`.
-pub(crate) fn array_to_dict<'py>(py: Python<'py>, a: &ArrayValue) -> PyResult<Bound<'py, PyDict>> {
-    let d = PyDict::new(py);
-    let logical: Vec<u32> = a.shape.iter().rev().copied().collect();
-    d.set_item("shape", logical)?;
-    let mut flat = Vec::new();
-    for e in a.elements() {
-        flat.push(element_to_py(py, &e)?);
-    }
-    d.set_item("array", flat)?;
-    Ok(d)
-}
-
 fn element_to_py(py: Python<'_>, v: &RecordValue) -> PyResult<Py<PyAny>> {
     match v {
         RecordValue::Bool(b) => pybool(py, *b),
@@ -698,7 +685,7 @@ pub(crate) fn table_record_to_dict_ctx<'py>(
             RecordValue::Record(sub) => table_record_to_dict_ctx(py, sub, table_dir)?
                 .into_any()
                 .unbind(),
-            RecordValue::Array(a) => array_to_dict(py, a)?.into_any().unbind(),
+            RecordValue::Array(a) => array_to_ndarray(py, a)?,
             RecordValue::Table(name) => {
                 let resolved = resolve_subtable_py(name, table_dir);
                 PyString::new(py, &resolved).into_any().unbind()
@@ -798,7 +785,38 @@ pub(crate) fn pyobject_to_record(py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResu
         let list = PyList::new(py, tup.iter())?;
         return list_to_array(py, &list);
     }
-    // numpy arrays (numeric or object).
+    // numpy arrays (numeric or object). `int32` is the common keyword-array
+    // dtype (casacore's `np.int32([[0, nch], ...])` for CHANNEL_SELECTION).
+    if let Ok(arr) = v.cast::<numpy::PyArrayDyn<i32>>() {
+        let readonly = arr.readonly();
+        let shape: Vec<u32> = readonly
+            .as_array()
+            .shape()
+            .to_vec()
+            .iter()
+            .map(|&d| d as u32)
+            .collect();
+        let data = readonly.as_array().iter().copied().collect();
+        return Ok(RecordValue::Array(ArrayValue {
+            shape,
+            data: ArrayData::Int(data),
+        }));
+    }
+    if let Ok(arr) = v.cast::<numpy::PyArrayDyn<i64>>() {
+        let readonly = arr.readonly();
+        let shape: Vec<u32> = readonly
+            .as_array()
+            .shape()
+            .to_vec()
+            .iter()
+            .map(|&d| d as u32)
+            .collect();
+        let data = readonly.as_array().iter().map(|&x| x as i32).collect();
+        return Ok(RecordValue::Array(ArrayValue {
+            shape,
+            data: ArrayData::Int(data),
+        }));
+    }
     if let Ok(arr) = v.cast::<numpy::PyArrayDyn<f64>>() {
         let readonly = arr.readonly();
         let shape: Vec<u32> = readonly
@@ -812,6 +830,36 @@ pub(crate) fn pyobject_to_record(py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResu
         return Ok(RecordValue::Array(ArrayValue {
             shape,
             data: ArrayData::Double(data),
+        }));
+    }
+    if let Ok(arr) = v.cast::<numpy::PyArrayDyn<f32>>() {
+        let readonly = arr.readonly();
+        let shape: Vec<u32> = readonly
+            .as_array()
+            .shape()
+            .to_vec()
+            .iter()
+            .map(|&d| d as u32)
+            .collect();
+        let data = readonly.as_array().iter().map(|&x| x as f64).collect();
+        return Ok(RecordValue::Array(ArrayValue {
+            shape,
+            data: ArrayData::Double(data),
+        }));
+    }
+    if let Ok(arr) = v.cast::<numpy::PyArrayDyn<bool>>() {
+        let readonly = arr.readonly();
+        let shape: Vec<u32> = readonly
+            .as_array()
+            .shape()
+            .to_vec()
+            .iter()
+            .map(|&d| d as u32)
+            .collect();
+        let data = readonly.as_array().iter().copied().collect();
+        return Ok(RecordValue::Array(ArrayValue {
+            shape,
+            data: ArrayData::Bool(data),
         }));
     }
     if let Ok(arr) = v.cast::<numpy::PyArrayDyn<Py<PyAny>>>() {

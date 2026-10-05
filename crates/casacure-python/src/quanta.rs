@@ -20,8 +20,13 @@ pub struct Quantity {
 }
 
 impl Quantity {
-    fn new(core: CoreQuantity) -> Quantity {
+    pub(crate) fn new(core: CoreQuantity) -> Quantity {
         Quantity { q: core }
+    }
+
+    /// The underlying core quantity (for sibling modules, e.g. `measures`).
+    pub(crate) fn as_core(&self) -> CoreQuantity {
+        self.q.clone()
     }
 }
 
@@ -35,9 +40,14 @@ fn get_core(obj: &Bound<'_, PyAny>) -> PyResult<CoreQuantity> {
 #[pyfunction]
 #[pyo3(signature = (value, unit = None))]
 fn quantity(value: &Bound<'_, PyAny>, unit: Option<&Bound<'_, PyAny>>) -> PyResult<Quantity> {
-    // Combined-string form: `quantity("1.5 Jy")`.
+    // Combined-string form: `quantity("1.5 Jy")`, or a date string
+    // (`quantity("2017-04-01T12:00:00")` -> an MJD-day quantity, matching
+    // casacore's MVTime date parse — see PORTING_DDFACET_KILLMS.md §1.5).
     if unit.is_none() {
         if let Ok(s) = value.extract::<String>() {
+            if let Some(mjd) = ::casacure::quanta::parse_date_string(&s) {
+                return CoreQuantity::new(mjd, "d").map(Quantity::new).map_err(err);
+            }
             let (v, u) = ::casacure::quanta::split_quantity_string(&s)
                 .ok_or_else(|| PyValueError::new_err(format!("invalid quantity string {s:?}")))?;
             return CoreQuantity::new(v, u).map(Quantity::new).map_err(err);

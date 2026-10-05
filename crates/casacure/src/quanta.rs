@@ -1055,6 +1055,79 @@ pub fn split_quantity_string(s: &str) -> Option<(f64, &str)> {
     Some((num, rest))
 }
 
+/// Parse an ISO-8601 / casacore date string into an MJD quantity in days.
+///
+/// Accepted forms (matching casacore's `MVTime` date parsing, which
+/// DDFacet's `TimeRange` option relies on — see
+/// `PORTING_DDFACET_KILLMS.md` §1.5):
+///
+/// * `YYYY-MM-DD`
+/// * `YYYY/MM/DD`
+/// * `YYYY-MM-DDTHH:MM:SS[.sss]`
+/// * `YYYY-MM-DD HH:MM:SS[.sss]`
+/// * `YYYY/MM/DD/HH:MM:SS[.sss]`
+///
+/// Returns `None` when the string is not a date (so the numeric-prefix
+/// path can handle plain quantity strings).
+pub fn parse_date_string(s: &str) -> Option<f64> {
+    let s = s.trim();
+    // Must start with a 4-digit year followed by a date separator.
+    let b = s.as_bytes();
+    if b.len() < 8
+        || !b[0].is_ascii_digit()
+        || !b[1].is_ascii_digit()
+        || !b[2].is_ascii_digit()
+        || !b[3].is_ascii_digit()
+    {
+        return None;
+    }
+    let year: i64 = s[..4].parse().ok()?;
+    let mut rest = &s[4..];
+    // Date separator: '-' or '/'.
+    let sep = rest.as_bytes().first().copied()?;
+    if sep != b'-' && sep != b'/' {
+        return None;
+    }
+    rest = &rest[1..];
+    // MM
+    if rest.len() < 2 {
+        return None;
+    }
+    let month: i64 = rest[..2].parse().ok()?;
+    rest = &rest[2..];
+    if rest.as_bytes().first().copied()? != sep {
+        return None;
+    }
+    rest = &rest[1..];
+    // DD (2 digits), then optionally a time part.
+    if rest.len() < 2 {
+        return None;
+    }
+    let day: i64 = rest[..2].parse().ok()?;
+    rest = &rest[2..];
+    let mut frac_day = 0.0f64;
+    if !rest.is_empty() {
+        // Time separator: 'T', ' ', or '/' (casacore's date/time form).
+        let tsep = rest.as_bytes().first().copied()?;
+        if tsep != b'T' && tsep != b' ' && tsep != b'/' {
+            return None;
+        }
+        rest = &rest[1..];
+        // HH:MM:SS[.sss]
+        let parts: Vec<&str> = rest.split(':').collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        let hh: f64 = parts[0].parse().ok()?;
+        let mm: f64 = parts[1].parse().ok()?;
+        let ss: f64 = parts[2].parse().ok()?;
+        frac_day = (hh * 3600.0 + mm * 60.0 + ss) / 86_400.0;
+    }
+    let days = civil_days(year, month, day) as f64;
+    // MJD = days-since-1970-01-01 + 40587.
+    Some(days + 40_587.0 + frac_day)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
