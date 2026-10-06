@@ -69,7 +69,7 @@ def _bump_patch(version: str) -> str:
 
 
 def _git(*args: str) -> str:
-    return local["git"]("-C", str(REPO), *args)()
+    return local["git"]["-C", str(REPO), *args]()
 
 
 def _tag_exists(tag: str) -> bool:
