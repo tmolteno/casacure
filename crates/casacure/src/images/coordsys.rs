@@ -42,6 +42,9 @@ pub enum Coordinate {
         pc: [[f64; 2]; 2],
         system: String,
         projection: String,
+        /// The per-axis units ("rad" from records; arcmin "'" in casacore's
+        /// default image template).
+        units: [String; 2],
         /// The CS pixel axes this coordinate occupies (long, lat).
         pixel_axes: [usize; 2],
     },
@@ -117,6 +120,240 @@ impl CoordinateSystem {
         }
     }
 
+    /// The default system casacore builds for
+    /// `image(imagename=, shape=)` with no coordsys: a J2000/SIN direction
+    /// on the two spatial axes (unit arcmin, crpix at the centre), Stokes
+    /// I, and an LSRK spectral axis — the template DDFacet's
+    /// ClassCasaimage.createScratch creates, mutates and re-creates with.
+    pub fn default_for(shape: &[usize]) -> CoordinateSystem {
+        let ndim = shape.len();
+        // casa pixel axis p = numpy axis ndim-1-p; direction on the last
+        // two numpy axes = casa axes 0 (long/x) and 1 (lat/y).
+        let (nx, ny) = (shape[ndim - 1], shape[ndim - 2]);
+        let direction = Coordinate::Direction {
+            name: "direction0".into(),
+            crval: [0.0, 0.0],
+            crpix: [nx as f64 / 2.0, ny as f64 / 2.0],
+            cdelt: [-1.0, 1.0],
+            pc: [[1.0, 0.0], [0.0, 1.0]],
+            system: "J2000".into(),
+            projection: "SIN".into(),
+            units: ["'".into(), "'".into()],
+            pixel_axes: [0, 1],
+        };
+        let stokes = Coordinate::Linear {
+            name: "stokes1".into(),
+            crval: vec![1.0],
+            crpix: vec![0.0],
+            cdelt: vec![1.0],
+            pc: vec![1.0],
+            pixel_axes: vec![ndim - 2],
+            stokes: vec!["I".into()],
+        };
+        let spectral = Coordinate::Linear {
+            name: "spectral2".into(),
+            crval: vec![1.415e9],
+            crpix: vec![1.0],
+            cdelt: vec![1000.0],
+            pc: vec![1.0],
+            // casa axis ndim-1 (the channel axis; numpy axis 0).
+            pixel_axes: vec![ndim - 1],
+            stokes: Vec::new(),
+        };
+        let mut csys = CoordinateSystem {
+            coords: vec![direction, stokes, spectral],
+            nimaxes: ndim,
+            record: None,
+        };
+        // Enrich the synthesised spectral record to what casacore's
+        // SpectralCoordinate::restore expects (probed default template).
+        let mut rec = csys.synthesise_record();
+        // The per-coordinate world/pixel axis mappings and replacements
+        // CoordinateSystem::restore reads back after the coordinates.
+        type AxisMaps = (
+            &'static str,
+            &'static str,
+            &'static str,
+            &'static str,
+            Vec<f64>,
+            Vec<f64>,
+            Vec<i64>,
+        );
+        let maps: [AxisMaps; 3] = [
+            (
+                "worldmap0",
+                "worldreplace0",
+                "pixelmap0",
+                "pixelreplace0",
+                vec![0.0305432619099, -0.00785398163397],
+                vec![0.0, 0.0],
+                vec![0, 1],
+            ),
+            (
+                "worldmap1",
+                "worldreplace1",
+                "pixelmap1",
+                "pixelreplace1",
+                vec![1.0],
+                vec![0.0],
+                vec![2],
+            ),
+            (
+                "worldmap2",
+                "worldreplace2",
+                "pixelmap2",
+                "pixelreplace2",
+                vec![1.415e9],
+                vec![0.0],
+                vec![3],
+            ),
+        ];
+        for (wm, wr, pm, pr, world, pix, map) in maps {
+            rec.set(
+                wm,
+                RecordValue::Array(ArrayValue {
+                    shape: vec![map.len() as u32],
+                    data: ArrayData::Int64(map.clone()),
+                }),
+            );
+            rec.set(
+                wr,
+                RecordValue::Array(ArrayValue {
+                    shape: vec![world.len() as u32],
+                    data: ArrayData::Double(world),
+                }),
+            );
+            rec.set(
+                pm,
+                RecordValue::Array(ArrayValue {
+                    shape: vec![map.len() as u32],
+                    data: ArrayData::Int64(map),
+                }),
+            );
+            rec.set(
+                pr,
+                RecordValue::Array(ArrayValue {
+                    shape: vec![pix.len() as u32],
+                    data: ArrayData::Double(pix),
+                }),
+            );
+        }
+        // ObsInfo.
+        rec.set("telescope", RecordValue::String("UNKNOWN".into()));
+        rec.set("observer", RecordValue::String("UNKNOWN".into()));
+        let mut obsdate = TableRecord::default();
+        obsdate.set("type", RecordValue::String("epoch".into()));
+        obsdate.set("refer", RecordValue::String("UTC".into()));
+        let mut om0 = TableRecord::default();
+        om0.set("value", RecordValue::Double(0.0));
+        om0.set("unit", RecordValue::String("d".into()));
+        obsdate.set("m0", RecordValue::Record(om0));
+        rec.set("obsdate", RecordValue::Record(obsdate));
+        let mut pointingcenter = TableRecord::default();
+        pointingcenter.set(
+            "value",
+            RecordValue::Array(ArrayValue {
+                shape: vec![2],
+                data: ArrayData::Double(vec![0.0, 0.0]),
+            }),
+        );
+        pointingcenter.set("initial", RecordValue::Bool(true));
+        rec.set("pointingcenter", RecordValue::Record(pointingcenter));
+        let mut telescopeposition = TableRecord::default();
+        telescopeposition.set("type", RecordValue::String("position".into()));
+        telescopeposition.set("refer", RecordValue::String("ITRF".into()));
+        for (name, value) in [("m0", 0.0), ("m1", 0.0), ("m2", 0.0)] {
+            let mut m = TableRecord::default();
+            m.set("value", RecordValue::Double(value));
+            m.set(
+                "unit",
+                RecordValue::String(if name == "m2" {
+                    "m".into()
+                } else {
+                    "rad".into()
+                }),
+            );
+            telescopeposition.set(name, RecordValue::Record(m));
+        }
+        rec.set("telescopeposition", RecordValue::Record(telescopeposition));
+        let spectral_pos = rec.desc.fields.iter().position(|f| f.name == "spectral2");
+        if let Some(pos) = spectral_pos {
+            if let Some(RecordValue::Record(spectral)) = rec.values.get_mut(pos) {
+                spectral.set("version", RecordValue::Int(2));
+                spectral.set("system", RecordValue::String("LSRK".into()));
+                spectral.set("restfreq", RecordValue::Double(1420405751.786));
+                spectral.set(
+                    "restfreqs",
+                    RecordValue::Array(ArrayValue {
+                        shape: vec![1],
+                        data: ArrayData::Double(vec![1420405751.786]),
+                    }),
+                );
+                spectral.set("velType", RecordValue::Int(0));
+                spectral.set("nativeType", RecordValue::Int(0));
+                spectral.set("velUnit", RecordValue::String("km/s".into()));
+                spectral.set("waveUnit", RecordValue::String("mm".into()));
+                spectral.set("formatUnit", RecordValue::String(String::new()));
+                spectral.set("unit", RecordValue::String("Hz".into()));
+                spectral.set("name", RecordValue::String("Frequency".into()));
+                // The linear wcs block and the conversion frame measures
+                // SpectralCoordinate::restore reads (casacore's default
+                // image template carries both).
+                let mut wcs = TableRecord::default();
+                wcs.set("crval", RecordValue::Double(1.415e9));
+                wcs.set("crpix", RecordValue::Double(1.0));
+                wcs.set("cdelt", RecordValue::Double(1000.0));
+                wcs.set("pc", RecordValue::Double(1.0));
+                wcs.set(
+                    "ctype",
+                    RecordValue::String("FREQ\u{0}\u{0}\u{0}\u{0}\u{0}".into()),
+                );
+                spectral.set("wcs", RecordValue::Record(wcs));
+                let mut conversion = TableRecord::default();
+                let mut direction = TableRecord::default();
+                direction.set("type", RecordValue::String("direction".into()));
+                direction.set("refer", RecordValue::String("J2000".into()));
+                let mut m1 = TableRecord::default();
+                m1.set("value", RecordValue::Double(std::f64::consts::FRAC_PI_2));
+                m1.set("unit", RecordValue::String("rad".into()));
+                direction.set("m1", RecordValue::Record(m1));
+                let mut m0 = TableRecord::default();
+                m0.set("value", RecordValue::Double(0.0));
+                m0.set("unit", RecordValue::String("rad".into()));
+                direction.set("m0", RecordValue::Record(m0));
+                conversion.set("direction", RecordValue::Record(direction));
+                let mut position = TableRecord::default();
+                position.set("type", RecordValue::String("position".into()));
+                position.set("refer", RecordValue::String("ITRF".into()));
+                let mut m2 = TableRecord::default();
+                m2.set("value", RecordValue::Double(0.0));
+                m2.set("unit", RecordValue::String("m".into()));
+                position.set("m2", RecordValue::Record(m2));
+                let mut pm1 = TableRecord::default();
+                pm1.set("value", RecordValue::Double(0.0));
+                pm1.set("unit", RecordValue::String("rad".into()));
+                position.set("m1", RecordValue::Record(pm1));
+                let mut pm0 = TableRecord::default();
+                pm0.set("value", RecordValue::Double(0.0));
+                pm0.set("unit", RecordValue::String("rad".into()));
+                position.set("m0", RecordValue::Record(pm0));
+                conversion.set("position", RecordValue::Record(position));
+                let mut epoch = TableRecord::default();
+                epoch.set("type", RecordValue::String("epoch".into()));
+                epoch.set("refer", RecordValue::String("LAST".into()));
+                let mut em0 = TableRecord::default();
+                em0.set("value", RecordValue::Double(0.0));
+                em0.set("unit", RecordValue::String("d".into()));
+                epoch.set("m0", RecordValue::Record(em0));
+                conversion.set("epoch", RecordValue::Record(epoch));
+                conversion.set("system", RecordValue::String("LSRK".into()));
+                spectral.set("conversion", RecordValue::Record(conversion));
+            }
+        }
+        csys.record = Some(rec);
+        csys
+    }
+
     /// Parse a CASA image's `coords` keyword record.  `nimaxes` is the
     /// image's axis count (the raster cell's dimensions).
     pub fn from_record(rec: &TableRecord, nimaxes: usize) -> Result<CoordinateSystem, CoordError> {
@@ -169,6 +406,16 @@ impl CoordinateSystem {
                             expected: "two values (long, lat)",
                         });
                     }
+                    let units = match sub.get("units") {
+                        Some(RecordValue::Array(a)) => match &a.data {
+                            ArrayData::String(sv) => [
+                                sv.first().cloned().unwrap_or_else(|| "rad".into()),
+                                sv.get(1).cloned().unwrap_or_else(|| "rad".into()),
+                            ],
+                            _ => ["rad".into(), "rad".into()],
+                        },
+                        _ => ["rad".into(), "rad".into()],
+                    };
                     coords.push(Coordinate::Direction {
                         name: field,
                         crval: [crval[0], crval[1]],
@@ -180,6 +427,7 @@ impl CoordinateSystem {
                         pc,
                         system: field_str(sub, "system").unwrap_or_default(),
                         projection,
+                        units,
                         pixel_axes: [
                             pixel_axes.first().copied().unwrap_or(0),
                             pixel_axes.get(1).copied().unwrap_or(1),
@@ -297,6 +545,7 @@ impl CoordinateSystem {
                 pc: [[pij(ln, ln), pij(ln, tn)], [pij(tn, ln), pij(tn, tn)]],
                 system: "ICRS".into(),
                 projection: ct(ln).split("---").nth(1).unwrap_or("SIN").to_string(),
+                units: ["rad".into(), "rad".into()],
                 pixel_axes: [lp, tp],
             });
         }
@@ -502,6 +751,7 @@ impl CoordinateSystem {
                     pc,
                     system,
                     projection,
+                    units,
                     pixel_axes,
                     ..
                 } => {
@@ -509,12 +759,34 @@ impl CoordinateSystem {
                     d.set("system", RecordValue::String(system.clone()));
                     d.set("projection", RecordValue::String(projection.clone()));
                     d.set(
+                        "units",
+                        RecordValue::Array(ArrayValue {
+                            shape: vec![2],
+                            data: ArrayData::String(units.to_vec()),
+                        }),
+                    );
+                    d.set(
                         "projection_parameters",
                         RecordValue::Array(ArrayValue {
                             shape: vec![2],
                             data: ArrayData::Double(vec![0.0, 0.0]),
                         }),
                     );
+                    // casacore's DirectionCoordinate::restore requires the
+                    // axis names and the pole fields.
+                    d.set(
+                        "axes",
+                        RecordValue::Array(ArrayValue {
+                            shape: vec![2],
+                            data: ArrayData::String(vec![
+                                "Right Ascension".into(),
+                                "Declination".into(),
+                            ]),
+                        }),
+                    );
+                    d.set("conversionSystem", RecordValue::String(system.clone()));
+                    d.set("longpole", RecordValue::Double(180.0));
+                    d.set("latpole", RecordValue::Double(0.0));
                     d.set("crval", arr2(*crval));
                     d.set("crpix", arr2(*crpix));
                     d.set("cdelt", arr2(*cdelt));
@@ -538,12 +810,31 @@ impl CoordinateSystem {
                     crval,
                     crpix,
                     cdelt,
+                    pc,
                     pixel_axes,
                     name,
                     stokes,
                     ..
                 } => {
                     let mut s = TableRecord::default();
+                    if !stokes.is_empty() {
+                        // StokesCoordinate::restore reads the axis name and
+                        // the pc matrix.
+                        s.set(
+                            "axes",
+                            RecordValue::Array(ArrayValue {
+                                shape: vec![1],
+                                data: ArrayData::String(vec!["Stokes".into()]),
+                            }),
+                        );
+                        s.set(
+                            "pc",
+                            RecordValue::Array(ArrayValue {
+                                shape: vec![1, 1],
+                                data: ArrayData::Double(vec![pc.first().copied().unwrap_or(1.0)]),
+                            }),
+                        );
+                    }
                     for (k, v) in [("crval", crval), ("crpix", crpix), ("cdelt", cdelt)] {
                         s.set(
                             k,

@@ -57,7 +57,7 @@ impl image {
                     let csys = obj.csys.read().unwrap().clone();
                     csys
                 }
-                None => CoordinateSystem::empty(shape.len()),
+                None => CoordinateSystem::default_for(shape),
             };
             cimg::create_casa_image(&path, shape, &csys, &ImageMeta::default()).map_err(err)?;
             let opened = Image::open(&path).map_err(err)?;

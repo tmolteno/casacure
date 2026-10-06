@@ -627,14 +627,31 @@ pub fn write_scalar_value(w: &mut crate::aipsio::Writer, dt: DataType, value: &R
 ///
 /// Currently supports the field types this project writes: scalars, strings,
 /// and nested records. Array fields are rejected.
+/// The record's description with every Record field's sub-desc replaced
+/// by the desc of the value actually stored (recursively).
+fn synced_desc(record: &TableRecord) -> RecordDesc {
+    let mut desc = record.desc.clone();
+    for (field, value) in desc.fields.iter_mut().zip(&record.values) {
+        if let RecordValue::Record(sub) = value {
+            field.sub_desc = Some(synced_desc(sub));
+        }
+    }
+    desc
+}
+
 pub(crate) fn write_table_record(
     w: &mut crate::aipsio::Writer,
     record: &TableRecord,
 ) -> Result<(), RecordError> {
+    // The VALUE's sub-record description is authoritative: a nested record
+    // mutated in place (fields appended after its parent's desc cached the
+    // old sub-desc) must be written with its current fields, or the
+    // reader — casacure's or casacore's — desynchronises on the stale one.
+    let desc = synced_desc(record);
     w.put_object_start("TableRecord", 1);
     w.put_object_start("RecordDesc", 2);
-    w.put_i32(record.desc.fields.len() as i32);
-    for field in &record.desc.fields {
+    w.put_i32(desc.fields.len() as i32);
+    for field in &desc.fields {
         w.put_string(&field.name);
         w.put_i32(data_type_code(field.data_type));
         match field.data_type {
@@ -653,7 +670,7 @@ pub(crate) fn write_table_record(
     }
     w.put_object_end(); // RecordDesc
     w.put_i32(record.record_type);
-    for field in &record.desc.fields {
+    for field in &desc.fields {
         match field.data_type {
             dt if dt.is_array() => {
                 let Some(RecordValue::Array(a)) = record.get(&field.name) else {
@@ -668,7 +685,7 @@ pub(crate) fn write_table_record(
                 let Some(RecordValue::Record(sub)) = record.get(&field.name) else {
                     return Err(RecordError::LegacyKeywordSet("missing record value".into()));
                 };
-                // Framed iff the *field's* sub-descriptor is empty (casacore
+                // Framed iff the synced sub-descriptor is empty (casacore
                 // frames nested keyword records whose header sub-desc is
                 // empty, regardless of the value's own desc).
                 let field_empty = field.sub_desc.as_ref().is_none_or(|s| s.fields.is_empty());
@@ -820,8 +837,8 @@ fn write_record_data_values(
             .ok_or_else(|| RecordError::LegacyKeywordSet("missing nested value".into()))?;
         match value {
             RecordValue::Record(sub) => {
-                let field_empty = field.sub_desc.as_ref().is_none_or(|s| s.fields.is_empty());
-                if field_empty {
+                let value_empty = sub.desc.fields.is_empty();
+                if value_empty {
                     write_table_record(w, sub)?;
                 } else {
                     write_record_data_values(w, sub)?;
