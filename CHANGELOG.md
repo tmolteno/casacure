@@ -16,6 +16,10 @@ subtasks are moved here.
   to go green. `--sanitizers`/`--freethreaded`/`--all-jobs` reproduce the
   `tsan` and `freethreaded` CI jobs too. A CI failure on a release tag is
   now a local failure the operator sees first.
+  `invoke release` bumps the patch version and generates the tag by
+  default (`--no-bump` to tag the tree's current version as-is,
+  `--version X.Y.Z` to tag an explicit version and imply `--no-bump`).
+  The protocol is documented in README.md § Releasing.
 
 ### Fixed
 

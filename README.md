@@ -281,23 +281,61 @@ Notes:
 
 ## Releasing
 
-`tasks.py` (in the spirit of `../meerkat_imaging`) gates a release on a
-local run of the CI suite, so a CI failure on a release tag is a local
-failure the operator sees first. Requires `invoke`, `plumbum`, `docker`,
-`gh` (authenticated), `cargo`, `rustup`.
+Releases are driven by `tasks.py` (in the spirit of `../meerkat_imaging`'s
+release chain): `invoke release` runs the **whole CI gate locally in
+Docker** before a tag is pushed, so a CI failure on a release tag becomes a
+local failure the operator sees first. Requires `invoke`, `plumbum`,
+`docker`, `gh` (authenticated), `cargo`, `rustup`.
 
 ```bash
-invoke version                 # show current + next versions
-invoke test                    # build the image + run the CI `test` job
-invoke test --all-jobs         # + `tsan` (nightly) + `freethreaded` (3.14t)
-invoke release                 # test, commit, tag vX.Y.Z, push, wait for publish
-invoke release --bump          # auto-bump the patch version first
+invoke version                          # show the version + the tag it would make
+invoke test                             # pre-release gate: build the image + run the CI `test` job
+invoke test --all-jobs                  # + `tsan` (nightly) + `freethreaded` (3.14t) — the full CI gate
+invoke release                          # bump patch, run tests, tag vX.Y.Z, push, wait for publish
+invoke release --no-bump                # tag the current version as-is
+invoke release --version 3.8.30         # tag an explicit version (implies --no-bump)
+invoke release --all-jobs               # release after running all three CI jobs locally
 ```
 
-`invoke release` runs the pre-release gate in `Dockerfile` (the `test` CI
-job: `cargo test` / `fmt` / `clippy` / `maturin build` / `pytest tests/`
-with real python-casacore) before any tag is pushed. The `publish-python`
-and `publish-rust` workflows then fire on the tag, exactly as before.
+**Version + tag are generated automatically.** `invoke release` bumps the
+patch level (`3.8.22` → `3.8.23`) in `pyproject.toml` + `Cargo.toml` (the
+workspace version *and* the `casacure` crate dependency), commits it as
+`release: bump to 3.8.23`, and tags `v3.8.23`. The version scheme is
+`<casacore-major>.<casacore-minor>.<casacure-patch>` (see [Install](#install)); only the
+patch level is auto-bumped — moving the interface version (3.8 → 3.9) is
+deliberate and done by hand. `--no-bump` tags the tree's current version;
+`--version X.Y.Z` tags exactly that and implies `--no-bump`, since the tree
+must not drift from an explicitly named tag.
+
+**The pre-release gate** is `Dockerfile`, which reproduces the `test` job
+of `.github/workflows/ci.yml` in a clean container with real
+`python-casacore` available (needed to generate the fixture tables and to
+run the real-casacore comparison tests):
+
+| Step | What it runs |
+|---|---|
+| build | `tests/make_fixtures.py` → `maturin build` + `pip install .` |
+| at build time | `cargo test --workspace`, `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` |
+| `docker run` | `PYTHONPATH=tests/shim pytest tests/` (the `casacore` comparison suite) |
+
+The image runs as a non-root `tester` user so the permission tests
+(`chmod 0444` write barriers) actually deny writes — root would ignore
+them. `invoke test --sanitizers` and `--freethreaded` reproduce the `tsan`
+(nightly + ThreadSanitizer) and `freethreaded` (no-GIL CPython 3.14t) CI
+jobs as `docker run` commands on the same image.
+
+**After the gate passes**, `invoke release` commits the release, tags
+`vX.Y.Z`, pushes `main` + the tag (which fires `publish-python.yml` and
+`publish-rust.yml`, exactly as before), and polls `gh run list` /
+`gh run view` until both publish workflows go green — it fails loudly if
+either fails, rather than leaving a half-published release. A tag that is
+already on origin is verified and skipped, so the task is idempotent and
+safe to re-run.
+
+**What `invoke release` does not do:** it does not edit `CHANGELOG.md`.
+The convention is to write the changelog entry by hand first (the task
+commits `CHANGELOG.md` alongside `pyproject.toml`/`Cargo.toml` in the
+release commit), so the notes are always deliberate.
 
 ## Development
 
