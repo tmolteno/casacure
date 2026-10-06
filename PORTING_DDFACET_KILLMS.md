@@ -242,6 +242,38 @@ tests/test_ddfacet_killms_usage.py`). Sections:
 - I measures call forms (pinned to the values probed from real casacore)
 - J cross-implementation interop (opt-in, real python-casacore)
 
+## 5. Phase 2 status (killMS) — complete
+
+killMS is now swapped (commit `01ae788` in `../killMS`): all
+`pyrap.tables`/`casacore.tables` -> `casacure.tables`, `pyrap.quanta`/
+`pyrap.measures` -> `casacure.quanta`/`casacure.measures`, `ephem` ->
+`astropy.time.Time` in both `GiveDate` copies, `pyrap.images` made lazy in
+`Simul/MakeModelImage` and removed from `Predict/ClassImageSM2`, and the
+test harness (`make_fixture_ms.py`, `TestFixtureMS.py`, `TestMemoryPlan.py`,
+`TestFixtureSolve.py`, `TestInProcessSolver.py`, `tests/smoke_degrid_chunk.py`,
+`measure_solver_memory.py`) swapped to casacure.
+
+**killMS TestHarness: 349 passed / 0 failed / 15 skipped** on the patched
+casacure (was 333 passed + 16 errors before the fixes below).
+
+Three casacure gaps surfaced during the port and were fixed:
+
+- **TaQL result keywords** (`casacure/src/taql.rs`,
+  `casacure-python/src/table.rs`): `t.query(...).sort("TIME").getkeyword('ANTENNA')`
+  returned `None` (or a scratch-dir-relative path); python-casacore's
+  reference tables carry the source table's keywords. `TaqlTable` now
+  carries `source_keywords` (with subtable names resolved to absolute paths
+  against the **source** table's directory), and `taql_result_to_table`
+  copies them to the result's `desc.keywords`. This is exactly the
+  `t.query(TaQL).sort('TIME')` chain DDFacet `GiveMainTable`
+  (`Data/ClassMS.py:230-234`) and killMS `ClassMS` use.
+- **`table.__getitem__` row access** (`casacure-python/src/table.rs`):
+  `t[0]['TIME_RANGE']` (used by `get_obs_details` in `ClassMS.py:189`) is
+  now supported — an integer key returns `{colname: value}` for that row
+  (python-casacore's `tablerow._getitem`).
+- **`table.__len__`** (`casacure-python/src/table.rs`): `len(t)` -> `nrows()`,
+  matching python-casacore.
+
 ## 4. Out of scope
 
 - `pyrap.images` (CASA image subsystem) — a separate port.
