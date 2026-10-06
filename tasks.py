@@ -9,9 +9,14 @@ Usage (from the casacure repo root, with a venv that has invoke + plumbum):
 
     invoke version                      # show the current + next versions
     invoke test                         # the pre-release tests (Docker build + suite)
-    invoke release                      # bump patch, run tests, tag + push
+    invoke release                      # bump patch, stamp CHANGELOG, tag + push
     invoke release --no-bump            # tag the current version as-is
     invoke release --version 3.8.21     # explicit version (implies --no-bump)
+
+`invoke release` writes the release commit for you: the patch version in
+`pyproject.toml`/`Cargo.toml` and the `CHANGELOG.md` heading (`[Unreleased]`
+becomes `## [X.Y.Z] - <today>`, with a fresh empty `[Unreleased]` left on
+top), so the changelog no longer has to be edited by hand at release time.
 
 The three CI jobs (`.github/workflows/ci.yml`) are reproduced locally:
   * test         — cargo test / fmt / clippy / maturin build / pytest tests/
@@ -30,6 +35,7 @@ import json
 import re
 import subprocess
 import time
+from datetime import date
 from pathlib import Path
 
 from invoke import task
@@ -67,6 +73,42 @@ def _bump_version(new: str) -> None:
 def _bump_patch(version: str) -> str:
     major, minor, patch = version.split(".")
     return f"{major}.{minor}.{int(patch) + 1}"
+
+
+def _changelog_has(version: str) -> bool:
+    """True when CHANGELOG.md already has a `## [version]` section."""
+    text = (REPO / "CHANGELOG.md").read_text()
+    return bool(re.search(rf"^## \[{re.escape(version)}\]", text, re.MULTILINE))
+
+
+def _stamp_changelog(new: str) -> bool:
+    """Move the `[Unreleased]` changelog entries under `## [new] - <today>`.
+
+    CHANGELOG.md is written newest-first, so a release turns the entries
+    accumulated under `## [Unreleased]` into the released version's own
+    section and leaves a fresh, empty `## [Unreleased]` on top of it.
+
+    Idempotent and respectful of hand-written notes: if a `## [new]` section
+    is already present (written by hand, or a re-run of the release), the
+    file is left untouched and `False` is returned; if there is no
+    `## [Unreleased]` section at all, the dated section is inserted above the
+    first existing section instead.
+    """
+    p = REPO / "CHANGELOG.md"
+    s = p.read_text()
+    if re.search(rf"^## \[{re.escape(new)}\]", s, re.MULTILINE):
+        return False
+    heading = f"## [{new}] - {date.today().isoformat()}\n"
+    unreleased = re.search(r"^## \[Unreleased\][ \t]*\n", s, re.MULTILINE)
+    if unreleased:
+        s = s[: unreleased.end()] + f"\n{heading}" + s[unreleased.end():]
+    else:
+        first = re.search(r"^## \[", s, re.MULTILINE)
+        if not first:
+            return False
+        s = s[: first.start()] + f"{heading}\n" + s[first.start():]
+    p.write_text(s)
+    return True
 
 
 def _git(*args: str) -> str:
@@ -145,11 +187,28 @@ def _run_pytest(extra_args: list[str] | None = None) -> None:
     local["docker"][*args] & FG
 
 
+def _run_pytest_casacore_parity() -> None:
+    """Re-run the measures accuracy contract with real casacore visible.
+
+    The image exports `PYTHONPATH=tests/shim` globally, which hides real
+    python-casacore; an empty PYTHONPATH override runs the casacore-parity
+    half of tests/test_measures.py (the counterpart of CI's "measures
+    accuracy contract and casacore parity" step) against the image's own
+    python-casacore.  The tests skip themselves when casacore is importable
+    but its measures data files are missing (ratt-ru/QuartiCal#330).
+    """
+    local["docker"][
+        "run", "--rm", "-e", "PYTHONPATH=", IMAGE, "python3", "-m", "pytest",
+        "tests/test_measures.py", "-q", "-p", "no:cacheprovider",
+    ] & FG
+
+
 @task
 def version(c) -> None:
     """Show the versions the release would tag (the tree's pyproject version)."""
     v = _read_version()
     print(f"casacure: pyproject {v}  ->  would bump to {_bump_patch(v)} and tag v{_bump_patch(v)}")
+    print(f"           CHANGELOG.md: [Unreleased] -> [{_bump_patch(v)}] - {date.today().isoformat()}")
     print(f"           (or tag v{v} as-is with --no-bump; "
           f"--version X.Y.Z tags that exact version)")
 
@@ -162,7 +221,8 @@ def test(c,
     """Run the pre-release tests in Docker.
 
     Default: the `test` CI job (cargo test / fmt / clippy / build + pytest
-    tests/ with the shim).  --sanitizers adds the `tsan` job (nightly +
+    tests/ with the shim, plus the measures accuracy contract against the
+    image's own python-casacore).  --sanitizers adds the `tsan` job (nightly +
     ThreadSanitizer); --freethreaded adds the `freethreaded` job (no-GIL
     CPython 3.14t).  --all-jobs runs all three (the full CI gate).
     """
@@ -171,6 +231,7 @@ def test(c,
 
     _build_image()
     _run_pytest()
+    _run_pytest_casacore_parity()
     print("=== test job PASS")
 
     if sanitizers:
@@ -204,15 +265,17 @@ def release(c,
             all_jobs: bool = False) -> None:
     """Run the full casacure release chain.
 
-    1. bump the patch version in pyproject/Cargo and commit (default; skip
-       with --no-bump, or override with --version X.Y.Z which implies
-       --no-bump since the tag is given explicitly).
-    2. run the pre-release tests in Docker (the `test` CI gate; --sanitizers
-       / --freethreaded / --all-jobs add the other CI jobs).
-    3. commit CHANGELOG.md + pyproject/Cargo (the release commit).
-    4. tag vX.Y.Z and push, which triggers `publish-python.yml` and
+    1. run the pre-release tests in Docker (the `test` CI gate, via this
+       task's `pre=[test]`; --sanitizers / --freethreaded / --all-jobs add the
+       other CI jobs).
+    2. bump the patch version in pyproject/Cargo and CHANGELOG.md (the
+       `[Unreleased]` entries move under `## [X.Y.Z] - <today>`) and commit
+       them as `release: bump to X.Y.Z` (default; skip with --no-bump, or
+       override with --version X.Y.Z which implies --no-bump since the tag is
+       given explicitly).
+    3. tag vX.Y.Z and push, which triggers `publish-python.yml` and
        `publish-rust.yml`.
-    5. wait for the publish workflows to go green.
+    4. wait for the publish workflows to go green.
 
     Idempotent: a tag already on origin is verified and skipped, not re-pushed.
     """
@@ -225,11 +288,17 @@ def release(c,
         new = _bump_patch(_read_version())
         print(f"=== bumping version to {new}")
         _bump_version(new)
+        if _stamp_changelog(new):
+            print(f"=== CHANGELOG.md: [Unreleased] -> [{new}]")
         _git("add", "pyproject.toml", "Cargo.toml", "CHANGELOG.md")
         _git("commit", "-m", f"release: bump to {new}")
 
     v = version or _read_version()
     tag = f"v{v}"
+    if not _changelog_has(v):
+        print(f"    warning: CHANGELOG.md has no '## [{v}]' section, so the "
+              f"tag will be published without release notes (add one, or let "
+              f"the default bump stamp it)")
 
     status = _git("status", "--porcelain").strip()
     if status:

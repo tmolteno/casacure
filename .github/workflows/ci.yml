@@ -21,7 +21,11 @@ jobs:
           python-version: "3.12"
 
       - name: Install Python dependencies
-        run: pip install python-casacore pytest maturin astropy
+        # astropy is the reference for the measures accuracy contract and
+        # skyfield is the algorithm model used while porting it (they are the
+        # `.[dev]` extra; python-casacore needs the casacore C++ libraries so
+        # it is installed explicitly rather than pulled in by the extra).
+        run: pip install python-casacore pytest maturin astropy skyfield
 
       - name: Generate casacore fixture tables
         run: python tests/make_fixtures.py
@@ -42,6 +46,14 @@ jobs:
         # to `casacure.tables` (real python-casacore is installed above only to
         # generate the fixture tables).
         run: PYTHONPATH=tests/shim pytest tests/
+
+      - name: measures accuracy contract and casacore parity
+        # test_measures.py holds casacure.measures to astropy over 1926-2126
+        # and, where real python-casacore is importable, to casacore's
+        # AZELGEO path (plus the proof that casacore's AZEL differs by its
+        # geocentric observer latitude).  The shim hides real casacore, so
+        # this runs without it.  See MEASURES_ACCURACY.md.
+        run: pytest tests/test_measures.py -q
 
   # Concurrency: the threaded stress tests (crates/casacure/tests/
   # thread_safety.rs, tests/test_threading.py) and the whole casacure suite

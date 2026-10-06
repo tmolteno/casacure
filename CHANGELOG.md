@@ -13,6 +13,64 @@ subtasks are moved here.
   handover.md; do not hand-tag. The pre-release Docker image now
   installs `astropy` (the new image fixtures need it in
   `make_fixtures.py`).
+- **`invoke release` now stamps `CHANGELOG.md` for you**: the entries that
+  accumulated under `## [Unreleased]` move beneath the new release's dated
+  heading (`## [X.Y.Z] - <today>`), with a fresh empty `## [Unreleased]`
+  left on top, so the changelog no longer has to be edited by hand at
+  release time. A section that already exists (hand-written notes, or a
+  re-run) is left untouched, and `--no-bump`/`--version X.Y.Z` warn when the
+  version being tagged has no section.
+
+## [3.8.25] - 2026-10-07
+
+### Added
+
+- **No more `casadata` dependency for measures** (ratt-ru/QuartiCal#330):
+  IERS UT1−UTC and polar motion ship with the library via the
+  `celestial-eop-data` crate (`finals2000A`, MJD 41684 … 61547, with
+  the constants astropy falls back to outside it), and the Earth's
+  ephemeris is a Keplerian model, so no external data files are read at
+  runtime.  The astrometry engine is panic-free from MJD 0 to 150 000.
+- **`MEASURES_ACCURACY.md`** — the accuracy contract, the model, the bundled
+  data and the documented differences from casacore.
+- **`tests/test_measures.py`** — the executable contract: casacure vs
+  astropy over 1926–2126 (every 10 years × 3 sites × 6 fields), issue #15,
+  posangle, round trips, the IERS-prediction window, and casacore parity
+  including the proof that casacore's `AZEL` uses the geocentric latitude.
+  `scripts/make_measures_refs.py` regenerates the astropy values pinned in
+  the Rust tests.
+- **A `.[dev]` extra** (`astropy`, `skyfield`, `pytest`): astropy is the
+  reference implementation the accuracy tests measure against, skyfield is
+  the algorithm model used while writing the port.
+
+### Changed
+
+- **`AZEL` and `AZELGEO` both use the geodetic observer latitude** (the
+  astropy truth), so casacure no longer reproduces casacore's geocentric
+  `AZEL` horizon — see `DIFFERENCES.md`.
+- `casacure::measures::gmst_deg` is the IAU 2006 GMST on UT1 (astropy's
+  `Time.sidereal_time("mean")` to 4e-5″) instead of the IAU 1982 UTC
+  formula.
+- New Rust dependencies: `sofars` 0.6 (MIT, SOFA algorithms) and
+  `celestial-eop-data` 0.1 (MIT/Apache-2.0, IERS data); both pure Rust, so
+  wheels still build without a C toolchain beyond the existing ones.
+
+### Fixed
+
+- **`casacure.measures` J2000 <-> `AZEL`/`AZELGEO` is now astropy-accurate
+  (issue #15).** The old conversion had an inverted first-order precession,
+  no nutation, no UT1 (it used UTC as if it were UT1), no annual/diurnal
+  aberration and no polar motion; near the zenith that cost up to ~2° of
+  parallactic angle. It is replaced by the IAU SOFA/ERFA stack — IAU
+  2006/2000A precession-nutation, Earth rotation angle on UT1, annual and
+  diurnal aberration, solar light deflection and polar motion, refraction
+  off, matching astropy's `AltAz` defaults — evaluated through the pure-Rust
+  [`sofars`](https://crates.io/crates/sofars) port in the new
+  `casacure::astro` module. The forward and inverse paths share one
+  astrometry context (as SOFA's `atco13` does) and round-trip to ~1e-13 rad.
+  For the issue's case casacure now returns az −47.701503°, alt
+  +86.855931°, PA 133.551306°: 0.005″/0.09″ from astropy and 0.55″/2.2″ from
+  casacore's `AZELGEO`, where the old code was 1837″/121″ and 29′ out.
 
 ## [3.8.24] - 2026-10-06
 
