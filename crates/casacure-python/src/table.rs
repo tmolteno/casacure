@@ -2242,7 +2242,9 @@ impl Table {
     }
 
     /// `getcolslice(column, blc, trc, inc=[], startrow=0, nrow=-1, rowincr=1)`
-    /// (python-casacore's signature).
+    /// (python-casacore's signature). The legacy 5-argument casacure form
+    /// `(column, blc, trc, startrow, nrow)` is also accepted (a positional
+    /// `inc` that is an integer means `startrow`).
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (column, blc, trc, inc = None, startrow = 0, nrow = -1, rowincr = 1))]
     fn getcolslice(
@@ -2251,12 +2253,13 @@ impl Table {
         column: &str,
         blc: Vec<i64>,
         trc: Vec<i64>,
-        inc: Option<Vec<i64>>,
-        startrow: i64,
-        nrow: i64,
+        inc: Option<Bound<'_, PyAny>>,
+        mut startrow: i64,
+        mut nrow: i64,
         rowincr: i64,
     ) -> PyResult<Py<PyAny>> {
-        let _ = (&inc, rowincr);
+        let inc_v = split_inc_startrow_nrow(inc, &mut startrow, &mut nrow)?;
+        let _ = rowincr;
         self.auto_tick()?;
         let total = self.row_count();
         let startrow = if startrow < 0 { 0 } else { startrow } as u64;
@@ -2266,14 +2269,15 @@ impl Table {
             nrow as u64
         };
         let col_idx = self.col_index(column)?;
-        let inc_v = inc.unwrap_or_default();
         let cells =
             py.detach(|| self.read_colslice(col_idx, &blc, &trc, &inc_v, startrow, nrow))?;
         self.column_to_python(py, col_idx, &cells)
     }
 
     /// `getcolslicenp(column, buf, blc, trc, inc=[], startrow=0, nrow=-1,
-    /// rowincr=1)` (python-casacore's signature).
+    /// rowincr=1)` (python-casacore's signature). The legacy 5-argument
+    /// casacure form `(column, buf, blc, trc, startrow, nrow)` is also
+    /// accepted (a positional `inc` that is an integer means `startrow`).
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (column, buf, blc, trc, inc = None, startrow = 0, nrow = -1, rowincr = 1))]
     fn getcolslicenp(
@@ -2283,12 +2287,13 @@ impl Table {
         buf: &Bound<'_, PyAny>,
         blc: Vec<i64>,
         trc: Vec<i64>,
-        inc: Option<Vec<i64>>,
-        startrow: i64,
-        nrow: i64,
+        inc: Option<Bound<'_, PyAny>>,
+        mut startrow: i64,
+        mut nrow: i64,
         rowincr: i64,
     ) -> PyResult<()> {
-        let _ = (&inc, rowincr);
+        let inc_v = split_inc_startrow_nrow(inc, &mut startrow, &mut nrow)?;
+        let _ = rowincr;
         self.auto_tick()?;
         let total = self.row_count();
         let startrow = if startrow < 0 { 0 } else { startrow } as u64;
@@ -2298,7 +2303,6 @@ impl Table {
             nrow as u64
         };
         let col_idx = self.col_index(column)?;
-        let inc_v = inc.unwrap_or_default();
         let cells =
             py.detach(|| self.read_colslice(col_idx, &blc, &trc, &inc_v, startrow, nrow))?;
         let cell = cell_shape_of(&cells).iter().product::<usize>().max(1);
@@ -3334,6 +3338,37 @@ impl Table {
         let cell_shape = cell_shape_of(cells);
         convert::arrays_to_ndarray_getcol(py, cells, &cell_shape)
     }
+}
+
+/// Interpret the `inc` argument of `getcolslice`/`getcolslicenp`, which is
+/// either python-casacore's per-dimension step (`inc=[]`, a sequence of
+/// ints) or — in the legacy 5-argument casacure form
+/// `(column, blc, trc, startrow, nrow)` — an integer that is really
+/// `startrow`. Returns the step sequence and, for the legacy form, shifts
+/// `startrow`/`nrow` into their python-casacore positions.
+fn split_inc_startrow_nrow(
+    inc: Option<Bound<'_, PyAny>>,
+    startrow: &mut i64,
+    nrow: &mut i64,
+) -> PyResult<Vec<i64>> {
+    let Some(v) = inc else {
+        return Ok(Vec::new());
+    };
+    if let Ok(seq) = v.extract::<Vec<i64>>() {
+        // python-casacore form: `inc` is a per-dimension step.
+        return Ok(seq);
+    }
+    if let Ok(n) = v.extract::<i64>() {
+        // Legacy form: this integer is `startrow`; the next positional is
+        // `nrow`. `*startrow` currently holds `nrow` (the 4th arg), so shift.
+        let legacy_nrow = *startrow;
+        *startrow = n;
+        *nrow = legacy_nrow;
+        return Ok(Vec::new());
+    }
+    Err(PyTypeError::new_err(
+        "getcolslice/getcolslicenp inc must be a sequence of ints (python-casacore) or an int (legacy casacure startrow)",
+    ))
 }
 
 fn reshape_cell(shape: &[usize]) -> usize {

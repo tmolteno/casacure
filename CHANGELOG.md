@@ -3,6 +3,18 @@
 All notable changes to this project are documented here. Completed `TODO.md`
 subtasks are moved here.
 
+## [3.8.20] - 2026-10-06
+
+### Fixed
+
+- **`table.getcolslice` / `getcolslicenp` accept the legacy 5-argument form**
+  — `(column, blc, trc, startrow, nrow)` (the form `test_subcell_tiles.py`
+  and earlier callers use) in addition to python-casacore's
+  `(column, blc, trc, inc=[], startrow=0, nrow=-1, rowincr=1)`. A positional
+  `inc` that is an integer is taken as `startrow`. This is a fix for the
+  regression 3.8.19 introduced by inserting `inc` before `startrow` in the
+  positional order.
+
 ## [3.8.19] - 2026-10-06
 
 ### Added (DDFacet / killMS port preparation)
