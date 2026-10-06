@@ -279,6 +279,26 @@ Notes:
   engine's portability is what makes the cross-compiled wheel matrix above
   possible).
 
+## Releasing
+
+`tasks.py` (in the spirit of `../meerkat_imaging`) gates a release on a
+local run of the CI suite, so a CI failure on a release tag is a local
+failure the operator sees first. Requires `invoke`, `plumbum`, `docker`,
+`gh` (authenticated), `cargo`, `rustup`.
+
+```bash
+invoke version                 # show current + next versions
+invoke test                    # build the image + run the CI `test` job
+invoke test --all-jobs         # + `tsan` (nightly) + `freethreaded` (3.14t)
+invoke release                 # test, commit, tag vX.Y.Z, push, wait for publish
+invoke release --bump          # auto-bump the patch version first
+```
+
+`invoke release` runs the pre-release gate in `Dockerfile` (the `test` CI
+job: `cargo test` / `fmt` / `clippy` / `maturin build` / `pytest tests/`
+with real python-casacore) before any tag is pushed. The `publish-python`
+and `publish-rust` workflows then fire on the tag, exactly as before.
+
 ## Development
 
 * [TODO.md](TODO.md) — the live task list; [CHANGELOG.md](CHANGELOG.md) records

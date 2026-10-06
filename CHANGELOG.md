@@ -3,6 +3,27 @@
 All notable changes to this project are documented here. Completed `TODO.md`
 subtasks are moved here.
 
+## [Unreleased]
+
+### Added
+
+- **`tasks.py` + `Dockerfile`** — release orchestration in the spirit of
+  `../meerkat_imaging/tasks.py`: `invoke test` builds the pre-release image
+  and runs the full CI gate locally (cargo test / fmt / clippy / maturin
+  build / `PYTHONPATH=tests/shim pytest tests/` with real python-casacore
+  available); `invoke release` runs the gate, commits the release, tags
+  `vX.Y.Z`, pushes, and waits for `publish-python.yml`/`publish-rust.yml`
+  to go green. `--sanitizers`/`--freethreaded`/`--all-jobs` reproduce the
+  `tsan` and `freethreaded` CI jobs too. A CI failure on a release tag is
+  now a local failure the operator sees first.
+
+### Fixed
+
+- **`table::tests::a_read_only_block_is_named_in_the_storage_error` skips
+  under root** — the test relies on `chmod 0444` denying writes, which root
+  ignores; it now returns early with a note when `geteuid() == 0` (the
+  Docker release image runs as root; CI's ubuntu runner does not).
+
 ## [3.8.20] - 2026-10-06
 
 ### Fixed

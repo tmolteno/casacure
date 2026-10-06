@@ -5434,6 +5434,15 @@ mod tests {
     fn a_read_only_block_is_named_in_the_storage_error() {
         use std::os::unix::fs::PermissionsExt;
 
+        // Root ignores file-mode permissions, so a chmod 0444 block is still
+        // writable and the test cannot make the write fail.  Skip it there
+        // (the Docker release image runs as root; CI's ubuntu runner does not).
+        let euid = unsafe { libc::geteuid() };
+        if euid == 0 {
+            eprintln!("skipping: running as root (chmod 0444 is not a write barrier for root)");
+            return;
+        }
+
         let dir = temp_dir("readonly-block-error");
         let mut desc = typed_desc();
         // Two SSM scalar columns, so the second flush is the incremental

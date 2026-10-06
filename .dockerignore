@@ -1,0 +1,13 @@
+.git
+.venv
+.venv-ft
+target
+tests/fixtures
+__pycache__
+*.pyc
+*.so
+.pytest_cache
+.ruff_cache
+*.egg-info
+dist
+build
