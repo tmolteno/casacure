@@ -236,7 +236,7 @@ def release(c,
 
     print(f"=== tagging {tag} (commit {commit[:12]})")
     _git("tag", "-a", tag, "-m", tag)
-    local["git"]("-C", str(REPO), "push", "origin", "main", tag) & FG
+    local["git"]["-C", str(REPO), "push", "origin", "main", tag] & FG
 
     print("  waiting for the publish workflows...")
     _wait_for_ci(tag)
