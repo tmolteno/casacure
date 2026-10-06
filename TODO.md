@@ -5,6 +5,10 @@ starting them; remove each when completed and log it in `CHANGELOG.md`.
 
 Work areas follow `CASACORE_TO_CASA_RS.md` (tracked as GitHub issues).
 
+**Releases are made only with `invoke release`** (`tasks.py`: the Docker CI
+gate, the version bump, the tag, the push and the publish-wait in one
+command — see README "Releasing"); do not hand-tag.
+
 ## 1. CASA table on-disk format (core prerequisite)
 
 - [X] StandardStMan column storage: read

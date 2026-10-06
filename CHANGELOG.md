@@ -5,6 +5,15 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The release procedure is `invoke release`** (README "Releasing",
+  `tasks.py`): the Docker CI gate, version bump, tag, push and
+  publish-wait in one command. Documented in README, TODO.md and
+  handover.md; do not hand-tag. The pre-release Docker image now
+  installs `astropy` (the new image fixtures need it in
+  `make_fixtures.py`).
+
 ## [3.8.23] - 2026-10-06
 
 ### Added

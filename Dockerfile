@@ -26,7 +26,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
 ENV PATH="/root/.cargo/bin:$PATH"
 
 RUN pip install --no-cache-dir \
-        maturin numpy pytest python-casacore dask-ms xarray
+        maturin numpy pytest python-casacore dask-ms xarray astropy
 
 WORKDIR /src
 
