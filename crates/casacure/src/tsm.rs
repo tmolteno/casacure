@@ -196,7 +196,10 @@ struct CubeGeom {
 }
 
 impl CubeGeom {
-    fn new(cube: &TsmCube, file: Option<usize>) -> CubeGeom {
+    /// `full_cell`: TiledCellStMan semantics — every row's cell IS a whole
+    /// cube (cube index == row), so the gather covers every cube axis
+    /// instead of "all but the row axis" (TiledColumnStMan/TiledShapeStMan).
+    fn new(cube: &TsmCube, file: Option<usize>, full_cell: bool) -> CubeGeom {
         let nrdim = cube.nrdim as usize;
         let mut g = CubeGeom {
             file,
@@ -205,8 +208,9 @@ impl CubeGeom {
         if nrdim < 1 || cube.cube_shape.len() != nrdim || cube.tile_shape.len() != nrdim {
             return g;
         }
-        let cell = &cube.cube_shape[..nrdim - 1];
-        let tile = &cube.tile_shape[..nrdim - 1];
+        let cut = if full_cell { nrdim } else { nrdim - 1 };
+        let cell = &cube.cube_shape[..cut];
+        let tile = &cube.tile_shape[..cut];
         if cell == tile || tile.iter().any(|&t| t <= 0) || cell.iter().any(|&c| c < 0) {
             return g;
         }
@@ -461,12 +465,13 @@ impl TsmFile {
         tile_files: Vec<(i32, crate::datafile::Buffer)>,
         big_endian: bool,
     ) -> TsmFile {
+        let full_cell = header.root_type == "TiledCellStMan";
         let geoms = header
             .cubes
             .iter()
             .map(|c| {
                 let file = tile_files.iter().position(|(s, _)| *s == c.file_seq_nr);
-                CubeGeom::new(c, file)
+                CubeGeom::new(c, file, full_cell)
             })
             .collect();
         TsmFile {
@@ -533,8 +538,14 @@ impl TsmFile {
             return self.read_default_cell(desc);
         };
         let nrdim = cube.nrdim as usize;
-        // Logical shape = reverse of the on-disk (CASA) cell shape.
-        let logical: Vec<u32> = cube.cube_shape[..nrdim - 1]
+        // Logical shape = reverse of the on-disk (CASA) cell shape: all but
+        // the row axis, or the whole cube for TiledCellStMan.
+        let cut = if self.header.root_type == "TiledCellStMan" {
+            nrdim
+        } else {
+            nrdim - 1
+        };
+        let logical: Vec<u32> = cube.cube_shape[..cut]
             .iter()
             .rev()
             .map(|&d| d as u32)
@@ -643,6 +654,15 @@ impl TsmFile {
                 nrow: self.header.nrrow,
             });
         }
+        // TiledCellStMan: every row's cell is its own cube, so the row IS
+        // the cube index (position 0 within it).  A row with no cube is an
+        // unset cell.
+        if self.header.root_type == "TiledCellStMan" {
+            return Ok(match self.header.cubes.get(row as usize) {
+                Some(c) if !c.cube_shape.is_empty() => Some((row as usize, 0)),
+                _ => None,
+            });
+        }
         // The cube holding `row`. With a row map (TiledShapeStMan) the
         // header's maps are authoritative: a row they do not mention is an
         // unset cell. Without one (TiledColumnStMan) cubes cover consecutive
@@ -707,8 +727,14 @@ impl TsmFile {
         if nrdim < 1 || cube.cube_shape.len() != nrdim || cube.tile_shape.len() != nrdim {
             return Err(bad());
         }
-        // The per-row cell spans all but the (extensible) row dimension.
-        let cell_size: i64 = cube.cube_shape[..nrdim - 1].iter().product::<i64>();
+        // The per-row cell spans all but the (extensible) row dimension —
+        // except in TiledCellStMan, where it is the whole cube.
+        let cut = if self.header.root_type == "TiledCellStMan" {
+            nrdim
+        } else {
+            nrdim - 1
+        };
+        let cell_size: i64 = cube.cube_shape[..cut].iter().product::<i64>();
         let row_tiles: i64 = cube.tile_shape[nrdim - 1];
         if row_tiles <= 0 || cube.tile_shape.iter().any(|&t| t <= 0) {
             return Err(bad());
@@ -986,7 +1012,10 @@ fn decode_tile_data(
 pub fn parse_header(data: &[u8]) -> Result<TsmHeader, TsmError> {
     let mut r = Reader::new(data);
     let obj = r.read_object_start(true)?;
-    if obj.type_name != "TiledColumnStMan" && obj.type_name != "TiledShapeStMan" {
+    if !matches!(
+        obj.type_name.as_str(),
+        "TiledColumnStMan" | "TiledShapeStMan" | "TiledCellStMan"
+    ) {
         return Err(TsmError::UnexpectedType {
             expected: "TiledColumnStMan".into(),
             found: obj.type_name,
@@ -997,7 +1026,7 @@ pub fn parse_header(data: &[u8]) -> Result<TsmHeader, TsmError> {
     // shape as an IPosition). TiledShapeStMan's root carries nothing — its
     // default tile shape travels in the (empty) table.dat blob or in a
     // placeholder cube, so it is reconstructed from the cubes below.
-    let mut subclass_shape = if root_type == "TiledColumnStMan" {
+    let mut subclass_shape = if root_type == "TiledColumnStMan" || root_type == "TiledCellStMan" {
         r.read_iposition()?
     } else {
         Vec::new()

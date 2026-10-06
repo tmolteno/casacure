@@ -1136,7 +1136,7 @@ fn read_table_dir(path: &std::path::Path) -> Result<DataFiles, TableDatError> {
                 crate::ism::IsmFile::open(path, dm.sequence_nr, big)
                     .map_err(|e| TableDatError::Storage(e.to_string()))?,
             )),
-            "TiledColumnStMan" | "TiledShapeStMan" => tsm_files.push((
+            "TiledColumnStMan" | "TiledShapeStMan" | "TiledCellStMan" => tsm_files.push((
                 dm.sequence_nr,
                 crate::tsm::TsmFile::open(path, dm.sequence_nr, big)
                     .map_err(|e| TableDatError::Storage(e.to_string()))?,
@@ -1673,7 +1673,7 @@ impl Table {
                     })?;
                 Ok(ColumnSource::Ism { file, within })
             }
-            "TiledColumnStMan" | "TiledShapeStMan" => {
+            "TiledColumnStMan" | "TiledShapeStMan" | "TiledCellStMan" => {
                 let file = self
                     .tsm_files
                     .iter()
@@ -1812,7 +1812,7 @@ impl Table {
             "StandardStMan" => desc.data_type != DT::Bool,
             // ISM stores a Bool cell as one byte.
             "IncrementalStMan" => !is_array,
-            "TiledColumnStMan" | "TiledShapeStMan" => is_array,
+            "TiledColumnStMan" | "TiledShapeStMan" | "TiledCellStMan" => is_array,
             _ => false,
         }
     }

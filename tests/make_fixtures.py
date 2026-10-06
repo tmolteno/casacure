@@ -301,6 +301,100 @@ def make_subtable_tree(fixtures: Path) -> dict:
     }
 
 
+def make_image_fixture(fixtures: Path) -> dict:
+    """A CASA image (TiledCellStMan `map` raster + coords/imageinfo keyword
+    records) built the way DDFacet produces its products: an astropy-written
+    4-D SIN/FREQ/STOKES FITS cube converted through casacore's image() +
+    saveas().  Ground truth for `casacure.images` (issue #14)."""
+    import numpy as np
+    from astropy.io import fits
+    from astropy.wcs import WCS
+    from casacore.images import image
+
+    nch, npol, ny, nx = 3, 2, 8, 10
+    w = WCS(naxis=4)
+    w.wcs.ctype = ["RA---SIN", "DEC--SIN", "STOKES", "FREQ"]
+    w.wcs.crval = [1.75, -0.45, 1.0, 1.4e9]
+    w.wcs.cdelt = [-2.5e-5, 3.0e-5, 1.0, 2.0e6]
+    w.wcs.crpix = [nx / 2.0, ny / 2.0, 1.0, 1.0]
+    w.wcs.crota = [0.0, 0.0, 0.0, 0.0]
+
+    data = np.arange(nch * npol * ny * nx, dtype=np.float32).reshape(nch, npol, ny, nx)
+    hdu = fits.PrimaryHDU(data)
+    for k, v in w.to_header(relax=True).items():
+        hdu.header[k] = v
+    hdu.header["BUNIT"] = "Jy/beam"
+    hdu.header["BMAJ"] = 3.5e-3
+    hdu.header["BMIN"] = 2.5e-3
+    hdu.header["BPA"] = 15.0
+    hdu.header["SPECSYS"] = "TOPOCENT"
+    fits_path = fixtures / "image.fits"
+    hdu.writeto(fits_path, overwrite=True)
+
+    casa_path = fixtures / "image.image"
+    image(str(fits_path)).saveas(str(casa_path))
+    im2 = image(str(casa_path))
+    got = im2.getdata()
+    assert got.shape == (nch, npol, ny, nx) and np.array_equal(got, data)
+    return {
+        "path": casa_path.name,
+        "fits": fits_path.name,
+        "nrows": 1,
+        "big_endian": sys.byteorder == "big",
+        "shape": list(got.shape),
+        "dtype": got.dtype.str,
+        "first": float(got.flat[0]),
+        "last": float(got.flat[-1]),
+        "keywords": {
+            "coords": im2.coordinates().dict(),
+            "imageinfo": im2.imageinfo(),
+            "units": im2.unit(),
+        },
+        "toworld_0000": list(im2.toworld((0, 0, 0, 0))),
+        "toworld_1123": list(im2.toworld((1, 1, 2, 3))),
+    }
+
+
+def make_tsmcell_table(fixtures: Path) -> dict:
+    """A multi-row TiledCellStMan table: every row's fixed-shape array cell
+    is its own cube (the storage pattern behind CASA images), here with
+    three rows to pin the cube-index-equals-row mapping."""
+    import numpy as np
+
+    path = fixtures / "tsmcell.tab"
+    acd = ct.makearrcoldesc("DATA", 0.0, 2, [2, 3], "TiledCellStMan", "TCSM", 4)
+    scd = ct.makescacoldesc("IDX", 0)
+    td = ct.maketabdesc([acd, scd])
+    dminfo = {
+        "*1": {
+            "TYPE": "TiledCellStMan",
+            "NAME": "TCSM",
+            "SEQNR": 0,
+            "SPEC": {"DEFAULTTILESHAPE": [6, 2, 1]},
+            "COLUMNS": ["DATA"],
+        }
+    }
+    nrow = 3
+    with ct.table(str(path), td, nrow=nrow, dminfo=dminfo, ack=False) as t:
+        for r in range(nrow):
+            cells = np.array(
+                [[r * 6.0 + i for i in range(3)], [r * 6.0 + 3 + i for i in range(3)]],
+                dtype=np.float32,
+            )
+            t.putcell("DATA", r, cells)
+            t.putcell("IDX", r, r)
+        first = t.getcell("DATA", 0)
+        return {
+            "path": path.name,
+            "nrows": nrow,
+            "big_endian": sys.byteorder == "big",
+            "array_shape": list(first.shape),
+            "array_dtype": first.dtype.str,
+            "dminfo_type": t.getdminfo()["*1"]["TYPE"],
+            "cells": [t.getcell("DATA", r).tolist() for r in range(nrow)],
+        }
+
+
 def main() -> None:
     if FIXTURES.exists():
         shutil.rmtree(FIXTURES)
@@ -317,9 +411,20 @@ def main() -> None:
             "tsm": make_tsm_table(FIXTURES),
             "kw": make_keyword_table(FIXTURES),
             "subs": make_subtable_tree(FIXTURES),
+            "image": make_image_fixture(FIXTURES),
+            "tsmcell": make_tsmcell_table(FIXTURES),
         },
     }
-    (FIXTURES / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    def _plain(o):
+        import numpy as np
+
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        if isinstance(o, np.generic):
+            return o.item()
+        raise TypeError(type(o))
+
+    (FIXTURES / "manifest.json").write_text(json.dumps(manifest, indent=2, default=_plain))
     print(f"wrote {FIXTURES / 'manifest.json'} (casacore {manifest['casacore_version']})")
 
 

@@ -41,6 +41,16 @@ struct TableFixture {
     sub_nested: String,
     #[serde(default)]
     outside: String,
+    /// Image fixture: raster shape (C order) + first/last values.
+    #[serde(default)]
+    shape: Vec<usize>,
+    #[serde(default)]
+    first: f64,
+    #[serde(default)]
+    last: f64,
+    /// TiledCellStMan fixture: the cells casacore returned per row.
+    #[serde(default)]
+    cells: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -101,7 +111,10 @@ fn fixture_value_types_parse_and_match_getcol_dtypes() {
     assert!(!manifest.tables.is_empty(), "manifest lists no tables");
 
     for (table_name, table) in &manifest.tables {
-        assert!(!table.columns.is_empty(), "{table_name}: no columns");
+        // The image/tsmcell fixtures carry their own value assertions.
+        if table.columns.is_empty() {
+            continue;
+        }
         for (col_name, col) in &table.columns {
             let vt = ValueType::from_casa_name(&col.value_type)
                 .unwrap_or_else(|e| panic!("{table_name}.{col_name}: unparseable value_type: {e}"));
@@ -309,6 +322,11 @@ fn fixture_table_descs_parse() {
         let dat = casacure::parse_table_dat(&buf)
             .unwrap_or_else(|e| panic!("{name}: table.dat failed to parse: {e}"));
         assert_eq!(dat.header.nrow, table.nrows, "{name}: wrong row count");
+        // Fixtures without a recorded columns map (image/tsmcell) assert
+        // their columns in their own tests below.
+        if table.columns.is_empty() {
+            continue;
+        }
         assert_eq!(
             dat.desc.columns.len(),
             table.columns.len(),
@@ -846,6 +864,102 @@ fn fixture_subtable_keywords_match_casacore() {
 
 fn tempdir() -> testdir::TestDir {
     testdir::TestDir::new(format!("casacure-fixture-subcopy-{}", std::process::id()))
+}
+
+/// The multi-row TiledCellStMan fixture: every row's array cell is its own
+/// cube (the storage pattern behind CASA images). Each row must read back
+/// exactly its own cell — the cube-index-equals-row mapping.
+#[test]
+fn fixture_tsmcell_read() {
+    use casacure::record::{ArrayData, RecordValue};
+    let Some(manifest) = load_manifest() else {
+        return;
+    };
+    let Some(f) = manifest.tables.get("tsmcell") else {
+        return;
+    };
+    let dir = manifest_path().parent().unwrap().join(&f.path);
+    let t = casacure::Table::open(&dir, true).expect("tsmcell: open");
+    assert_eq!(t.nrows(), f.nrows);
+    let idx = t
+        .dat
+        .desc
+        .columns
+        .iter()
+        .position(|c| c.name == "DATA")
+        .unwrap();
+    for (row, want) in f.cells.iter().enumerate() {
+        let cell = t.getcell(idx, row as u64).expect("tsmcell: read");
+        match cell {
+            RecordValue::Array(a) => {
+                assert_eq!(a.shape, vec![2, 3], "tsmcell: shape row {row}");
+                let ArrayData::Double(vals) = &a.data else {
+                    panic!("tsmcell: expected double data");
+                };
+                let want: Vec<f64> = want
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|pl| {
+                        pl.as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|v| v.as_f64().unwrap())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                assert_eq!(&vals[..], &want[..], "tsmcell: values row {row}");
+            }
+            other => panic!("tsmcell: expected array, got {other:?}"),
+        }
+    }
+}
+
+/// The CASA image fixture (issue #14): a one-row table whose `map` column
+/// holds one 4-D TiledCellStMan cell — the raster — plus coords/imageinfo
+/// keyword records. The raster must read back exactly as casacore's
+/// `image.getdata()` returned it.
+#[test]
+fn fixture_image_read() {
+    use casacure::record::{ArrayData, RecordValue};
+    let Some(manifest) = load_manifest() else {
+        return;
+    };
+    let Some(f) = manifest.tables.get("image") else {
+        return;
+    };
+    let dir = manifest_path().parent().unwrap().join(&f.path);
+    let t = casacure::Table::open(&dir, true).expect("image: open");
+    assert_eq!(t.nrows(), 1);
+    assert_eq!(t.colnames(), vec!["map"]);
+    let idx = t
+        .dat
+        .desc
+        .columns
+        .iter()
+        .position(|c| c.name == "map")
+        .unwrap();
+    let cell = t.getcell(idx, 0).expect("image: raster read");
+    match cell {
+        RecordValue::Array(a) => {
+            assert_eq!(
+                a.shape,
+                f.shape.iter().map(|&d| d as u32).collect::<Vec<u32>>(),
+                "image: raster logical shape"
+            );
+            let ArrayData::Float(vals) = &a.data else {
+                panic!("image: expected float raster");
+            };
+            assert_eq!(vals.len(), f.shape.iter().product::<usize>());
+            assert_eq!(vals[0] as f64, f.first);
+            assert_eq!(*vals.last().unwrap() as f64, f.last);
+            // Spot-check the ordering against arange (the fixture's pixels).
+            for (i, v) in vals.iter().enumerate() {
+                assert_eq!(*v, i as f32, "image: raster is arange-ordered");
+            }
+        }
+        other => panic!("image: expected array, got {other:?}"),
+    }
 }
 
 fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
