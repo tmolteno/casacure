@@ -29,6 +29,10 @@ ct = pytest.importorskip("casacure.images")
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 IMAGE_FIXTURE = os.path.join(FIXTURES, "image.image")
 FITS_FIXTURE = os.path.join(FIXTURES, "image.fits")
+
+# Read as a CASA image and as FITS; tests/conftest.py skips the module when
+# either fixture is absent.
+CASACORE_FIXTURES = ("image.image", "image.fits")
 SHAPE = [3, 2, 8, 10]
 
 

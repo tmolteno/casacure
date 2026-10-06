@@ -39,6 +39,10 @@ needs_casacore = pytest.mark.skipif(
 
 FIXTURES = "tests/fixtures"
 
+# The casacore-written image this module reads; tests/conftest.py skips the
+# module when it is absent.
+CASACORE_FIXTURES = ("image.image",)
+
 
 def make(tmp_path, shape, name="scratch.image"):
     """A default-coordinate image of `shape` (numpy order)."""

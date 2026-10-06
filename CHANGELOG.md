@@ -57,6 +57,13 @@ subtasks are moved here.
 
 ### Fixed
 
+- **Fixture-dependent tests skip cleanly when `tests/fixtures/` is absent**
+  (the free-threaded CI job, or a bare checkout): the image modules declare
+  what they read (`CASACORE_FIXTURES = ("image.image", "image.fits")`) and
+  `tests/conftest.py` turns a missing casacore-written fixture into one
+  clear skip instead of 34 failures, 58 errors and a red job. With the
+  fixtures generated the suite is unchanged (450 passed / 37 skipped /
+  3 xfailed); without them it is 220 passed / 270 skipped / 0 failed.
 - **`casacure.measures` J2000 <-> `AZEL`/`AZELGEO` is now astropy-accurate
   (issue #15).** The old conversion had an inverted first-order precession,
   no nutation, no UT1 (it used UTC as if it were UT1), no annual/diurnal

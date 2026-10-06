@@ -27,6 +27,10 @@ ct = pytest.importorskip("casacure.images")
 
 FIXTURES = "tests/fixtures"
 
+# The casacore-written FITS cube this module reads; tests/conftest.py skips
+# the module when it is absent.
+CASACORE_FIXTURES = ("image.fits",)
+
 # A SIMPLE = T primary HDU is 80-column cards, padded to 2880 bytes.
 BLOCK = 2880
 

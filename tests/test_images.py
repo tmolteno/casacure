@@ -22,9 +22,9 @@ ct = pytest.importorskip("casacure.images")
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
 MANIFEST = os.path.join(FIXTURES, "manifest.json")
 
-pytestmark = pytest.mark.skipif(
-    not os.path.exists(MANIFEST), reason="fixtures not generated (make_fixtures.py)"
-)
+# The manifest drives every table this module opens; tests/conftest.py turns
+# a missing fixture into a clean skip.
+CASACORE_FIXTURES = ("manifest.json",)
 
 
 def manifest():

@@ -102,5 +102,8 @@ jobs:
         run: .venv-ft/bin/python -c "import casacure, casacure.tables, casacure.quanta, sys; assert not sys._is_gil_enabled()"
 
       - name: Test suite (no GIL)
+        # No fixture generation here (that needs real python-casacore, which
+        # has no 3.14t wheel): the casacore-fixture modules skip themselves
+        # via tests/conftest.py instead of failing.
         run: PYTHONPATH=tests/shim .venv-ft/bin/python -m pytest tests/
 
