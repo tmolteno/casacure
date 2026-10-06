@@ -4,6 +4,7 @@
 
 mod convert;
 mod helpers;
+mod images;
 mod measures;
 mod quanta;
 mod selftest;
@@ -265,6 +266,7 @@ fn casacure(m: &Bound<'_, PyModule>) -> PyResult<()> {
     tables_submodule(m)?;
     quanta::quanta_submodule(m)?;
     measures::measures_submodule(m)?;
+    images::images_submodule(m)?;
     Ok(())
 }
 

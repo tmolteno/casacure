@@ -8,6 +8,7 @@ pub mod columnset;
 pub mod datafile;
 mod flushgate;
 mod grow;
+pub mod images;
 pub mod ism;
 pub mod lockfile;
 pub mod measures;

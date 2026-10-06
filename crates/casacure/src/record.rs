@@ -312,7 +312,7 @@ impl ArrayData {
 
 /// A decoded TableRecord: description, record type, and values aligned with
 /// `desc.fields`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct TableRecord {
     pub desc: RecordDesc,
     /// 0 = Fixed, 1 = Variable (`RecordInterface::RecordType`).
