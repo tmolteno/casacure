@@ -33,6 +33,20 @@ pub enum ImageError {
     },
     #[error(transparent)]
     Write(#[from] crate::table::WriteTableError),
+    /// `regrid` given an axis index outside the image's axes — reported
+    /// instead of indexing `src_shape[axis]` out of bounds (which panicked
+    /// through pyo3 as a `PanicException`).
+    #[error("regrid axis {axis} is out of range (the image has {ndim} axes)")]
+    BadAxis { axis: usize, ndim: usize },
+    /// `putdata` given a raster whose shape is not the image's shape.
+    #[error("putdata: array shape {got:?} does not match the image {want:?}")]
+    ShapeMismatch { got: Vec<u32>, want: Vec<u32> },
+    /// `putdata` given an element type the float raster cannot hold (Bool,
+    /// String, Complex).  casacore rejects these too ("invalid data type
+    /// Array<T>"); naming the offending type is the whole point, because the
+    /// storage layer's own complaint named the *column's* type instead.
+    #[error("putdata: invalid data type Array<{kind}> for an image that stores Float")]
+    BadElementType { kind: String },
 }
 
 /// An opened image: a CASA image table, a FITS file, or an in-memory
@@ -76,6 +90,15 @@ impl Image {
     pub fn open(path: impl Into<std::path::PathBuf>) -> Result<Image, ImageError> {
         let path = path.into();
         if path.is_dir() {
+            // A directory is an image only when it is a CASA table.  Any
+            // other directory is "not an image", and leaking the table
+            // layer's io error ("No such file or directory (os error 2)")
+            // for a directory that plainly exists sends the caller looking
+            // for a missing path instead of a wrong one.  A directory that
+            // *is* a table but fails to open still reports the table error.
+            if !path.join("table.info").is_file() {
+                return Err(ImageError::NoSuchImage { path });
+            }
             return Ok(Image::Casa(CasaImage::open(path)?));
         }
         if path.is_file() {
@@ -117,7 +140,29 @@ impl Image {
     /// Replace the raster (pyrap `putdata`).  A CASA-table image is
     /// rewritten through a writable open and its snapshot refreshed; an
     /// in-memory image swaps its raster (shape-checked).
+    ///
+    /// The shape is checked up front for every flavour: casacore rejects a
+    /// `putdata` whose shape differs from the image before touching the
+    /// storage manager, so a mismatched array must not reach the tiled
+    /// encoder (whose "unsupported tiled element type" message is about the
+    /// storage, not the caller's mistake).
     pub fn put_data(&mut self, data: &ArrayValue) -> Result<(), ImageError> {
+        let want: Vec<u32> = self.shape().iter().map(|&d| d as u32).collect();
+        if data.shape != want {
+            return Err(ImageError::ShapeMismatch {
+                got: data.shape.clone(),
+                want,
+            });
+        }
+        // casacore converts any *numeric* raster to the image's float
+        // storage and rejects the rest; naming the caller's array type beats
+        // the tiled encoder's "unsupported tiled element type Float", which
+        // reports the column's type instead.
+        if !super::write::storable_as_float(&data.data) {
+            return Err(ImageError::BadElementType {
+                kind: super::write::array_kind_name(&data.data).to_string(),
+            });
+        }
         match self {
             Image::Casa(c) => {
                 super::write::put_data(&c.path, data)?;
@@ -125,18 +170,7 @@ impl Image {
                 Ok(())
             }
             Image::Memory(m) => {
-                let want: Vec<u32> = m.shape.iter().map(|&d| d as u32).collect();
-                let coerced = super::write::coerce_float(data);
-                if coerced.shape != want {
-                    return Err(ImageError::Other {
-                        path: std::path::PathBuf::new(),
-                        msg: format!(
-                            "putdata: array shape {:?} does not match the image {:?}",
-                            coerced.shape, want
-                        ),
-                    });
-                }
-                m.data = coerced;
+                m.data = super::write::coerce_float(data);
                 Ok(())
             }
             Image::Fits(_) => Err(ImageError::Other {
@@ -172,6 +206,11 @@ impl Image {
 
     /// The brightness unit: the `units` keyword (CASA) or BUNIT (FITS).
     /// pyrap's `unit()` wraps it in quotes — matched verbatim.
+    ///
+    /// Both flavours quote, so `unit()` is symmetric across CASA images,
+    /// FITS cubes and in-memory rasters.  A value already carrying the
+    /// pyrap quotes (an `ImageMeta` that round-tripped through `unit()`) is
+    /// returned as-is rather than double-quoted.
     pub fn unit(&self) -> String {
         let raw = match self {
             Image::Casa(c) => c
@@ -184,6 +223,9 @@ impl Image {
             Image::Fits(f) => f.fits.string_of("BUNIT").unwrap_or("").to_string(),
             Image::Memory(m) => m.meta.units.clone(),
         };
+        if raw.len() >= 2 && raw.starts_with('\'') && raw.ends_with('\'') {
+            return raw;
+        }
         format!("'{raw}'")
     }
 
@@ -303,5 +345,197 @@ impl FitsImageInfo {
             info.set("restoringbeam", RecordValue::Record(beam));
         }
         info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::images::write::ImageMeta;
+    use crate::record::ArrayData;
+
+    #[test]
+    fn error_messages_name_the_cause() {
+        // Each of these is the caller's only diagnostic: the shape one used
+        // to surface as the storage layer's "unsupported tiled element type
+        // Float", and the axis one as a pyo3 PanicException.
+        assert_eq!(
+            ImageError::NoSuchImage {
+                path: "/x/y.image".into()
+            }
+            .to_string(),
+            "/x/y.image: no such image (not a CASA table directory or a FITS file)"
+        );
+        assert_eq!(
+            ImageError::BadAxis { axis: 9, ndim: 4 }.to_string(),
+            "regrid axis 9 is out of range (the image has 4 axes)"
+        );
+        assert_eq!(
+            ImageError::ShapeMismatch {
+                got: vec![2, 2],
+                want: vec![3, 2, 8, 10],
+            }
+            .to_string(),
+            "putdata: array shape [2, 2] does not match the image [3, 2, 8, 10]"
+        );
+        assert_eq!(
+            ImageError::BadElementType {
+                kind: "Bool".into()
+            }
+            .to_string(),
+            "putdata: invalid data type Array<Bool> for an image that stores Float"
+        );
+    }
+
+    fn memory(shape: &[usize], value: f32) -> Image {
+        let nelem: usize = shape.iter().product();
+        Image::Memory(MemoryImage {
+            data: ArrayValue {
+                shape: shape.iter().map(|&d| d as u32).collect(),
+                data: ArrayData::Float(vec![value; nelem]),
+            },
+            shape: shape.to_vec(),
+            coords: CoordinateSystem::default_for(shape),
+            meta: ImageMeta::default(),
+        })
+    }
+
+    #[test]
+    fn shape_and_path_of_an_in_memory_image() {
+        let img = memory(&[3, 2, 8, 10], 1.0);
+        assert_eq!(img.shape(), &[3, 2, 8, 10]);
+        assert_eq!(img.path(), std::path::Path::new(""));
+        assert_eq!(img.coordinates().nimaxes, 4);
+    }
+
+    #[test]
+    fn put_data_checks_the_shape_before_touching_the_raster() {
+        let mut img = memory(&[2, 3], 1.0);
+        let err = img
+            .put_data(&ArrayValue {
+                shape: vec![3, 2],
+                data: ArrayData::Float(vec![0.0; 6]),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ImageError::ShapeMismatch { .. }), "{err}");
+        // The raster is untouched.
+        match img.getdata().unwrap().data {
+            ArrayData::Float(v) => assert_eq!(v, vec![1.0; 6]),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn put_data_checks_the_element_type() {
+        let mut img = memory(&[2, 3], 1.0);
+        let err = img
+            .put_data(&ArrayValue {
+                shape: vec![2, 3],
+                data: ArrayData::Bool(vec![true; 6]),
+            })
+            .unwrap_err();
+        match err {
+            ImageError::BadElementType { kind } => assert_eq!(kind, "Bool"),
+            other => panic!("expected BadElementType, got {other}"),
+        }
+    }
+
+    #[test]
+    fn put_data_into_memory_coerces_to_float32() {
+        let mut img = memory(&[2, 2], 0.0);
+        img.put_data(&ArrayValue {
+            shape: vec![2, 2],
+            data: ArrayData::Double(vec![1.5, 2.5, 3.5, 4.5]),
+        })
+        .unwrap();
+        match img.getdata().unwrap().data {
+            ArrayData::Float(v) => assert_eq!(v, vec![1.5, 2.5, 3.5, 4.5]),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_fits_flavour_image_is_not_writable() {
+        // The FITS arm of `put_data` refuses outright; there is no table to
+        // rewrite, and the batch pipelines only ever write CASA products.
+        let dir = std::env::temp_dir().join(format!("casacure-img-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.fits");
+        let mut body = Vec::new();
+        for text in [
+            "SIMPLE  =                    T",
+            "BITPIX  =                  -32",
+            "NAXIS   =                    1",
+            "NAXIS1  =                    1",
+        ] {
+            let mut card = [b' '; 80];
+            card[..text.len()].copy_from_slice(text.as_bytes());
+            body.extend_from_slice(&card);
+        }
+        let mut end = [b' '; 80];
+        end[..3].copy_from_slice(b"END");
+        body.extend_from_slice(&end);
+        while body.len() % 2880 != 0 {
+            body.push(b' ');
+        }
+        body.extend_from_slice(&1.0f32.to_be_bytes());
+        std::fs::write(&path, &body).unwrap();
+
+        let mut img = Image::open(&path).unwrap();
+        let err = img
+            .put_data(&ArrayValue {
+                shape: vec![1],
+                data: ArrayData::Float(vec![2.0]),
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot putdata into a FITS file"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Image` has no `Debug`, so `unwrap_err` is unavailable.
+    fn open_err(path: &std::path::Path) -> ImageError {
+        match Image::open(path) {
+            Ok(_) => panic!("expected {} to fail to open", path.display()),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn open_reports_a_missing_path_as_no_such_image() {
+        let err = open_err(std::path::Path::new("/definitely/not/here.image"));
+        assert!(matches!(err, ImageError::NoSuchImage { .. }), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "/definitely/not/here.image: no such image (not a CASA table directory or a FITS file)"
+        );
+    }
+
+    #[test]
+    fn open_reports_a_directory_without_a_table_as_no_such_image() {
+        // A directory that exists but is not a CASA table used to surface
+        // the table layer's raw "No such file or directory (os error 2)".
+        let dir = std::env::temp_dir().join(format!("casacure-nodir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = open_err(&dir);
+        assert!(matches!(err, ImageError::NoSuchImage { .. }), "{err}");
+        assert!(err.to_string().contains("no such image"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_image_meta_has_the_housekeeping_records() {
+        // A freshly created image carries no unit (pyrap's `unit()` is
+        // then the empty quoted string) and the default imageinfo record.
+        let meta = ImageMeta::default();
+        assert!(meta.units.is_empty());
+        let info = ImageMeta::default_info();
+        let names: Vec<&str> = info.desc.fields.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"imagetype"), "{names:?}");
+        assert!(names.contains(&"objectname"), "{names:?}");
     }
 }

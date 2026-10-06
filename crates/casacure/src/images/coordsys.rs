@@ -92,6 +92,10 @@ fn f64s(value: &RecordValue) -> Option<Vec<f64>> {
             data: ArrayData::Int(v),
             ..
         }) => Some(v.iter().map(|i| f64::from(*i)).collect()),
+        RecordValue::Array(ArrayValue {
+            data: ArrayData::Int64(v),
+            ..
+        }) => Some(v.iter().map(|i| *i as f64).collect()),
         _ => None,
     }
 }
@@ -109,6 +113,45 @@ fn field_str(rec: &TableRecord, field: &str) -> Option<String> {
 
 const COORD_PREFIXES: [&str; 4] = ["direction", "stokes", "spectral", "linear"];
 
+/// The Stokes letters for `count` planes starting at Stokes code `first`.
+///
+/// The codes follow casacore's `Stokes` enum (1 = I, 2 = Q, 3 = U, 4 = V);
+/// a FITS `STOKES` axis with `CRVAL = 1` and two planes is therefore
+/// `['I', 'Q']` — casacore's answer for the fixture cube.  An unrecognised
+/// code falls back to `S<code>` rather than silently claiming `I`.
+pub(crate) fn stokes_letters(first: i64, count: usize) -> Vec<String> {
+    const NAMES: [&str; 4] = ["I", "Q", "U", "V"];
+    (0..count.max(1))
+        .map(|i| {
+            let code = first + i as i64;
+            match usize::try_from(code - 1).ok().and_then(|c| NAMES.get(c)) {
+                Some(name) => (*name).to_string(),
+                None => format!("S{code}"),
+            }
+        })
+        .collect()
+}
+
+/// A direction-coordinate angle in radians, from the unit its record
+/// carries.
+///
+/// A direction record stores `crval`/`cdelt` *with* a unit: a real image
+/// uses `rad` (a FITS-sourced one is converted on read), while casacore's
+/// own default template uses `'` (arcmin) with `cdelt = [-1, 1]`.  Treating
+/// that `-1'` as `-1 rad` put 0.4 rad of RA on a 0.4-pixel offset, so a
+/// default image's `tofits` did not round-trip through `open` — the written
+/// cards are in degrees and `from_fits` converts them back to radians.
+pub(crate) fn angle_to_radians(value: f64, unit: &str) -> f64 {
+    match unit.trim() {
+        "deg" | "degree" | "degrees" => value.to_radians(),
+        "'" | "arcmin" => value.to_radians() / 60.0,
+        "\"" | "arcsec" => value.to_radians() / 3600.0,
+        // `rad`, and anything unrecognised: a direction world axis is in
+        // radians by default.
+        _ => value,
+    }
+}
+
 impl CoordinateSystem {
     /// An empty system over `nimaxes` axes (an image with no coordinates
     /// yet — every axis reads as a bare pixel index).
@@ -121,47 +164,114 @@ impl CoordinateSystem {
     }
 
     /// The default system casacore builds for
-    /// `image(imagename=, shape=)` with no coordsys: a J2000/SIN direction
-    /// on the two spatial axes (unit arcmin, crpix at the centre), Stokes
-    /// I, and an LSRK spectral axis — the template DDFacet's
-    /// ClassCasaimage.createScratch creates, mutates and re-creates with.
+    /// `image(imagename=, shape=)` with no coordsys — the template
+    /// DDFacet's ClassCasaimage.createScratch creates, mutates and
+    /// re-creates with.
+    ///
+    /// The exact layout casacore's `CoordinateUtil::defaultCoords` builds,
+    /// measured against casacore for shapes of 1..5 axes:
+    ///
+    /// | numpy shape  | coordinates (casa pixel axes)              |
+    /// |--------------|--------------------------------------------|
+    /// | `(9,)`       | `spectral0` (0)                            |
+    /// | `(9,8)`      | `direction0` (0,1)                         |
+    /// | `(2,9,8)`    | `direction0`, `stokes1` (2)                |
+    /// | `(3,2,9,8)`  | `direction0`, `stokes1` (2), `spectral2` (3) |
+    /// | `(4,3,2,9,8)`| … plus `linear3` (4)                       |
+    ///
+    /// The direction coordinate is J2000/SIN in arcmin with
+    /// `crval = [0, 0]`, `cdelt = [-1, 1]` and — unlike a half-pixel image
+    /// centre — `crpix = [nx/2, ny/2]` in **integer** arithmetic, so a 5x7
+    /// image references pixel `[3, 2]` and `tofits` emits `CRPIX1=4`,
+    /// `CRPIX2=3`, not `4.5/3.5`.
+    ///
+    /// Extra axes are numbered from casa axis 2 upward: stokes, then
+    /// spectral, then generic `linear{n}` (unit km, `crpix = len/2`).
+    /// Emitting stokes/spectral unconditionally left a 2-D image with three
+    /// coordinates all claiming casa pixel axes 0 and 1, so `to_world` wrote
+    /// spectral and stokes world values over the direction ones.
     pub fn default_for(shape: &[usize]) -> CoordinateSystem {
         let ndim = shape.len();
-        // casa pixel axis p = numpy axis ndim-1-p; direction on the last
-        // two numpy axes = casa axes 0 (long/x) and 1 (lat/y).
+        let mut coords: Vec<Coordinate> = Vec::new();
+        if ndim == 0 {
+            return CoordinateSystem {
+                coords,
+                nimaxes: 0,
+                record: None,
+            };
+        }
+        // A one-dimensional image gets a lone spectral coordinate, exactly
+        // as casacore's defaultCoords does; there is no direction axis pair
+        // to put a direction coordinate on.
+        if ndim == 1 {
+            coords.push(Coordinate::Linear {
+                name: "spectral0".into(),
+                crval: vec![1.415e9],
+                crpix: vec![0.0],
+                cdelt: vec![1000.0],
+                pc: vec![1.0],
+                pixel_axes: vec![0],
+                stokes: Vec::new(),
+            });
+            return CoordinateSystem {
+                coords,
+                nimaxes: ndim,
+                record: None,
+            };
+        }
+        // casa pixel axis p = numpy axis ndim-1-p; direction sits on the
+        // last two numpy axes = casa axes 0 (long/x) and 1 (lat/y).
         let (nx, ny) = (shape[ndim - 1], shape[ndim - 2]);
-        let direction = Coordinate::Direction {
+        coords.push(Coordinate::Direction {
             name: "direction0".into(),
             crval: [0.0, 0.0],
-            crpix: [nx as f64 / 2.0, ny as f64 / 2.0],
+            crpix: [(nx / 2) as f64, (ny / 2) as f64],
             cdelt: [-1.0, 1.0],
             pc: [[1.0, 0.0], [0.0, 1.0]],
             system: "J2000".into(),
             projection: "SIN".into(),
             units: ["'".into(), "'".into()],
             pixel_axes: [0, 1],
-        };
-        let stokes = Coordinate::Linear {
-            name: "stokes1".into(),
-            crval: vec![1.0],
-            crpix: vec![0.0],
-            cdelt: vec![1.0],
-            pc: vec![1.0],
-            pixel_axes: vec![ndim - 2],
-            stokes: vec!["I".into()],
-        };
-        let spectral = Coordinate::Linear {
-            name: "spectral2".into(),
-            crval: vec![1.415e9],
-            crpix: vec![1.0],
-            cdelt: vec![1000.0],
-            pc: vec![1.0],
-            // casa axis ndim-1 (the channel axis; numpy axis 0).
-            pixel_axes: vec![ndim - 1],
-            stokes: Vec::new(),
-        };
+        });
+        for casa_axis in 2..ndim {
+            // The length of the numpy axis this casa axis corresponds to.
+            let len = shape[ndim - 1 - casa_axis];
+            // casacore numbers the trailing name by the coordinate's
+            // position in the system, not by its pixel axis: a 5-axis image
+            // gets `linear3` on casa pixel axis 4.
+            let cs_index = coords.len();
+            coords.push(match casa_axis {
+                2 => Coordinate::Linear {
+                    name: "stokes1".into(),
+                    crval: vec![1.0],
+                    crpix: vec![0.0],
+                    cdelt: vec![1.0],
+                    pc: vec![1.0],
+                    pixel_axes: vec![casa_axis],
+                    stokes: vec!["I".into()],
+                },
+                3 => Coordinate::Linear {
+                    name: "spectral2".into(),
+                    crval: vec![1.415e9],
+                    crpix: vec![1.0],
+                    cdelt: vec![1000.0],
+                    pc: vec![1.0],
+                    pixel_axes: vec![casa_axis],
+                    stokes: Vec::new(),
+                },
+                _ => Coordinate::Linear {
+                    name: format!("linear{cs_index}"),
+                    crval: vec![0.0],
+                    crpix: vec![(len / 2) as f64],
+                    cdelt: vec![1.0],
+                    pc: vec![1.0],
+                    pixel_axes: vec![casa_axis],
+                    stokes: Vec::new(),
+                },
+            });
+        }
         CoordinateSystem {
-            coords: vec![direction, stokes, spectral],
+            coords,
             nimaxes: ndim,
             record: None,
         }
@@ -372,7 +482,8 @@ impl CoordinateSystem {
             if ctype.is_empty() {
                 continue;
             }
-            let name = if ctype.contains("STOKES") {
+            let is_stokes = ctype.contains("STOKES");
+            let name = if is_stokes {
                 "stokes1".to_string()
             } else if ["FREQ", "VRAD", "VELO", "WAVE", "AWAV"]
                 .iter()
@@ -383,6 +494,16 @@ impl CoordinateSystem {
                 lin_idx += 1;
                 format!("linear{lin_idx}")
             };
+            // A FITS STOKES axis spells out one letter per plane, starting
+            // at the Stokes code in CRVAL (1 = I): the fixture's 2-plane
+            // axis with CRVAL 1 is ['I', 'Q'], as casacore reports it.
+            let stokes = if is_stokes {
+                let first = get("CRVAL", n).unwrap_or(1.0).round() as i64;
+                let count = hdr.axis_f64("NAXIS", n).unwrap_or(1.0).max(1.0) as usize;
+                stokes_letters(first, count)
+            } else {
+                Vec::new()
+            };
             coords.push(Coordinate::Linear {
                 name,
                 crval: vec![get("CRVAL", n).unwrap_or(0.0)],
@@ -390,7 +511,7 @@ impl CoordinateSystem {
                 cdelt: vec![get("CDELT", n).unwrap_or(1.0)],
                 pc: vec![1.0],
                 pixel_axes: vec![p],
-                stokes: Vec::new(),
+                stokes,
             });
         }
         CoordinateSystem {
@@ -418,13 +539,30 @@ impl CoordinateSystem {
                     cdelt,
                     pc,
                     pixel_axes,
+                    units,
                     ..
                 } => {
-                    let dx = (pixel[pixel_axes[0]] - crpix[0]) * cdelt[0];
-                    let dy = (pixel[pixel_axes[1]] - crpix[1]) * cdelt[1];
+                    if pixel_axes[0] >= self.nimaxes || pixel_axes[1] >= self.nimaxes {
+                        return Err(CoordError::AxisCount {
+                            got: pixel_axes[0].max(pixel_axes[1]) + 1,
+                            want: self.nimaxes,
+                        });
+                    }
+                    // The record's angles carry a unit; the world values
+                    // handed back are always radians.
+                    let crval_rad = [
+                        angle_to_radians(crval[0], &units[0]),
+                        angle_to_radians(crval[1], &units[1]),
+                    ];
+                    let cdelt_rad = [
+                        angle_to_radians(cdelt[0], &units[0]),
+                        angle_to_radians(cdelt[1], &units[1]),
+                    ];
+                    let dx = (pixel[pixel_axes[0]] - crpix[0]) * cdelt_rad[0];
+                    let dy = (pixel[pixel_axes[1]] - crpix[1]) * cdelt_rad[1];
                     let ix = pc[0][0] * dx + pc[0][1] * dy;
                     let iy = pc[1][0] * dx + pc[1][1] * dy;
-                    let (ra, dec) = sin_to_world(crval, ix, iy)?;
+                    let (ra, dec) = sin_to_world(&crval_rad, ix, iy)?;
                     world[pixel_axes[0]] = ra;
                     world[pixel_axes[1]] = dec;
                 }
@@ -437,6 +575,12 @@ impl CoordinateSystem {
                     ..
                 } => {
                     for (k, &pa) in pixel_axes.iter().enumerate() {
+                        if pa >= self.nimaxes {
+                            return Err(CoordError::AxisCount {
+                                got: pa + 1,
+                                want: self.nimaxes,
+                            });
+                        }
                         world[pa] = crval[k] + (pixel[pa] - crpix[k]) * cdelt[k] * pc[k];
                     }
                 }
@@ -462,10 +606,28 @@ impl CoordinateSystem {
                     cdelt,
                     pc,
                     pixel_axes,
+                    units,
                     ..
                 } => {
-                    let (ix, iy) =
-                        sin_to_intermediate(crval, world[pixel_axes[0]], world[pixel_axes[1]])?;
+                    if pixel_axes[0] >= self.nimaxes || pixel_axes[1] >= self.nimaxes {
+                        return Err(CoordError::AxisCount {
+                            got: pixel_axes[0].max(pixel_axes[1]) + 1,
+                            want: self.nimaxes,
+                        });
+                    }
+                    let crval_rad = [
+                        angle_to_radians(crval[0], &units[0]),
+                        angle_to_radians(crval[1], &units[1]),
+                    ];
+                    let cdelt_rad = [
+                        angle_to_radians(cdelt[0], &units[0]),
+                        angle_to_radians(cdelt[1], &units[1]),
+                    ];
+                    let (ix, iy) = sin_to_intermediate(
+                        &crval_rad,
+                        world[pixel_axes[0]],
+                        world[pixel_axes[1]],
+                    )?;
                     // Invert the pc rotation, then the per-axis scale.
                     let det = pc[0][0] * pc[1][1] - pc[0][1] * pc[1][0];
                     if det.abs() < f64::MIN_POSITIVE {
@@ -476,8 +638,8 @@ impl CoordinateSystem {
                     }
                     let dx = (pc[1][1] * ix - pc[0][1] * iy) / det;
                     let dy = (pc[0][0] * iy - pc[1][0] * ix) / det;
-                    pixel[pixel_axes[0]] = dx / cdelt[0] + crpix[0];
-                    pixel[pixel_axes[1]] = dy / cdelt[1] + crpix[1];
+                    pixel[pixel_axes[0]] = dx / cdelt_rad[0] + crpix[0];
+                    pixel[pixel_axes[1]] = dy / cdelt_rad[1] + crpix[1];
                 }
                 Coordinate::Linear {
                     crval,
@@ -488,6 +650,12 @@ impl CoordinateSystem {
                     ..
                 } => {
                     for (k, &pa) in pixel_axes.iter().enumerate() {
+                        if pa >= self.nimaxes {
+                            return Err(CoordError::AxisCount {
+                                got: pa + 1,
+                                want: self.nimaxes,
+                            });
+                        }
                         pixel[pa] = (world[pa] - crval[k]) / (cdelt[k] * pc[k]) + crpix[k];
                     }
                 }
@@ -564,12 +732,12 @@ impl CoordinateSystem {
         // CoordinateSystem::restore reads back after the coordinates, in
         // coordinate order (each coordinate's casa pixel axes).
         for (idx, c) in self.coords.iter().enumerate() {
-            let paxes: Vec<i64> = match c {
+            let paxes: Vec<i32> = match c {
                 Coordinate::Direction { pixel_axes, .. } => {
-                    pixel_axes.iter().map(|&p| p as i64).collect()
+                    pixel_axes.iter().map(|&p| p as i32).collect()
                 }
                 Coordinate::Linear { pixel_axes, .. } => {
-                    pixel_axes.iter().map(|&p| p as i64).collect()
+                    pixel_axes.iter().map(|&p| p as i32).collect()
                 }
             };
             let worldreplace = match c {
@@ -577,11 +745,15 @@ impl CoordinateSystem {
                 Coordinate::Linear { crval, .. } => crval.clone(),
             };
             let n = paxes.len();
+            // `Vector<Int>` on disk, as casacore writes it: a Double/Int64
+            // here is not what `from_record` reads back, and a pixelmap that
+            // fails to parse silently collapses every non-direction
+            // coordinate onto casa axis 0.
             rec.set(
                 &format!("worldmap{idx}"),
                 RecordValue::Array(ArrayValue {
                     shape: vec![n as u32],
-                    data: ArrayData::Int64(paxes.clone()),
+                    data: ArrayData::Int(paxes.clone()),
                 }),
             );
             rec.set(
@@ -595,7 +767,7 @@ impl CoordinateSystem {
                 &format!("pixelmap{idx}"),
                 RecordValue::Array(ArrayValue {
                     shape: vec![n as u32],
-                    data: ArrayData::Int64(paxes),
+                    data: ArrayData::Int(paxes),
                 }),
             );
             rec.set(
@@ -652,22 +824,14 @@ impl CoordinateSystem {
                         .get("crval")
                         .and_then(f64s)
                         .unwrap_or_else(|| vec![1.0]);
-                    let n = crval.len().max(1);
-                    let letters: Vec<String> = crval
-                        .iter()
-                        .map(|&v| {
-                            ["I", "Q", "U", "V"]
-                                .get(v.round() as usize)
-                                .unwrap_or(&"I")
-                                .to_string()
-                        })
-                        .collect();
-                    let letters = if letters.is_empty() {
+                    // Each `crval` entry is a Stokes *code* (1 = I, 2 = Q,
+                    // ...), so the first plane of a `crval = 1` axis is I.
+                    // Indexing the table with the code itself labelled it Q.
+                    let letters: Vec<String> = if crval.is_empty() {
                         vec!["I".to_string()]
                     } else {
-                        letters
+                        stokes_letters(crval[0].round() as i64, crval.len())
                     };
-                    let _ = n;
                     stokes.set(
                         "axes",
                         RecordValue::Array(ArrayValue {
@@ -934,20 +1098,38 @@ impl CoordinateSystem {
             .collect()
     }
 
+    /// Mutating setters must invalidate the cached raw record, which is a
+    /// snapshot of the coordinates as they were read.
+    ///
+    /// Without this, `set_increment` moved what `get_increment()` reported
+    /// but `dict()`/`_csys` kept returning the old numbers and
+    /// `image(imagename=, coordsys=...)` persisted the *old* grid — so
+    /// DDFacet's `ClassCasaImage` retargeting (`coordinates()` →
+    /// `set_increment` → `image(coordsys=...)`) silently did nothing.
+    fn invalidate_record(&mut self) {
+        self.record = None;
+    }
+
     pub fn set_increments(&mut self, inc: &[Vec<f64>]) {
+        let mut changed = false;
         for (c, v) in self.coords.iter_mut().zip(inc) {
             match c {
                 Coordinate::Direction { cdelt, .. } => {
-                    if v.len() == 2 {
+                    if v.len() == 2 && *cdelt != [v[0], v[1]] {
                         *cdelt = [v[0], v[1]];
+                        changed = true;
                     }
                 }
                 Coordinate::Linear { cdelt, .. } => {
-                    if v.len() == cdelt.len() {
+                    if v.len() == cdelt.len() && *cdelt != *v {
                         *cdelt = v.clone();
+                        changed = true;
                     }
                 }
             }
+        }
+        if changed {
+            self.invalidate_record();
         }
     }
 
@@ -962,19 +1144,25 @@ impl CoordinateSystem {
     }
 
     pub fn set_reference_values(&mut self, vals: &[Vec<f64>]) {
+        let mut changed = false;
         for (c, v) in self.coords.iter_mut().zip(vals) {
             match c {
                 Coordinate::Direction { crval, .. } => {
-                    if v.len() == 2 {
+                    if v.len() == 2 && *crval != [v[0], v[1]] {
                         *crval = [v[0], v[1]];
+                        changed = true;
                     }
                 }
                 Coordinate::Linear { crval, .. } => {
-                    if v.len() == crval.len() {
+                    if v.len() == crval.len() && *crval != *v {
                         *crval = v.clone();
+                        changed = true;
                     }
                 }
             }
+        }
+        if changed {
+            self.invalidate_record();
         }
     }
 
@@ -989,19 +1177,25 @@ impl CoordinateSystem {
     }
 
     pub fn set_reference_pixels(&mut self, vals: &[Vec<f64>]) {
+        let mut changed = false;
         for (c, v) in self.coords.iter_mut().zip(vals) {
             match c {
                 Coordinate::Direction { crpix, .. } => {
-                    if v.len() == 2 {
+                    if v.len() == 2 && *crpix != [v[0], v[1]] {
                         *crpix = [v[0], v[1]];
+                        changed = true;
                     }
                 }
                 Coordinate::Linear { crpix, .. } => {
-                    if v.len() == crpix.len() {
+                    if v.len() == crpix.len() && *crpix != *v {
                         *crpix = v.clone();
+                        changed = true;
                     }
                 }
             }
+        }
+        if changed {
+            self.invalidate_record();
         }
     }
 }
@@ -1175,5 +1369,153 @@ mod tests {
         for (a, b) in wf.iter().zip(&wr) {
             assert!((a - b).abs() < 1e-15, "fits {a} vs record {b}");
         }
+    }
+
+    /// The name/`pixel_axes` layout of a default system, per shape.
+    fn default_layout(shape: &[usize]) -> Vec<(String, Vec<usize>)> {
+        CoordinateSystem::default_for(shape)
+            .coords
+            .iter()
+            .map(|c| match c {
+                Coordinate::Direction {
+                    name, pixel_axes, ..
+                } => (name.clone(), pixel_axes.to_vec()),
+                Coordinate::Linear {
+                    name, pixel_axes, ..
+                } => (name.clone(), pixel_axes.clone()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn default_coordsys_matches_casacore_layout() {
+        // casacore's `CoordinateUtil::defaultCoords`, measured live for
+        // 1..5 axis images: the coordinate names and the casa pixel axes
+        // each one occupies.  Emitting stokes/spectral for a 2-D image put
+        // three coordinates on pixel axes 0/1 and made `tofits` write the
+        // spectral and stokes world values over the direction ones.
+        assert_eq!(default_layout(&[9]), [("spectral0".into(), vec![0])]);
+        assert_eq!(default_layout(&[9, 8]), [("direction0".into(), vec![0, 1])]);
+        assert_eq!(
+            default_layout(&[2, 9, 8]),
+            [
+                ("direction0".into(), vec![0, 1]),
+                ("stokes1".into(), vec![2])
+            ]
+        );
+        assert_eq!(
+            default_layout(&[3, 2, 9, 8]),
+            [
+                ("direction0".into(), vec![0, 1]),
+                ("stokes1".into(), vec![2]),
+                ("spectral2".into(), vec![3]),
+            ]
+        );
+        // A 5th casa axis gets a generic linear coordinate, numbered by its
+        // position in the coordinate system (3), not by its pixel axis (4).
+        assert_eq!(
+            default_layout(&[4, 3, 2, 9, 8]),
+            [
+                ("direction0".into(), vec![0, 1]),
+                ("stokes1".into(), vec![2]),
+                ("spectral2".into(), vec![3]),
+                ("linear3".into(), vec![4]),
+            ]
+        );
+    }
+
+    #[test]
+    fn default_direction_crpix_is_integer_half_shape() {
+        // casacore's default reference pixel is `shape/2` in integer
+        // arithmetic, not a half-pixel image centre: a 5x7 image references
+        // pixel (3, 2), so `tofits` emits CRPIX1=4 CRPIX2=3 (1-based).
+        let dir = |shape: &[usize]| match &CoordinateSystem::default_for(shape).coords[0] {
+            Coordinate::Direction {
+                crval,
+                crpix,
+                cdelt,
+                units,
+                ..
+            } => (*crval, *crpix, *cdelt, units.clone()),
+            other => panic!("expected a direction coordinate, got {other:?}"),
+        };
+        let (crval, crpix, cdelt, units) = dir(&[5, 7]);
+        assert_eq!(crval, [0.0, 0.0]);
+        assert_eq!(crpix, [3.0, 2.0]);
+        assert_eq!(cdelt, [-1.0, 1.0]);
+        assert_eq!(units, ["'".to_string(), "'".to_string()]);
+        // Odd/even shapes both floor.
+        assert_eq!(dir(&[9, 8]).1, [4.0, 4.0]);
+        assert_eq!(dir(&[2, 5]).1, [2.0, 1.0]);
+    }
+
+    #[test]
+    fn default_linear_crpix_follows_the_axis_length() {
+        // `linear3` sits on casa axis 4 = numpy axis 0; casacore's crpix for
+        // it is that axis length / 2 (4 -> 2, 3 -> 1).
+        let linear_crpix = |shape: &[usize]| match CoordinateSystem::default_for(shape)
+            .coords
+            .iter()
+            .find(|c| matches!(c, Coordinate::Linear { name, .. } if name == "linear3"))
+        {
+            Some(Coordinate::Linear { crpix, .. }) => crpix.clone(),
+            other => panic!("no linear3 in {shape:?}: {other:?}"),
+        };
+        assert_eq!(linear_crpix(&[4, 3, 2, 9, 8]), vec![2.0]);
+        assert_eq!(linear_crpix(&[3, 2, 1, 9, 8]), vec![1.0]);
+    }
+
+    #[test]
+    fn default_image_axes_annotations_match_casacore() {
+        // casacore annotates every coordinate in `dict()` with
+        // `_image_axes`: the numpy-order axes it spans.  For a (3,2,9,8)
+        // image that is direction [2,3], stokes [1], spectral [0].
+        let cs = CoordinateSystem::default_for(&[3, 2, 9, 8]);
+        let rec = cs.to_record();
+        let axes = |name: &str| -> Vec<i64> {
+            match rec.get(name) {
+                Some(RecordValue::Record(sub)) => match sub.get("_image_axes") {
+                    Some(RecordValue::Array(a)) => match &a.data {
+                        ArrayData::Int64(v) => v.clone(),
+                        other => panic!("{name}: unexpected dtype {other:?}"),
+                    },
+                    other => panic!("{name}: no _image_axes: {other:?}"),
+                },
+                other => panic!("{name}: no record: {other:?}"),
+            }
+        };
+        assert_eq!(axes("direction0"), [2, 3]);
+        assert_eq!(axes("stokes1"), [1]);
+        assert_eq!(axes("spectral2"), [0]);
+    }
+
+    #[test]
+    fn default_image_axes_survive_a_record_round_trip() {
+        // The annotation is derived from the stored `pixelmapN`, so it must
+        // be unchanged after the record is written and read back — the path
+        // a freshly created image takes through `create_casa_image`/`open`.
+        let cs = CoordinateSystem::default_for(&[3, 2, 9, 8]);
+        let rec = cs.raw_record();
+        let back = CoordinateSystem::from_record(&rec, 4).unwrap();
+        let layout: Vec<(String, Vec<usize>)> = back
+            .coords
+            .iter()
+            .map(|c| match c {
+                Coordinate::Direction {
+                    name, pixel_axes, ..
+                } => (name.clone(), pixel_axes.to_vec()),
+                Coordinate::Linear {
+                    name, pixel_axes, ..
+                } => (name.clone(), pixel_axes.clone()),
+            })
+            .collect();
+        assert_eq!(
+            layout,
+            [
+                ("direction0".to_string(), vec![0, 1]),
+                ("stokes1".to_string(), vec![2]),
+                ("spectral2".to_string(), vec![3]),
+            ]
+        );
     }
 }

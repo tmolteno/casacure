@@ -3441,10 +3441,16 @@ impl WritableTable {
                         self.clear_pending(col);
                     }
                 }
-                "TiledColumnStMan" | "TiledShapeStMan" => {
+                "TiledColumnStMan" | "TiledShapeStMan" | "TiledCellStMan" => {
                     // One array column per TSM DM (build_tsm_data's
                     // invariant) — patch its tile file in place when
                     // possible, else rebuild it from on-disk + pending.
+                    // TiledCellStMan is the layout casacore gives a
+                    // single-row image's `map` column, so a `putdata` into
+                    // an image casacore (rather than casacure) created lands
+                    // here; without this arm it was rejected outright with
+                    // "cannot preserve-rewrite data-manager type
+                    // TiledCellStMan".
                     let col = cols[0];
                     if self
                         .patch_tsm_column(dir, seq, dat.header.big_endian, col, nrow)?

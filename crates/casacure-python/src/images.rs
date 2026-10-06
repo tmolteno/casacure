@@ -51,6 +51,15 @@ impl image {
         // Create form: image(imagename=, shape= [, coordsys=]).
         if let (Some(name_arg), Some(shape)) = (imagename, &shape) {
             let path = path_from(name_arg)?;
+            // pyrap's contract: `overwrite=False` refuses to replace an
+            // existing image.  Ignoring the flag silently destroyed a
+            // caller's cube; DDFacet's ClassCasaImage passes it explicitly.
+            if !overwrite && path.exists() {
+                return Err(PyRuntimeError::new_err(format!(
+                    "file {} already exists and should not be overwritten",
+                    path.display()
+                )));
+            }
             let csys = match coordsys {
                 Some(c) => {
                     let obj: PyRef<'_, coordinates> = c.extract()?;
