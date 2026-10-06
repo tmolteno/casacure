@@ -1,6 +1,7 @@
 .git
 .venv
 .venv-ft
+.zcode
 target
 tests/fixtures
 __pycache__
