@@ -31,6 +31,8 @@ pub enum ImageError {
         path: std::path::PathBuf,
         msg: String,
     },
+    #[error(transparent)]
+    Write(#[from] crate::table::WriteTableError),
 }
 
 /// An opened image: either a CASA image table or a FITS file.

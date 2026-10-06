@@ -107,6 +107,16 @@ fn field_str(rec: &TableRecord, field: &str) -> Option<String> {
 const COORD_PREFIXES: [&str; 4] = ["direction", "stokes", "spectral", "linear"];
 
 impl CoordinateSystem {
+    /// An empty system over `nimaxes` axes (an image with no coordinates
+    /// yet — every axis reads as a bare pixel index).
+    pub fn empty(nimaxes: usize) -> CoordinateSystem {
+        CoordinateSystem {
+            coords: Vec::new(),
+            nimaxes,
+            record: None,
+        }
+    }
+
     /// Parse a CASA image's `coords` keyword record.  `nimaxes` is the
     /// image's axis count (the raster cell's dimensions).
     pub fn from_record(rec: &TableRecord, nimaxes: usize) -> Result<CoordinateSystem, CoordError> {
@@ -438,10 +448,7 @@ impl CoordinateSystem {
     /// casacore adds to every coordinate), or a synthesised record for
     /// FITS-sourced systems.
     pub fn to_record(&self) -> TableRecord {
-        let mut rec = match &self.record {
-            Some(rec) => rec.clone(),
-            None => self.synthesise_record(),
-        };
+        let mut rec = self.raw_record();
         // casacore annotates each coordinate with the image axes it spans
         // (numpy/pyrap order, ascending) and their sizes.
         for c in &self.coords {
@@ -459,8 +466,6 @@ impl CoordinateSystem {
                 .collect();
             let mut sorted = image_axes.clone();
             sorted.sort_unstable();
-            let sizes: Vec<i64> = sorted.iter().map(|_| 0).collect();
-            let _ = sizes;
             if let Some(pos) = rec.desc.fields.iter().position(|f| f.name == name) {
                 if let Some(RecordValue::Record(sub)) = rec.values.get_mut(pos) {
                     sub.set(
@@ -474,6 +479,16 @@ impl CoordinateSystem {
             }
         }
         rec
+    }
+
+    /// The coords record as it is stored on disk (no runtime
+    /// `_image_axes` annotations): the record the image was opened with,
+    /// or a synthesised one for FITS-sourced systems.
+    pub fn raw_record(&self) -> TableRecord {
+        match &self.record {
+            Some(rec) => rec.clone(),
+            None => self.synthesise_record(),
+        }
     }
 
     fn synthesise_record(&self) -> TableRecord {

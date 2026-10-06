@@ -12,7 +12,8 @@ use pyo3::types::{PyAny, PyDict, PyList, PyTuple};
 use crate::convert;
 use numpy::PyArray1;
 
-use casacure::images::{Coordinate, CoordinateSystem, Image};
+use casacure::images as cimg;
+use casacure::images::{Coordinate, CoordinateSystem, Image, ImageMeta};
 
 fn err<E: std::fmt::Display>(e: E) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
@@ -23,6 +24,7 @@ fn err<E: std::fmt::Display>(e: E) -> PyErr {
 #[pyclass(name = "image")]
 pub struct image {
     inner: RwLock<Image>,
+    path: std::path::PathBuf,
     shape: Vec<usize>,
     name: String,
 }
@@ -33,35 +35,54 @@ impl image {
     #[pyo3(signature = (imagename = None, shape = None, coordsys = None, overwrite = true))]
     #[allow(unused_variables)]
     fn new(
+        py: Python<'_>,
         imagename: Option<&Bound<'_, PyAny>>,
         shape: Option<Vec<usize>>,
         coordsys: Option<&Bound<'_, PyAny>>,
         overwrite: bool,
     ) -> PyResult<Self> {
-        // Creation (imagename + shape [+ coordsys]) is Phase 2 of the port
-        // (it needs the write path: raster table + coords records + FITS
-        // writer); every live DDFacet read path only opens.
-        if shape.is_some() {
-            return Err(PyNotImplementedError::new_err(
-                "casacure.images: image creation is not implemented yet (issue #14 phase 2)",
-            ));
+        let path_from = |arg: &Bound<'_, PyAny>| -> PyResult<std::path::PathBuf> {
+            let s: String = if let Ok(s) = arg.extract::<String>() {
+                s
+            } else {
+                arg.call_method0("__fspath__")?.extract()?
+            };
+            Ok(casacure::table::absolute_dir(std::path::Path::new(&s)))
+        };
+        // Create form: image(imagename=, shape= [, coordsys=]).
+        if let (Some(name_arg), Some(shape)) = (imagename, &shape) {
+            let path = path_from(name_arg)?;
+            let csys = match coordsys {
+                Some(c) => {
+                    let obj: PyRef<'_, coordinates> = c.extract()?;
+                    let csys = obj.csys.read().unwrap().clone();
+                    csys
+                }
+                None => CoordinateSystem::empty(shape.len()),
+            };
+            cimg::create_casa_image(&path, shape, &csys, &ImageMeta::default()).map_err(err)?;
+            let opened = Image::open(&path).map_err(err)?;
+            let shape = opened.shape().to_vec();
+            let name = opened.path().display().to_string();
+            return Ok(image {
+                inner: RwLock::new(opened),
+                path,
+                shape,
+                name,
+            });
         }
         let Some(path_arg) = imagename else {
             return Err(PyValueError::new_err(
                 "image() needs a path (or imagename= + shape=)",
             ));
         };
-        let path_str: String = if let Ok(s) = path_arg.extract::<String>() {
-            s
-        } else {
-            path_arg.call_method0("__fspath__")?.extract()?
-        };
-        let path = casacure::table::absolute_dir(std::path::Path::new(&path_str));
+        let path = path_from(path_arg)?;
         let opened = Image::open(&path).map_err(err)?;
         let shape = opened.shape().to_vec();
         let name = opened.path().display().to_string();
         Ok(image {
             inner: RwLock::new(opened),
+            path,
             shape,
             name,
         })
@@ -141,23 +162,31 @@ impl image {
         format!("<image '{}' shape {:?}>", self.name, self.shape)
     }
 
-    // Phase 2 of the port (write path).
-    fn putdata(&self, _data: &Bound<'_, PyAny>) -> PyResult<()> {
-        Err(PyNotImplementedError::new_err(
-            "casacure.images: putdata is not implemented yet (issue #14 phase 2)",
-        ))
+    /// Replace the raster (pyrap `putdata`); the opened snapshot is
+    /// refreshed so later reads see the new data.
+    fn putdata(&self, data: &Bound<'_, PyAny>) -> PyResult<()> {
+        let rec = convert::pyobject_to_record(data.py(), data)?;
+        let casacure::record::RecordValue::Array(arr) = rec else {
+            return Err(PyValueError::new_err("putdata expects an array"));
+        };
+        cimg::put_data(&self.path, &arr).map_err(err)?;
+        let opened = Image::open(&self.path).map_err(err)?;
+        *self.inner.write().unwrap() = opened;
+        Ok(())
     }
 
-    fn saveas(&self, _filename: &str) -> PyResult<()> {
-        Err(PyNotImplementedError::new_err(
-            "casacure.images: saveas is not implemented yet (issue #14 phase 2)",
-        ))
+    /// Copy this image to a new CASA image table (pyrap `saveas`).
+    fn saveas(&self, filename: &str) -> PyResult<()> {
+        let img = self.inner.read().unwrap();
+        let path = casacure::table::absolute_dir(std::path::Path::new(filename));
+        cimg::saveas(&img, &path).map_err(err)
     }
 
-    fn tofits(&self, _filename: &str) -> PyResult<()> {
-        Err(PyNotImplementedError::new_err(
-            "casacure.images: tofits is not implemented yet (issue #14 phase 2)",
-        ))
+    /// Export as a FITS primary-image cube (pyrap `tofits`).
+    fn tofits(&self, filename: &str) -> PyResult<()> {
+        let img = self.inner.read().unwrap();
+        let path = casacure::table::absolute_dir(std::path::Path::new(filename));
+        cimg::tofits(&img, &path).map_err(err)
     }
 
     fn regrid(&self, _axes: &Bound<'_, PyAny>, _coordsys: &Bound<'_, PyAny>) -> PyResult<()> {

@@ -212,6 +212,80 @@ def test_multi_row_tsmcell_table():
     t.close()
 
 
-def test_creation_not_implemented_yet(tmp_path):
-    with pytest.raises(NotImplementedError):
-        ct.image(imagename=str(tmp_path / "x.image"), shape=(2, 2, 8, 8))
+def test_create_putdata_roundtrip(tmp_path):
+    """killMS MakeModelImage's pattern: saveas a template, fill, putdata."""
+    tmpl = ct.image(os.path.join(FIXTURES, manifest()["tables"]["image"]["path"]))
+    out = str(tmp_path / "model.image")
+    tmpl.saveas(out)
+    im = ct.image(out)
+    assert list(im.shape()) == manifest()["tables"]["image"]["shape"]
+    np.testing.assert_array_equal(im.getdata(), tmpl.getdata())
+    data = im.getdata()
+    data.fill(0)
+    data[0, 0, 3, 4] = 42.0
+    data[1, 1, 7, 9] = -7.5
+    im.putdata(data)
+    np.testing.assert_array_equal(ct.image(out).getdata(), data)
+    # Coordinates and beam survive the copy + write.
+    tw, twt = im.toworld((0, 0, 3, 4)), tmpl.toworld((0, 0, 3, 4))
+    for a, b in zip(tw, twt):
+        assert a == pytest.approx(b, abs=1e-15)
+    assert os.path.isdir(os.path.join(out, "logtable"))
+
+
+@needs_casacore
+def test_casacore_reads_casacure_created_image(tmp_path):
+    from casacore.images import image as cc_image
+
+    tmpl = ct.image(os.path.join(FIXTURES, manifest()["tables"]["image"]["path"]))
+    out = str(tmp_path / "c.image")
+    tmpl.saveas(out)
+    data = tmpl.getdata()
+    data.fill(0)
+    data[1, 0, 2, 5] = 9.75
+    ct.image(out).putdata(data)
+
+    cc = cc_image(out)
+    np.testing.assert_array_equal(cc.getdata(), data)
+    cc_tw = cc.toworld((0, 0, 2, 5))
+    tmpl_tw = tmpl.toworld((0, 0, 2, 5))
+    for a, b in zip(cc_tw, tmpl_tw):
+        assert a == pytest.approx(b, abs=1e-15)
+
+
+def test_create_with_coordsys_object(tmp_path):
+    """DDFacet ClassCasaImage's create: coordsys from another image,
+    optionally mutated through the get/set surface."""
+    src = ct.image(os.path.join(FIXTURES, manifest()["tables"]["image"]["path"]))
+    c = src.coordinates()
+    out = str(tmp_path / "scratch.image")
+    ct.image(imagename=out, shape=(2, 1, 6, 7), coordsys=c)
+    im = ct.image(out)
+    assert list(im.shape()) == [2, 1, 6, 7]
+    # The created image carries the passed coordsys (same cdelt).
+    assert im.coordinates().dict()["direction0"]["cdelt"] == pytest.approx(
+        src.coordinates().dict()["direction0"]["cdelt"]
+    )
+
+
+@needs_casacore
+def test_tofits_read_back_by_casacore_and_astropy(tmp_path):
+    from astropy.io import fits
+    from casacore.images import image as cc_image
+
+    src = ct.image(os.path.join(FIXTURES, manifest()["tables"]["image"]["path"]))
+    out = str(tmp_path / "export.fits")
+    src.tofits(out)
+
+    cc = cc_image(out)
+    np.testing.assert_array_equal(cc.getdata(), src.getdata())
+    for a, b in zip(cc.toworld((1, 1, 2, 3)), src.toworld((1, 1, 2, 3))):
+        assert a == pytest.approx(b, abs=1e-12)
+
+    with fits.open(out) as hdul:
+        h = hdul[0].header
+        assert [h[f"CTYPE{i}"] for i in range(1, 5)] == [
+            "RA---SIN", "DEC--SIN", "STOKES", "FREQ",
+        ]
+        assert h["BMAJ"] == pytest.approx(3.5e-3)
+        np.testing.assert_array_equal(hdul[0].data, src.getdata())
