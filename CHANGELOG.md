@@ -14,7 +14,7 @@ subtasks are moved here.
   installs `astropy` (the new image fixtures need it in
   `make_fixtures.py`).
 
-## [3.8.23] - 2026-10-06
+## [3.8.24] - 2026-10-06
 
 ### Added
 

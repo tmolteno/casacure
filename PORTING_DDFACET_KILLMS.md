@@ -17,7 +17,7 @@ native extension read the MS directly.
   `posangle`, `measure`, `get_value`) in `ClassFITSBeam` / `GiveDate` need a
   new `casacure.measures` subset. Everything else that looks like measures
   use is already astropy or pyephem.
-- **Images**: `pyrap.images` **shipped as `casacure.images`** (3.8.23):
+- **Images**: `pyrap.images` **shipped as `casacure.images`** (3.8.24):
   the `image` class opening CASA image tables and FITS cubes, getdata/
   putdata/saveas/tofits/regrid, coordinates with SIN toworld/topixel, and
   the restoring beam — the surface DDFacet (35 imports) and killMS use.

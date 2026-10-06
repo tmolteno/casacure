@@ -853,7 +853,7 @@ still unsupported (per-column bucket offsets not applied), as before.
 
 ## 2026-10-06: casacure.images shipped (issue #14), release procedure = `invoke release`
 
-`casacure.images` (the pyrap.images surface) shipped in 3.8.23: image opens
+`casacure.images` (the pyrap.images surface) shipped in 3.8.24: image opens
 of CASA image tables + FITS cubes, getdata/putdata/saveas/tofits/regrid,
 coordsys with SIN toworld/topixel + the pyrap dict/get-set/_csys surface,
 imageinfo beams; TiledCellStMan read support underneath plus a hand-rolled
@@ -868,6 +868,6 @@ it — verified in the checkouts with real python-casacore cross-checks
 (casacore opens casacure-created images bit-exactly, world coords match).
 Commits ecaf5dc..e2fba25 + the docs/record fixes; tests/test_images.py
 passes both with and without real casacore; `invoke release --version
-3.8.23` is the release path. **The release procedure is `invoke release`**
+3.8.24` is the release path. **The release procedure is `invoke release`**
 (tasks.py: Docker CI gate + bump + tag + push + publish-wait); never
 hand-tag.
