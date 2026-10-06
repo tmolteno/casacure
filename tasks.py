@@ -9,8 +9,9 @@ Usage (from the casacure repo root, with a venv that has invoke + plumbum):
 
     invoke version                      # show the current + next versions
     invoke test                         # the pre-release tests (Docker build + suite)
-    invoke release                      # bump version, run tests, tag + push
-    invoke release --version 3.8.21     # explicit version (skips the auto-bump)
+    invoke release                      # bump patch, run tests, tag + push
+    invoke release --no-bump            # tag the current version as-is
+    invoke release --version 3.8.21     # explicit version (implies --no-bump)
 
 The three CI jobs (`.github/workflows/ci.yml`) are reproduced locally:
   * test         — cargo test / fmt / clippy / maturin build / pytest tests/
@@ -148,9 +149,9 @@ def _run_pytest(extra_args: list[str] | None = None) -> None:
 def version(c) -> None:
     """Show the versions the release would tag (the tree's pyproject version)."""
     v = _read_version()
-    print(f"casacure: pyproject {v}  ->  would tag v{v} (or v{_bump_patch(v)} with --bump)")
-    print("(the convention is to bump CHANGELOG.md + pyproject in the tree first; "
-          "--version overrides the tag)")
+    print(f"casacure: pyproject {v}  ->  would bump to {_bump_patch(v)} and tag v{_bump_patch(v)}")
+    print(f"           (or tag v{v} as-is with --no-bump; "
+          f"--version X.Y.Z tags that exact version)")
 
 
 @task
@@ -197,13 +198,15 @@ def test(c,
 @task(pre=[test])
 def release(c,
             version: str | None = None,
-            bump: bool = False,
+            bump: bool = True,
             sanitizers: bool = False,
             freethreaded: bool = False,
             all_jobs: bool = False) -> None:
     """Run the full casacure release chain.
 
-    1. (optional) bump the patch version in pyproject/Cargo and commit.
+    1. bump the patch version in pyproject/Cargo and commit (default; skip
+       with --no-bump, or override with --version X.Y.Z which implies
+       --no-bump since the tag is given explicitly).
     2. run the pre-release tests in Docker (the `test` CI gate; --sanitizers
        / --freethreaded / --all-jobs add the other CI jobs).
     3. commit CHANGELOG.md + pyproject/Cargo (the release commit).
@@ -213,6 +216,11 @@ def release(c,
 
     Idempotent: a tag already on origin is verified and skipped, not re-pushed.
     """
+    # An explicit --version means "tag exactly this"; the tree's version must
+    # not be touched or the tag and tree would drift apart.
+    if version is not None:
+        bump = False
+
     if bump:
         new = _bump_patch(_read_version())
         print(f"=== bumping version to {new}")
