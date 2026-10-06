@@ -39,7 +39,7 @@ _WRITE = r"""
 import sys, time
 import numpy as np, dask, dask.array as da, xarray as xr
 import casacore
-assert "casacure" in casacore.__file__ or "shim" in casacore.__file__, casacore.__file__
+assert getattr(casacore, "__casacure_shim__", False), casacore.__file__
 from daskms import xds_to_table
 path, nrow, nchan, ncorr, chunk, mode = sys.argv[1:7]
 nrow, nchan, ncorr, chunk = int(nrow), int(nchan), int(ncorr), int(chunk)
@@ -95,7 +95,7 @@ for name, expected in want.items():
     got = t.getcol(name)
     assert got.shape == expected.shape, (name, got.shape, expected.shape)
     assert np.array_equal(got, expected), f"{name} differs at rows {np.flatnonzero((got != expected).reshape(nrow, -1).any(axis=1))[:5]}"
-print("VERIFIED", casacore.__file__)
+print("VERIFIED", getattr(casacore, "__casacure_shim__", False))
 """
 
 
@@ -184,7 +184,10 @@ def test_real_casacore_reads_the_written_table(tmp_path, mode):
     path, _, _ = _write(tmp_path, 16_000 + 777, mode)   # a partial last chunk
     rc, out, _ = _run(_VERIFY, [path, str(16_000 + 777), str(NCHAN), str(NCORR)],
                       _casacore_env())
-    assert rc == 0 and "VERIFIED" in out and "casacure" not in out.split("VERIFIED")[1], out
+    # The reader must be the real python-casacore, not the shim: the marker
+    # is the only reliable signal (matching "casacure" against the module
+    # path also matches this checkout's own directory name).
+    assert rc == 0 and "VERIFIED False" in out, out
     # and casacure reads it back the same way
     rc, out, _ = _run(_VERIFY, [path, str(16_000 + 777), str(NCHAN), str(NCORR)],
                       _casacure_env())

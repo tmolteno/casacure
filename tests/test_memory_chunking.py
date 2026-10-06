@@ -88,7 +88,7 @@ _OPEN_WORKER = r"""
 import sys
 import casacore
 want = sys.argv[1] == "casacure"
-_is_casacure = ("casacure" in casacore.__file__) or ("shim" in casacore.__file__)
+_is_casacure = getattr(casacore, "__casacure_shim__", False)
 if _is_casacure != want:
     raise SystemExit(
         f"backend mismatch: wanted casacure={want} but "
@@ -144,7 +144,7 @@ from daskms import xds_from_table, xds_to_table
 # casacure reaches `casacore` via the tests/shim redirect or via dask-ms's
 # DASK_MS_BACKEND=casacure alias; both are identifiable by the root module's
 # file path (the `tables` submodule may be a lazy proxy without __file__).
-_is_casacure = ("casacure" in casacore.__file__) or ("shim" in casacore.__file__)
+_is_casacure = getattr(casacore, "__casacure_shim__", False)
 if _is_casacure != want_casacure:
     raise SystemExit(
         f"backend mismatch: wanted casacure={want_casacure} but "

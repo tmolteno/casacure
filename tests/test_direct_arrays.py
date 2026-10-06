@@ -101,7 +101,7 @@ print("WRITTEN")
 
 _CASACURE_GROWS = _COMMON + r"""
 import casacore
-assert "casacure" in casacore.__file__ or "shim" in casacore.__file__, casacore.__file__
+assert getattr(casacore, "__casacure_shim__", False), casacore.__file__
 path, nrow, chunk = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 t = table(path, desc(), nrow=0, ack=False)
 for start in range(0, nrow, chunk):

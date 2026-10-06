@@ -52,7 +52,7 @@ def _env(casacure_backend):
 
 _BACKEND_CHECK = """
 import casacore
-_is_cure = ("casacure" in casacore.__file__) or ("shim" in casacore.__file__)
+_is_cure = getattr(casacore, "__casacure_shim__", False)
 assert _is_cure == {want}, casacore.__file__
 """
 
