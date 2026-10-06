@@ -160,198 +160,11 @@ impl CoordinateSystem {
             pixel_axes: vec![ndim - 1],
             stokes: Vec::new(),
         };
-        let mut csys = CoordinateSystem {
+        CoordinateSystem {
             coords: vec![direction, stokes, spectral],
             nimaxes: ndim,
             record: None,
-        };
-        // Enrich the synthesised spectral record to what casacore's
-        // SpectralCoordinate::restore expects (probed default template).
-        let mut rec = csys.synthesise_record();
-        // The per-coordinate world/pixel axis mappings and replacements
-        // CoordinateSystem::restore reads back after the coordinates.
-        type AxisMaps = (
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-            Vec<f64>,
-            Vec<f64>,
-            Vec<i64>,
-        );
-        let maps: [AxisMaps; 3] = [
-            (
-                "worldmap0",
-                "worldreplace0",
-                "pixelmap0",
-                "pixelreplace0",
-                vec![0.0305432619099, -0.00785398163397],
-                vec![0.0, 0.0],
-                vec![0, 1],
-            ),
-            (
-                "worldmap1",
-                "worldreplace1",
-                "pixelmap1",
-                "pixelreplace1",
-                vec![1.0],
-                vec![0.0],
-                vec![2],
-            ),
-            (
-                "worldmap2",
-                "worldreplace2",
-                "pixelmap2",
-                "pixelreplace2",
-                vec![1.415e9],
-                vec![0.0],
-                vec![3],
-            ),
-        ];
-        for (wm, wr, pm, pr, world, pix, map) in maps {
-            rec.set(
-                wm,
-                RecordValue::Array(ArrayValue {
-                    shape: vec![map.len() as u32],
-                    data: ArrayData::Int64(map.clone()),
-                }),
-            );
-            rec.set(
-                wr,
-                RecordValue::Array(ArrayValue {
-                    shape: vec![world.len() as u32],
-                    data: ArrayData::Double(world),
-                }),
-            );
-            rec.set(
-                pm,
-                RecordValue::Array(ArrayValue {
-                    shape: vec![map.len() as u32],
-                    data: ArrayData::Int64(map),
-                }),
-            );
-            rec.set(
-                pr,
-                RecordValue::Array(ArrayValue {
-                    shape: vec![pix.len() as u32],
-                    data: ArrayData::Double(pix),
-                }),
-            );
         }
-        // ObsInfo.
-        rec.set("telescope", RecordValue::String("UNKNOWN".into()));
-        rec.set("observer", RecordValue::String("UNKNOWN".into()));
-        let mut obsdate = TableRecord::default();
-        obsdate.set("type", RecordValue::String("epoch".into()));
-        obsdate.set("refer", RecordValue::String("UTC".into()));
-        let mut om0 = TableRecord::default();
-        om0.set("value", RecordValue::Double(0.0));
-        om0.set("unit", RecordValue::String("d".into()));
-        obsdate.set("m0", RecordValue::Record(om0));
-        rec.set("obsdate", RecordValue::Record(obsdate));
-        let mut pointingcenter = TableRecord::default();
-        pointingcenter.set(
-            "value",
-            RecordValue::Array(ArrayValue {
-                shape: vec![2],
-                data: ArrayData::Double(vec![0.0, 0.0]),
-            }),
-        );
-        pointingcenter.set("initial", RecordValue::Bool(true));
-        rec.set("pointingcenter", RecordValue::Record(pointingcenter));
-        let mut telescopeposition = TableRecord::default();
-        telescopeposition.set("type", RecordValue::String("position".into()));
-        telescopeposition.set("refer", RecordValue::String("ITRF".into()));
-        for (name, value) in [("m0", 0.0), ("m1", 0.0), ("m2", 0.0)] {
-            let mut m = TableRecord::default();
-            m.set("value", RecordValue::Double(value));
-            m.set(
-                "unit",
-                RecordValue::String(if name == "m2" {
-                    "m".into()
-                } else {
-                    "rad".into()
-                }),
-            );
-            telescopeposition.set(name, RecordValue::Record(m));
-        }
-        rec.set("telescopeposition", RecordValue::Record(telescopeposition));
-        let spectral_pos = rec.desc.fields.iter().position(|f| f.name == "spectral2");
-        if let Some(pos) = spectral_pos {
-            if let Some(RecordValue::Record(spectral)) = rec.values.get_mut(pos) {
-                spectral.set("version", RecordValue::Int(2));
-                spectral.set("system", RecordValue::String("LSRK".into()));
-                spectral.set("restfreq", RecordValue::Double(1420405751.786));
-                spectral.set(
-                    "restfreqs",
-                    RecordValue::Array(ArrayValue {
-                        shape: vec![1],
-                        data: ArrayData::Double(vec![1420405751.786]),
-                    }),
-                );
-                spectral.set("velType", RecordValue::Int(0));
-                spectral.set("nativeType", RecordValue::Int(0));
-                spectral.set("velUnit", RecordValue::String("km/s".into()));
-                spectral.set("waveUnit", RecordValue::String("mm".into()));
-                spectral.set("formatUnit", RecordValue::String(String::new()));
-                spectral.set("unit", RecordValue::String("Hz".into()));
-                spectral.set("name", RecordValue::String("Frequency".into()));
-                // The linear wcs block and the conversion frame measures
-                // SpectralCoordinate::restore reads (casacore's default
-                // image template carries both).
-                let mut wcs = TableRecord::default();
-                wcs.set("crval", RecordValue::Double(1.415e9));
-                wcs.set("crpix", RecordValue::Double(1.0));
-                wcs.set("cdelt", RecordValue::Double(1000.0));
-                wcs.set("pc", RecordValue::Double(1.0));
-                wcs.set(
-                    "ctype",
-                    RecordValue::String("FREQ\u{0}\u{0}\u{0}\u{0}\u{0}".into()),
-                );
-                spectral.set("wcs", RecordValue::Record(wcs));
-                let mut conversion = TableRecord::default();
-                let mut direction = TableRecord::default();
-                direction.set("type", RecordValue::String("direction".into()));
-                direction.set("refer", RecordValue::String("J2000".into()));
-                let mut m1 = TableRecord::default();
-                m1.set("value", RecordValue::Double(std::f64::consts::FRAC_PI_2));
-                m1.set("unit", RecordValue::String("rad".into()));
-                direction.set("m1", RecordValue::Record(m1));
-                let mut m0 = TableRecord::default();
-                m0.set("value", RecordValue::Double(0.0));
-                m0.set("unit", RecordValue::String("rad".into()));
-                direction.set("m0", RecordValue::Record(m0));
-                conversion.set("direction", RecordValue::Record(direction));
-                let mut position = TableRecord::default();
-                position.set("type", RecordValue::String("position".into()));
-                position.set("refer", RecordValue::String("ITRF".into()));
-                let mut m2 = TableRecord::default();
-                m2.set("value", RecordValue::Double(0.0));
-                m2.set("unit", RecordValue::String("m".into()));
-                position.set("m2", RecordValue::Record(m2));
-                let mut pm1 = TableRecord::default();
-                pm1.set("value", RecordValue::Double(0.0));
-                pm1.set("unit", RecordValue::String("rad".into()));
-                position.set("m1", RecordValue::Record(pm1));
-                let mut pm0 = TableRecord::default();
-                pm0.set("value", RecordValue::Double(0.0));
-                pm0.set("unit", RecordValue::String("rad".into()));
-                position.set("m0", RecordValue::Record(pm0));
-                conversion.set("position", RecordValue::Record(position));
-                let mut epoch = TableRecord::default();
-                epoch.set("type", RecordValue::String("epoch".into()));
-                epoch.set("refer", RecordValue::String("LAST".into()));
-                let mut em0 = TableRecord::default();
-                em0.set("value", RecordValue::Double(0.0));
-                em0.set("unit", RecordValue::String("d".into()));
-                epoch.set("m0", RecordValue::Record(em0));
-                conversion.set("epoch", RecordValue::Record(epoch));
-                conversion.set("system", RecordValue::String("LSRK".into()));
-                spectral.set("conversion", RecordValue::Record(conversion));
-            }
-        }
-        csys.record = Some(rec);
-        csys
     }
 
     /// Parse a CASA image's `coords` keyword record.  `nimaxes` is the
@@ -736,8 +549,251 @@ impl CoordinateSystem {
     pub fn raw_record(&self) -> TableRecord {
         match &self.record {
             Some(rec) => rec.clone(),
-            None => self.synthesise_record(),
+            None => self.completed_record(),
         }
+    }
+
+    /// A synthesised record with everything casacore's coordinate restore
+    /// paths read: the spectral wcs block and conversion frame measures,
+    /// the per-coordinate world/pixel axis maps and replacements, and the
+    /// ObsInfo records.  Shared by the default template and the FITS
+    /// synthesis — a persisted coordinate system must open in casacore.
+    fn completed_record(&self) -> TableRecord {
+        let mut rec = self.synthesise_record();
+        // The per-coordinate world/pixel axis mappings and replacements
+        // CoordinateSystem::restore reads back after the coordinates, in
+        // coordinate order (each coordinate's casa pixel axes).
+        for (idx, c) in self.coords.iter().enumerate() {
+            let paxes: Vec<i64> = match c {
+                Coordinate::Direction { pixel_axes, .. } => {
+                    pixel_axes.iter().map(|&p| p as i64).collect()
+                }
+                Coordinate::Linear { pixel_axes, .. } => {
+                    pixel_axes.iter().map(|&p| p as i64).collect()
+                }
+            };
+            let worldreplace = match c {
+                Coordinate::Direction { crval, .. } => crval.to_vec(),
+                Coordinate::Linear { crval, .. } => crval.clone(),
+            };
+            let n = paxes.len();
+            rec.set(
+                &format!("worldmap{idx}"),
+                RecordValue::Array(ArrayValue {
+                    shape: vec![n as u32],
+                    data: ArrayData::Int64(paxes.clone()),
+                }),
+            );
+            rec.set(
+                &format!("worldreplace{idx}"),
+                RecordValue::Array(ArrayValue {
+                    shape: vec![n as u32],
+                    data: ArrayData::Double(worldreplace),
+                }),
+            );
+            rec.set(
+                &format!("pixelmap{idx}"),
+                RecordValue::Array(ArrayValue {
+                    shape: vec![n as u32],
+                    data: ArrayData::Int64(paxes),
+                }),
+            );
+            rec.set(
+                &format!("pixelreplace{idx}"),
+                RecordValue::Array(ArrayValue {
+                    shape: vec![n as u32],
+                    data: ArrayData::Double(vec![0.0; n]),
+                }),
+            );
+        }
+        // ObsInfo.
+        rec.set("telescope", RecordValue::String("UNKNOWN".into()));
+        rec.set("observer", RecordValue::String("UNKNOWN".into()));
+        let mut obsdate = TableRecord::default();
+        obsdate.set("type", RecordValue::String("epoch".into()));
+        obsdate.set("refer", RecordValue::String("UTC".into()));
+        let mut om0 = TableRecord::default();
+        om0.set("value", RecordValue::Double(0.0));
+        om0.set("unit", RecordValue::String("d".into()));
+        obsdate.set("m0", RecordValue::Record(om0));
+        rec.set("obsdate", RecordValue::Record(obsdate));
+        let mut pointingcenter = TableRecord::default();
+        pointingcenter.set(
+            "value",
+            RecordValue::Array(ArrayValue {
+                shape: vec![2],
+                data: ArrayData::Double(vec![0.0, 0.0]),
+            }),
+        );
+        pointingcenter.set("initial", RecordValue::Bool(true));
+        rec.set("pointingcenter", RecordValue::Record(pointingcenter));
+        let mut telescopeposition = TableRecord::default();
+        telescopeposition.set("type", RecordValue::String("position".into()));
+        telescopeposition.set("refer", RecordValue::String("ITRF".into()));
+        for (name, value, unit) in [("m0", 0.0, "rad"), ("m1", 0.0, "rad"), ("m2", 0.0, "m")] {
+            let mut m = TableRecord::default();
+            m.set("value", RecordValue::Double(value));
+            m.set("unit", RecordValue::String(unit.into()));
+            telescopeposition.set(name, RecordValue::Record(m));
+        }
+        rec.set("telescopeposition", RecordValue::Record(telescopeposition));
+        // StokesCoordinate::restore reads the axes name and pc matrix; a
+        // FITS-sourced system has no letters (derive them from the crval
+        // Stokes codes, 1=I 2=Q 3=U 4=V).
+        let stokes_pos = rec
+            .desc
+            .fields
+            .iter()
+            .position(|f| f.name.starts_with("stokes"));
+        if let Some(pos) = stokes_pos {
+            if let Some(RecordValue::Record(stokes)) = rec.values.get_mut(pos) {
+                if !stokes.desc.fields.iter().any(|f| f.name == "axes") {
+                    let crval = stokes
+                        .get("crval")
+                        .and_then(f64s)
+                        .unwrap_or_else(|| vec![1.0]);
+                    let n = crval.len().max(1);
+                    let letters: Vec<String> = crval
+                        .iter()
+                        .map(|&v| {
+                            ["I", "Q", "U", "V"]
+                                .get(v.round() as usize)
+                                .unwrap_or(&"I")
+                                .to_string()
+                        })
+                        .collect();
+                    let letters = if letters.is_empty() {
+                        vec!["I".to_string()]
+                    } else {
+                        letters
+                    };
+                    let _ = n;
+                    stokes.set(
+                        "axes",
+                        RecordValue::Array(ArrayValue {
+                            shape: vec![1],
+                            data: ArrayData::String(vec!["Stokes".into()]),
+                        }),
+                    );
+                    stokes.set(
+                        "pc",
+                        RecordValue::Array(ArrayValue {
+                            shape: vec![1, 1],
+                            data: ArrayData::Double(vec![1.0]),
+                        }),
+                    );
+                    stokes.set(
+                        "stokes",
+                        RecordValue::Array(ArrayValue {
+                            shape: vec![letters.len() as u32],
+                            data: ArrayData::String(letters),
+                        }),
+                    );
+                }
+            }
+        }
+        // The spectral coordinate's linear wcs block and conversion frame
+        // measures SpectralCoordinate::restore reads.
+        let spectral_pos = rec
+            .desc
+            .fields
+            .iter()
+            .position(|f| f.name.starts_with("spectral"));
+        if let Some(pos) = spectral_pos {
+            if let Some(RecordValue::Record(spectral)) = rec.values.get_mut(pos) {
+                if !spectral.desc.fields.iter().any(|f| f.name == "wcs") {
+                    let crval = spectral
+                        .get("crval")
+                        .and_then(f64s)
+                        .and_then(|v| v.first().copied())
+                        .unwrap_or(1.415e9);
+                    let crpix = spectral
+                        .get("crpix")
+                        .and_then(f64s)
+                        .and_then(|v| v.first().copied())
+                        .unwrap_or(0.0);
+                    let cdelt = spectral
+                        .get("cdelt")
+                        .and_then(f64s)
+                        .and_then(|v| v.first().copied())
+                        .unwrap_or(1000.0);
+                    let mut wcs = TableRecord::default();
+                    wcs.set("crval", RecordValue::Double(crval));
+                    wcs.set("crpix", RecordValue::Double(crpix));
+                    wcs.set("cdelt", RecordValue::Double(cdelt));
+                    wcs.set("pc", RecordValue::Double(1.0));
+                    wcs.set(
+                        "ctype",
+                        RecordValue::String("FREQ\u{0}\u{0}\u{0}\u{0}\u{0}".into()),
+                    );
+                    spectral.set("wcs", RecordValue::Record(wcs));
+                }
+                // The scalar/enum fields SpectralCoordinate::restore
+                // reads (set-if-absent: records parsed from casacore
+                // already carry them).
+                let set_absent = |sp: &mut TableRecord, name: &str, v: RecordValue| {
+                    if !sp.desc.fields.iter().any(|f| f.name == name) {
+                        sp.set(name, v);
+                    }
+                };
+                set_absent(spectral, "version", RecordValue::Int(2));
+                set_absent(spectral, "system", RecordValue::String("LSRK".into()));
+                set_absent(spectral, "restfreq", RecordValue::Double(0.0));
+                set_absent(
+                    spectral,
+                    "restfreqs",
+                    RecordValue::Array(ArrayValue {
+                        shape: vec![1],
+                        data: ArrayData::Double(vec![0.0]),
+                    }),
+                );
+                set_absent(spectral, "velType", RecordValue::Int(0));
+                set_absent(spectral, "nativeType", RecordValue::Int(0));
+                set_absent(spectral, "velUnit", RecordValue::String("km/s".into()));
+                set_absent(spectral, "waveUnit", RecordValue::String("mm".into()));
+                set_absent(spectral, "formatUnit", RecordValue::String(String::new()));
+                set_absent(spectral, "unit", RecordValue::String("Hz".into()));
+                set_absent(spectral, "name", RecordValue::String("Frequency".into()));
+                if !spectral.desc.fields.iter().any(|f| f.name == "conversion") {
+                    let mut conversion = TableRecord::default();
+                    let mut direction = TableRecord::default();
+                    direction.set("type", RecordValue::String("direction".into()));
+                    direction.set("refer", RecordValue::String("J2000".into()));
+                    let mut m1 = TableRecord::default();
+                    m1.set("value", RecordValue::Double(std::f64::consts::FRAC_PI_2));
+                    m1.set("unit", RecordValue::String("rad".into()));
+                    direction.set("m1", RecordValue::Record(m1));
+                    let mut m0 = TableRecord::default();
+                    m0.set("value", RecordValue::Double(0.0));
+                    m0.set("unit", RecordValue::String("rad".into()));
+                    direction.set("m0", RecordValue::Record(m0));
+                    conversion.set("direction", RecordValue::Record(direction));
+                    let mut position = TableRecord::default();
+                    position.set("type", RecordValue::String("position".into()));
+                    position.set("refer", RecordValue::String("ITRF".into()));
+                    for (name, value, unit) in
+                        [("m2", 0.0, "m"), ("m1", 0.0, "rad"), ("m0", 0.0, "rad")]
+                    {
+                        let mut m = TableRecord::default();
+                        m.set("value", RecordValue::Double(value));
+                        m.set("unit", RecordValue::String(unit.into()));
+                        position.set(name, RecordValue::Record(m));
+                    }
+                    conversion.set("position", RecordValue::Record(position));
+                    let mut epoch = TableRecord::default();
+                    epoch.set("type", RecordValue::String("epoch".into()));
+                    epoch.set("refer", RecordValue::String("LAST".into()));
+                    let mut em0 = TableRecord::default();
+                    em0.set("value", RecordValue::Double(0.0));
+                    em0.set("unit", RecordValue::String("d".into()));
+                    epoch.set("m0", RecordValue::Record(em0));
+                    conversion.set("epoch", RecordValue::Record(epoch));
+                    conversion.set("system", RecordValue::String("LSRK".into()));
+                    spectral.set("conversion", RecordValue::Record(conversion));
+                }
+            }
+        }
+        rec
     }
 
     fn synthesise_record(&self) -> TableRecord {
