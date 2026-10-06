@@ -5,6 +5,41 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.23] - 2026-10-06
+
+### Added
+
+- **`casacure.images` — the `pyrap.images` surface DDFacet and killMS use
+  (issue #14).** The `image` class opens CASA image tables (one-row
+  TiledCellStMan tables whose coordinates/beam/units live in keyword
+  records) and FITS primary-image cubes through the same object: getdata,
+  putdata, coordinates (the pyrap dict layout, the get/set
+  increment/referencevalue/referencepixel surface, and the `_csys`
+  attribute MyCasapy2bbs reads), toworld/topixel (zenithal SIN, verified
+  against casacore to 3e-16 rad), imageinfo (restoring beam from keyword
+  records or BMAJ/BMIN/BPA), shape/name/unit/miscinfo, saveas, tofits and
+  regrid (bilinear over the given axes; the identity regrid ModMosaic's
+  stacked facets use is bit-exact). Creation (`image(imagename=, shape=,
+  coordsys=)`) reproduces casacore's default image template probed
+  field-for-field, so what casacure writes, real casacore opens —
+  verified bit-exactly in both directions, including world coordinates.
+  Under it: **TiledCellStMan read support** (the CASA-image storage
+  manager: every row's cell is its own cube), and a hand-rolled FITS
+  reader (cards, BITPIX 8-64 + BSCALE/BZERO, mmap + bulk endian
+  conversion, native dtype preserved) — no new dependencies. The
+  ground-truth probe is `scripts/probe_pyrap_images.py`; fixtures
+  `image.image`/`image.fits`/`tsmcell.tab` extend `make_fixtures.py`;
+  `tests/test_images.py` passes with real python-casacore in the loop.
+  DDFacet (all 35 `pyrap.images` imports) and killMS
+  (`Simul/MakeModelImage.py`, its last one) now run on it — verified in
+  the checkouts: ModFitPSF's FindSidelobe, ClassCasaimage's
+  create/mutate/recreate/setdata/ToFits, MakeMask-style beam/topixel
+  flows, ModMosaic-style regrid, and killMS's MakeModelImage
+  end-to-end. Also fixed on the way: a record-writer bug where an
+  in-place mutation of a nested keyword record left the parent's cached
+  sub-description stale, producing a desynchronised encoding casacure
+  itself could not read back.
+
 ### Added
 
 - **`tasks.py` + `Dockerfile`** — release orchestration in the spirit of

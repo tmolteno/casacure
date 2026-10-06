@@ -17,8 +17,11 @@ native extension read the MS directly.
   `posangle`, `measure`, `get_value`) in `ClassFITSBeam` / `GiveDate` need a
   new `casacure.measures` subset. Everything else that looks like measures
   use is already astropy or pyephem.
-- **Images**: `pyrap.images` is a separate subsystem and **out of scope**
-  here.
+- **Images**: `pyrap.images` **shipped as `casacure.images`** (3.8.23):
+  the `image` class opening CASA image tables and FITS cubes, getdata/
+  putdata/saveas/tofits/regrid, coordinates with SIN toworld/topixel, and
+  the restoring beam — the surface DDFacet (35 imports) and killMS use.
+  Verified in both checkouts with real python-casacore cross-checks.
 - **Rust crate**: killMS already runs its solver as an in-process thread pool
   around its own `killms-core`/`native` crates. That crate can depend on
   `casacure` directly and do the MS chunk reads/writes in Rust, in parallel,
@@ -54,7 +57,7 @@ also grow a `casacure` dependency later if profiling justifies it.
 | `pyrap.tables` / `casacore.tables` | `DDF.py`, `Restore.py`, `Data/ClassMS.py`, `Data/ClassJones.py`, `Data/ClassVisServer.py`, `Data/ClassEveryBeam.py`, `Imager/ClassWeighting.py`, `ToolsDir/ModEstimateMemory.py`, `ToolsDir/ModRotate.py`, tests | `Data/ClassMS.py`, `Data/ClassVisServer.py`, `Data/ClassWeighting.py`, `Data/ClassBeam.py`, `Weights/W_*.py`, `kMS.py`, `BLCal.py`, `ClipCal.py`, `AQWeight.py`, `SmoothSols.py`, `InterpSols.py`, `Simul/DoSimul.py`, `Simul/MakeClusterCat.py`, `Predict/ClassImageSM2.py`, `Predict/PredictGaussPoints_NumExpr.py` | load-bearing |
 | `pyrap.quanta` | `Data/ClassMS.py`, `Data/PointingProvider.py`, `Data/ClassFITSBeam.py`, `ToolsDir/ModRotate.py` | `Data/ClassMS.py`, `Simul/MakeClusterCat.py` | thin |
 | `pyrap.measures` | `Data/ClassMS.py`, `Data/ClassFITSBeam.py`, `Imager/ClassMontblancMachine.py` | `Data/ClassMS.py`, `Simul/MakeClusterCat.py` | thin but real |
-| `pyrap.images` | `Restore.py`, `Imager/ClassCasaImage.py`, `Imager/ClassDeconvMachine.py`, `Imager/ClassImageNoiseMachine.py`, `Imager/ClassFacetMachineTessel.py`, `Imager/MultiSliceDeconv/*`, `Imager/SSD3/*`, `Imager/MSMF/*`, `ToolsDir/ModMosaic.py`, `ToolsDir/ModFitPSF.py`, `ToolsDir/casapy2bbs.py`, `fits2png.py` | `Simul/MakeModelImage.py`, `Predict/ClassImageSM2.py` | **out of scope** |
+| `pyrap.images` | `Restore.py`, `Imager/ClassCasaImage.py`, `Imager/ClassDeconvMachine.py`, `Imager/ClassImageNoiseMachine.py`, `Imager/ClassFacetMachineTessel.py`, `Imager/MultiSliceDeconv/*`, `Imager/SSD3/*`, `Imager/MSMF/*`, `ToolsDir/ModMosaic.py`, `ToolsDir/ModFitPSF.py`, `ToolsDir/casapy2bbs.py`, `fits2png.py` | `Simul/MakeModelImage.py`, `Predict/ClassImageSM2.py` | **shipped** as `casacure.images` (see TL;DR); `ClassImageSM2.py` keeps its rayon/FITS path |
 | `astropy` | `astropy.time.Time`, `astropy.io.fits`, `astropy.io.ascii`, `astropy.coordinates.SkyCoord` | `astropy.io.fits` | already used |
 | `pyephem` | `ephem.Date` in `ClassMS.GiveDate` | `ephem.Date` in `ClassMS.GiveDate`, `Simul/MakeClusterCat.GiveDate` | trivial |
 
@@ -276,7 +279,6 @@ Three casacure gaps surfaced during the port and were fixed:
 
 ## 4. Out of scope
 
-- `pyrap.images` (CASA image subsystem) — a separate port.
 - `Imager/ClassMontblancMachine.py` (montblanc extra; `me.uvw`/`me.baseline`).
 - `measures` features beyond the seven used (e.g. `doppler`, `frequency`,
   `radialvelocity`, `separation`, `uvw`, `baseline`).
