@@ -4,6 +4,7 @@
 //! See `CASACORE_TO_CASA_RS.md` for the required functionality inventory.
 
 pub mod aipsio;
+pub mod astro;
 pub mod columnset;
 pub mod datafile;
 mod flushgate;

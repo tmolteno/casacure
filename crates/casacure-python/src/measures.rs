@@ -6,7 +6,9 @@
 //! here: `measures()` constructor, `direction`, `position`, `epoch`,
 //! `do_frame`, `posangle`, `measure`, `get_value`. See
 //! `PORTING_DDFACET_KILLMS.md` §1.6 for the audit and the semantics pinned
-//! to real python-casacore 3.8.1.
+//! to real python-casacore 3.8.1; the J2000 <-> AZEL/AZELGEO accuracy
+//! contract (astropy to <1 arcsec over 1926-2126) and the documented
+//! casacore divergences are in `MEASURES_ACCURACY.md`.
 
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;

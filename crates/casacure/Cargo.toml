@@ -13,6 +13,10 @@ keywords = ["casacore", "measurement-set", "radio-astronomy", "taql"]
 libc = "0.2"
 thiserror = "2"
 memmap2 = "0.9"
+# Astrometry engine for `measures` (IAU SOFA algorithms, pure Rust) and the
+# bundled IERS Earth-orientation data they need for UTC->UT1.
+sofars = { workspace = true }
+celestial-eop-data = { workspace = true }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -112,12 +112,17 @@ Which packages that depend on casacore can run on casacure.
   byte-for-byte against python-casacore 3.8.1 (see `tests/test_quanta.py`).
   This covers the `pyrap.quanta` uses the surveys found (jiveplot unit
   conversions, CubiCal's degridder machines, DDFacet `GiveDate`).
-- **`measures` (the M* transforms)**: astronomical measure conversion
-  (`direction`/`epoch`/`uvw`/`doppler` and the parallactic-angle machinery,
-  which needs the ephemeris-backed `measures` engine). Not implemented —
-  used only in DDFacet's montblanc / utility paths (`GiveDate`, `ModRotate`,
-  CubiCal's parallactic_machine); tracked in `TODO.md` as optional future
-  work.
+- **`measures` (the M* transforms)**: **the subset the port blockers need is
+  shipped** (3.8.25) — `casacure.measures` covers
+  `direction`/`position`/`epoch`/`do_frame`/`measure`/`posangle`/`get_value`
+  with J2000 <-> `AZEL`/`AZELGEO` (plus `ITRF`/`WGS84` positions and UTC
+  epochs) held to **<1 arcsec of astropy over 1926-2126** via the SOFA
+  stack, with the IERS data compiled in (`MEASURES_ACCURACY.md`). This
+  closes the parallactic-angle gap of issue #15 and the `casadata`
+  dependency of ratt-ru/QuartiCal#330. The wider casacore `measures` engine
+  — the `uvw`/`doppler` transforms, the full reference-frame catalogue and
+  the `measures`-table observatory/ephemeris data — is not implemented and
+  is tracked in `TODO.md` as optional future work.
 - **`msfits` / `lofar`-style helpers** and other casacore subsystems: not
   implemented.
 

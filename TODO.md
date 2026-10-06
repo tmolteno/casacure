@@ -189,5 +189,7 @@ Python 3.14: supported (pyo3 0.27 / numpy 0.27; full dask-ms suite green on 3.14
 
 DDFacet survey (crates/casacure): DDFacet's MS data path uses only the tables
 API, now covered — added `table.query()`, `table.select()`, `table.sort()`,
-`table.getkeyword(name)`. Optional future work: `pyrap.measures`/`quanta` for
-DDFacet's montblanc/GiveDate utilities.
+`table.getkeyword(name)`. `pyrap.quanta` and the `pyrap.measures` subset
+those utilities need (`GiveDate`, `posangle`, `measure(J2000 -> AZELGEO)`)
+are shipped too — see `MEASURES_ACCURACY.md` for the measures accuracy
+contract and the casacore divergences.

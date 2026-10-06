@@ -133,8 +133,15 @@ qa.quantity(45, "deg").formatted()  # '+045.00.00'
 qa.quantity(51544, "d").to_unix_time()  # 946684800.0 (2000-01-01T00:00Z)
 ```
 
-The full `casacore.measures` engine (direction/epoch/uvw transforms, backed
-by the casacore ephemeris data) is not implemented.
+`casacure.measures` implements the `direction`/`position`/`epoch`/`do_frame`/
+`measure`/`posangle`/`get_value` subset that DDFacet and killMS use, with
+J2000 <-> `AZEL`/`AZELGEO` held to **<1 arcsec of astropy's `AltAz` over
+1926-2126** (worst measured ~0.02"). The IERS Earth-orientation data and the
+Earth ephemeris are compiled in — there is no `casadata`/`measures` data
+directory to install or configure (ratt-ru/QuartiCal#330). The full
+`casacore.measures` engine (the `uvw` engine and the wider reference-frame
+catalogue) is not implemented; the accuracy contract and the documented
+differences from casacore are in [`MEASURES_ACCURACY.md`](MEASURES_ACCURACY.md).
 
 ### Driving dask-ms on casacure
 
@@ -299,13 +306,18 @@ invoke release --all-jobs               # release after running all three CI job
 
 **Version + tag are generated automatically.** `invoke release` bumps the
 patch level (`3.8.22` → `3.8.23`) in `pyproject.toml` + `Cargo.toml` (the
-workspace version *and* the `casacure` crate dependency), commits it as
-`release: bump to 3.8.23`, and tags `v3.8.23`. The version scheme is
+workspace version *and* the `casacure` crate dependency), moves the
+`CHANGELOG.md` entries that accumulated under `## [Unreleased]` beneath a new
+`## [3.8.23] - <today>` heading (leaving a fresh `## [Unreleased]` on top),
+commits both as `release: bump to 3.8.23`, and tags `v3.8.23`. A
+`## [3.8.23]` section that already exists — hand-written release notes, or a
+re-run — is left untouched. The version scheme is
 `<casacore-major>.<casacore-minor>.<casacure-patch>` (see [Install](#install)); only the
 patch level is auto-bumped — moving the interface version (3.8 → 3.9) is
-deliberate and done by hand. `--no-bump` tags the tree's current version;
-`--version X.Y.Z` tags exactly that and implies `--no-bump`, since the tree
-must not drift from an explicitly named tag.
+deliberate and done by hand. `--no-bump` tags the tree's current version and
+warns if the changelog has no section for it; `--version X.Y.Z` tags exactly
+that and implies `--no-bump`, since the tree must not drift from an
+explicitly named tag.
 
 **The pre-release gate** is `Dockerfile`, which reproduces the `test` job
 of `.github/workflows/ci.yml` in a clean container with real

@@ -47,7 +47,25 @@ dependencies = ["numpy"]
 # interface changes). The crates.io crate and this wheel share the same
 # three-part A.B.P, so both are published together per release
 # (see Cargo.toml [workspace.package]).
-version = "3.8.24"
+version = "3.8.25"
+
+[project.optional-dependencies]
+# Development/test extras: `pip install -e .[dev]`.
+#   astropy   - the astrometric reference implementation that
+#               tests/test_measures.py holds casacure.measures to
+#               (<1 arcsec over 1926-2126; see MEASURES_ACCURACY.md).
+#   skyfield  - the documented model for the algorithms behind that
+#               reference (precession/nutation/sidereal time); used when
+#               porting and cross-checking the Rust implementation.
+#   pytest    - the test runner.
+# python-casacore is deliberately *not* here: it needs the casacore C++
+# libraries and is only required for the casacore-parity tests (CI
+# installs it explicitly to generate fixtures and run those comparisons).
+dev = [
+    "astropy",
+    "skyfield",
+    "pytest",
+]
 
 [project.scripts]
 casacure-test = "casacure:run_tests"

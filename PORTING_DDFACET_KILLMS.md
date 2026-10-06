@@ -194,19 +194,22 @@ Semantics pinned to real python-casacore (probed live on this machine):
   great-circle PA at `m0` from its increasing-declination direction —
   exact for same-frame directions, and the mixed-frame path (J2000 source vs
   AZELGEO zenith) reproduces casacore's value.
-- `measure(d, 'AZELGEO')` uses the frame's `position` + `epoch`, converts
-  J2000 → apparent place (first-order precession), computes hour angle from
-  IAU 1982 GMST, and returns azimuth as `az_east + π` (casacore's
-  convention). Verified to ~10–20 arcsec against real casacore over a
-  multi-epoch sweep.
+- `measure(d, 'AZELGEO')` uses the frame's `position` + `epoch` and converts
+  J2000 → topocentric observed (azimuth east from north, wrapped to
+  `(-π, π]` like python-casacore). Since 3.8.25 the conversion is the IAU
+  SOFA stack (precession/nutation 2006/2000A, Earth rotation angle on UT1
+  with bundled IERS data, annual + diurnal aberration, solar light
+  deflection, polar motion) — see `MEASURES_ACCURACY.md`.
 
-**Accuracy note.** The full casacore measures stack applies nutation and IERS
-data; the analytic model here omits both (casacore itself degrades to
-"less precision" without IERS files). The residual in `AZELGEO` is
-~10–20 arcsec in azimuth/altitude and <1 arcsec in the same-frame `posangle`
-path — far finer than DDFacet's parallactic-angle sampling granularity
-(`pa_inc` is degrees). `GiveDate` does not use any direction conversion at
-all (only `epoch('utc', s)` → MJD days) and is exact.
+**Accuracy note.** `casacure.measures` is held to **<1 arcsec of astropy's
+`AltAz` for 1926–2126** (measured worst case ~0.02″) by
+`tests/test_measures.py`, and agrees with casacore's `AZELGEO` path to
+≤0.7″ where casacore has IERS data (≤13″ before 1973, where casacore
+itself warns it is extrapolating). The one place casacore's `AZEL` (as
+opposed to `AZELGEO`) differs from astropy is a geocentric-vs-geodetic
+observer latitude — documented in `DIFFERENCES.md` and reproduced exactly
+by the tests. `GiveDate` does not use any direction conversion at all (only
+`epoch('utc', s)` → MJD days) and is exact.
 
 #### C. `casacure` crate: Rust-facing MS I/O (for killMS's native extension)
 

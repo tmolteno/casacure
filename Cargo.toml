@@ -3,10 +3,18 @@ resolver = "2"
 members = ["crates/casacure", "crates/casacure-python"]
 
 [workspace.dependencies]
-casacure = { path = "crates/casacure", version = "3.8.24" }
+casacure = { path = "crates/casacure", version = "3.8.25" }
+# Astrometry engine for `casacure::measures`: a pure-Rust port of the IAU
+# SOFA routines (the same algorithms ERFA/pyerfa/astropy use). Pinned to the
+# 0.6 series: 0.6.1 is the version the accuracy tests in
+# `tests/test_measures.py` were validated against.
+sofars = "0.6.1"
+# Bundled IERS Earth-orientation parameters (UT1-UTC and polar motion) used
+# for UTC->UT1 and the polar-motion correction in the same conversions.
+celestial-eop-data = "0.1"
 
 [workspace.package]
-version = "3.8.24"
+version = "3.8.25"
 authors = ["Tim Molteno <tim@elec.ac.nz>"]
 edition = "2021"
 license = "LGPL-3.0-or-later"

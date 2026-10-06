@@ -50,6 +50,44 @@ and the buffered `addrows` default for everything newer. The earlier
 0ea3db6) was superseded by ad0b510 and is gone: no read path raises for an
 unwritten cell anymore.
 
+## `AZEL` is the astropy direction, not casacore's `AZEL`
+
+**casacore behaviour.** Its two horizontal references are not the same
+transform. `measure(d, 'AZEL')` builds the local horizon from the
+observer's **geocentric** latitude, while `measure(d, 'AZELGEO')` uses the
+**geodetic (WGS84)** latitude. At MeerKAT those two horizons differ by
+0.169°, so for a field 3° from the zenith casacore's `AZEL` and `AZELGEO`
+azimuths differ by 2.36° — the parallactic-angle gap reported in issue #15
+(131.192182° vs 133.550707°).
+
+**casacure behaviour.** Both references return the topocentric observed
+place built from the **geodetic** latitude: the physically correct vertical
+(plumb line / ellipsoid normal), the one astropy's `AltAz` frame uses, and
+the one casacore itself uses for `AZELGEO`. For the issue #15 case casacure
+returns az −47.701503°, alt +86.855931° and PA 133.551306°, which matches
+astropy to 0.005″/0.09″ and casacore's `AZELGEO` to 0.55″/2.2″.
+
+### Why
+
+The local zenith is defined by the observer's vertical, and for an observer
+on the rotating, flattened Earth that vertical is the ellipsoid normal, not
+the geocentric radius. casacore's `AZELGEO` — its "geocentric" reference —
+is in fact the geodetic one, so casacure reproduces that and treats
+`AZEL` as a synonym, the way astropy has only one `AltAz`. Following
+casacore's `AZEL` quirk would have meant *adding* a known 0.169° error to
+the horizon pole to match a bug.
+
+### How it is asserted
+
+`tests/test_measures.py::test_casacore_azel_uses_the_geocentric_latitude`
+proves the identification rather than just tolerating a difference: it
+hands casacure a WGS84 site whose latitude *is* MeerKAT's geocentric
+latitude and reproduces real casacore's `AZEL` to under 1″.
+`test_casacore_azelgeo_parity_over_the_grid` holds the astropy-compatible
+`AZELGEO` path to casacore over 1926–2126, and `MEASURES_ACCURACY.md`
+records the full accuracy contract, including the one IERS-prediction
+window where the bundled and astropy data disagree.
+
 ## Other intentional divergences
 
 None currently. TaQL's `ORDER BY` is an unimplemented feature (a gap), not a

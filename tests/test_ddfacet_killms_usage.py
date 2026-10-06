@@ -503,7 +503,9 @@ def test_measures_direction_and_posangle():
     pa = me.posangle(src, zen)
     deg = pa.get_value("deg")
     # Pinned to real casacore at this position/epoch (probed live).
-    assert abs(deg - (-12.875850547)) < 5e-2, deg
+    # casacure 3.8.25 gives -12.876001978, 0.55 arcsec away; the tolerance is
+    # 1.8 arcsec (MEASURES_ACCURACY.md holds the model to <1" of astropy).
+    assert abs(deg - (-12.875850547)) < 5e-4, deg
 
 
 def test_measures_direction_to_azelgeo():
@@ -525,10 +527,11 @@ def test_measures_direction_to_azelgeo():
     vals = me.get_value(azel)
     assert len(vals) == 2
     # Pinned to real casacore at this position/epoch (probed live).
+    # casacure 3.8.25 gives 2.945111616 / 1.044795251: 0.55" and 0.31" away.
     az = vals[0].get_value()
     alt = vals[1].get_value()
-    assert abs(az - 2.945114291) < 5e-3, az
-    assert abs(alt - 1.044796770) < 5e-3, alt
+    assert abs(az - 2.945114291) < 2e-5, az
+    assert abs(alt - 1.044796770) < 2e-5, alt
 
 
 def test_measures_missing_frame_errors():
