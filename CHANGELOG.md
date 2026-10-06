@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. Completed `TODO.md`
 subtasks are moved here.
 
-## [3.8.18] - 2026-10-05
+## [3.8.19] - 2026-10-06
 
 ### Added (DDFacet / killMS port preparation)
 
@@ -53,6 +53,20 @@ subtasks are moved here.
   treats a lock file that has never held a sync record (e.g. one made by
   `default_ms`'s `NoLocking` create) as "no sync record" instead of
   propagating the EOF as a storage error.
+- **TaQL result tables carry the source table's keywords** —
+  `t.query(...).sort('TIME').getkeyword('ANTENNA')` returned `None` (or a
+  path relative to the result's scratch dir); python-casacore's reference
+  tables keep the source's keywords. `TaqlTable` now carries
+  `source_keywords` (subtable names resolved to absolute paths against the
+  **source** table's directory) and `taql_result_to_table` copies them to
+  the result's `desc.keywords`. This is the `t.query(TaQL).sort('TIME')`
+  chain DDFacet's `GiveMainTable` and killMS's `ClassMS` use
+  (`ClassMS.py:894`: `table(table_all.getkeyword('ANTENNA'))`).
+- **`table.__getitem__` accepts a row number** — `t[0]['TIME_RANGE']` (used
+  by `ClassMS.get_obs_details`) returns `{colname: value}` for that row,
+  matching python-casacore's `tablerow._getitem`; a string key is still a
+  column name.
+- **`table.__len__`** — `len(t)` -> `nrows()`, matching python-casacore.
 
 
 ## [3.8.17] - 2026-10-03
