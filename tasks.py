@@ -217,6 +217,8 @@ def release(c,
         new = _bump_patch(_read_version())
         print(f"=== bumping version to {new}")
         _bump_version(new)
+        _git("add", "pyproject.toml", "Cargo.toml", "CHANGELOG.md")
+        _git("commit", "-m", f"release: bump to {new}")
 
     v = version or _read_version()
     tag = f"v{v}"
