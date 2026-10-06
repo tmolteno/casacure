@@ -2767,8 +2767,33 @@ impl Table {
         Ok(desc_to_pydict(py, &desc, Some(&base))?.into_any().unbind())
     }
 
-    fn __getitem__(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
-        self.getcol(py, key, 0, -1, 1)
+    /// `t[key]` — python-casacore's `table.__getitem__`: an integer key is a
+    /// row number (returns the row's values as a dict `{colname: value}`);
+    /// a string key is a column name (returns the column as an array).
+    fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        // Column-name form: t["DATA"].
+        if let Ok(name) = key.extract::<String>() {
+            return self.getcol(py, &name, 0, -1, 1);
+        }
+        // Row form: t[0] -> {colname: value} for that row.
+        let row: i64 = key.extract().map_err(|_| {
+            PyTypeError::new_err("table key must be a column name (str) or a row number (int)")
+        })?;
+        let desc = self.desc();
+        let d = PyDict::new(py);
+        for (i, cd) in desc.columns.iter().enumerate() {
+            let v = self.read_cell(i, row.max(0) as u64)?;
+            let base = self.dir_of();
+            let v = convert::cell_to_py(py, &v)?;
+            let _ = &base;
+            d.set_item(&cd.name, v)?;
+        }
+        Ok(d.into_any().unbind())
+    }
+
+    /// `len(t)` — the number of rows (python-casacore's `table.__len__`).
+    fn __len__(&self) -> PyResult<usize> {
+        Ok(self.nrows()? as usize)
     }
 }
 
@@ -3646,11 +3671,10 @@ fn taql_result_to_table(_py: Python<'_>, out: core::taql::TaqlTable) -> PyResult
         name: String::new(),
         version: String::new(),
         comment: String::new(),
-        keywords: TableRecord {
-            desc: Default::default(),
-            record_type: 0,
-            values: Vec::new(),
-        },
+        // The source table's keywords (python-casacore's reference-table
+        // semantics: `t.query(...).getkeyword('ANTENNA')` returns the source
+        // table's keyword).
+        keywords: out.source_keywords.clone(),
         private_keywords: TableRecord {
             desc: Default::default(),
             record_type: 0,

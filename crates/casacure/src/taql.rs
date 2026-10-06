@@ -38,6 +38,25 @@ pub struct TaqlTable {
     pub colnames: Vec<String>,
     /// Column values in row-major order.
     pub columns: Vec<Vec<RecordValue>>,
+    /// The source table's keyword record. python-casacore's `query()`/
+    /// `sort()` return a reference table whose keywords are the source's
+    /// (so `t.query(...).getkeyword('ANTENNA')` works); the result table
+    /// gets these as its own.
+    pub source_keywords: crate::record::TableRecord,
+}
+
+impl Default for TaqlTable {
+    fn default() -> Self {
+        TaqlTable {
+            colnames: Vec::new(),
+            columns: Vec::new(),
+            source_keywords: crate::record::TableRecord {
+                desc: Default::default(),
+                record_type: 0,
+                values: Vec::new(),
+            },
+        }
+    }
 }
 
 impl TaqlTable {
@@ -59,6 +78,27 @@ impl TaqlTable {
     /// One cell (`taql_result.getcell(col, row)`).
     pub fn getcell(&self, col: usize, row: usize) -> Option<&RecordValue> {
         self.columns.get(col)?.get(row)
+    }
+}
+
+/// Resolve `RecordValue::Table(name)` names in a keyword record to absolute
+/// paths against `table_dir` (the source table's directory), so a TaQL
+/// result's `getkeyword` returns the source subtable's path even though the
+/// result lives in a scratch directory.
+fn resolve_tables_in_record(v: RecordValue, table_dir: &std::path::Path) -> RecordValue {
+    match v {
+        RecordValue::Table(name) => {
+            RecordValue::Table(crate::record::resolve_subtable(&name, table_dir))
+        }
+        RecordValue::Record(mut inner) => {
+            inner.values = inner
+                .values
+                .drain(..)
+                .map(|v| resolve_tables_in_record(v, table_dir))
+                .collect();
+            RecordValue::Record(inner)
+        }
+        other => other,
     }
 }
 
@@ -1119,6 +1159,7 @@ fn run_count(query: &str, tables: &[&Table]) -> TResult<TaqlTable> {
     Ok(TaqlTable {
         colnames: vec!["count".to_string()],
         columns: vec![vec![RecordValue::Int64(count)]],
+        ..Default::default()
     })
 }
 
@@ -1134,6 +1175,7 @@ fn empty_table() -> TaqlTable {
     TaqlTable {
         colnames: Vec::new(),
         columns: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -1751,6 +1793,7 @@ fn run_show(query: &str, tables: &[&Table]) -> TResult<TaqlTable> {
                 "comment".into(),
             ],
             columns: vec![Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            ..Default::default()
         };
         let colnames = t.colnames();
         for (ci, cd) in t.dat.desc.columns.iter().enumerate() {
@@ -1779,6 +1822,7 @@ fn run_show(query: &str, tables: &[&Table]) -> TResult<TaqlTable> {
              keyword), SHOW TABLE, CALC"
                 .into(),
         )]],
+        ..Default::default()
     })
 }
 
@@ -1815,6 +1859,7 @@ fn run_calc(query: &str, tables: &[&Table]) -> TResult<TaqlTable> {
     let mut out = TaqlTable {
         colnames: (0..exprs.len()).map(|i| format!("col{i}")).collect(),
         columns: vec![Vec::new(); exprs.len()],
+        ..Default::default()
     };
     for (i, e) in exprs.iter().enumerate() {
         let v = ctx.eval_row(e, 0)?;
@@ -1950,6 +1995,21 @@ fn run_select(sel: &Select, tables: &[&Table]) -> TResult<TaqlTable> {
             owned.as_ref().unwrap()
         }
     };
+    // The source's keywords travel to the result (python-casacore's
+    // reference-table semantics: `t.query(...).getkeyword('ANTENNA')`).
+    // Subtable (`Table(...)`) names are resolved against the source table's
+    // own directory first, so `getkeyword` on the result returns the source
+    // subtable's path (not one relative to the result's scratch dir).
+    let source_dir = std::path::Path::new(table.name());
+    let source_keywords = {
+        let mut rec = table.dat.desc.keywords.clone();
+        rec.values = rec
+            .values
+            .drain(..)
+            .map(|v| resolve_tables_in_record(v, source_dir))
+            .collect();
+        rec
+    };
     let colidx: HashMap<String, usize> = table
         .colnames()
         .into_iter()
@@ -1966,7 +2026,9 @@ fn run_select(sel: &Select, tables: &[&Table]) -> TResult<TaqlTable> {
     };
 
     if !sel.groupby.is_empty() {
-        return run_group(&ctx, sel);
+        let mut out = run_group(&ctx, sel)?;
+        out.source_keywords = source_keywords;
+        return Ok(out);
     }
 
     // Row-mode: filter, sort, project.
@@ -1983,7 +2045,9 @@ fn run_select(sel: &Select, tables: &[&Table]) -> TResult<TaqlTable> {
     if let Some(limit) = sel.limit {
         rows.truncate(limit.max(0) as usize);
     }
-    project_rows(&ctx, sel, &rows)
+    let mut out = project_rows(&ctx, sel, &rows)?;
+    out.source_keywords = source_keywords;
+    Ok(out)
 }
 
 /// The group pipeline: rows grouped by the group-by expressions, in
@@ -2066,6 +2130,7 @@ fn run_group(ctx: &EvalCtx<'_>, sel: &Select) -> TResult<TaqlTable> {
     Ok(TaqlTable {
         colnames: cols.into_iter().map(|(_, n)| n).collect(),
         columns: out_cols,
+        ..Default::default()
     })
 }
 
@@ -2121,6 +2186,7 @@ fn project_rows(ctx: &EvalCtx<'_>, sel: &Select, rows: &[i64]) -> TResult<TaqlTa
     let mut out = TaqlTable {
         colnames: cols.into_iter().map(|(_, n)| n).collect(),
         columns: out_cols,
+        ..Default::default()
     };
     if sel.unique {
         out = unique_rows(out);
@@ -2144,6 +2210,7 @@ fn unique_rows(t: TaqlTable) -> TaqlTable {
     let mut out = TaqlTable {
         colnames: t.colnames,
         columns: Vec::with_capacity(t.columns.len()),
+        source_keywords: t.source_keywords.clone(),
     };
     for col in t.columns {
         let mut c = Vec::with_capacity(keep.len());
