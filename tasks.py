@@ -141,7 +141,7 @@ def _run_pytest(extra_args: list[str] | None = None) -> None:
     args = ["run", "--rm", IMAGE, "python3", "-m", "pytest", "tests/", "-q", "-p", "no:cacheprovider"]
     if extra_args:
         args.extend(extra_args)
-    local["docker"](*args) & FG
+    local["docker"][*args] & FG
 
 
 @task
