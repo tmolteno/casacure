@@ -39,7 +39,7 @@ impl ImageMeta {
         }
     }
 
-    fn default_info() -> TableRecord {
+    pub(crate) fn default_info() -> TableRecord {
         let mut info = TableRecord::default();
         info.set("imagetype", RecordValue::String("Intensity".into()));
         info.set("objectname", RecordValue::String(String::new()));
@@ -174,7 +174,7 @@ fn create_logtable(path: &std::path::Path) -> Result<std::path::PathBuf, ImageEr
 
 /// Coerce an array to float32 storage (casacore's putdata accepts any
 /// numeric array for a float image).
-fn coerce_float(data: &ArrayValue) -> ArrayValue {
+pub(crate) fn coerce_float(data: &ArrayValue) -> ArrayValue {
     let flat = match &data.data {
         ArrayData::Float(v) => {
             return ArrayValue {

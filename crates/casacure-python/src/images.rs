@@ -5,7 +5,7 @@
 
 use std::sync::RwLock;
 
-use pyo3::exceptions::{PyAttributeError, PyNotImplementedError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyTuple};
 
@@ -24,7 +24,6 @@ fn err<E: std::fmt::Display>(e: E) -> PyErr {
 #[pyclass(name = "image")]
 pub struct image {
     inner: RwLock<Image>,
-    path: std::path::PathBuf,
     shape: Vec<usize>,
     name: String,
 }
@@ -66,7 +65,6 @@ impl image {
             let name = opened.path().display().to_string();
             return Ok(image {
                 inner: RwLock::new(opened),
-                path,
                 shape,
                 name,
             });
@@ -82,7 +80,6 @@ impl image {
         let name = opened.path().display().to_string();
         Ok(image {
             inner: RwLock::new(opened),
-            path,
             shape,
             name,
         })
@@ -169,10 +166,7 @@ impl image {
         let casacure::record::RecordValue::Array(arr) = rec else {
             return Err(PyValueError::new_err("putdata expects an array"));
         };
-        cimg::put_data(&self.path, &arr).map_err(err)?;
-        let opened = Image::open(&self.path).map_err(err)?;
-        *self.inner.write().unwrap() = opened;
-        Ok(())
+        self.inner.write().unwrap().put_data(&arr).map_err(err)
     }
 
     /// Copy this image to a new CASA image table (pyrap `saveas`).
@@ -189,10 +183,32 @@ impl image {
         cimg::tofits(&img, &path).map_err(err)
     }
 
-    fn regrid(&self, _axes: &Bound<'_, PyAny>, _coordsys: &Bound<'_, PyAny>) -> PyResult<()> {
-        Err(PyNotImplementedError::new_err(
-            "casacure.images: regrid is not implemented yet (issue #14 phase 3)",
-        ))
+    /// Resample the given numpy-order axes onto a target coordinate
+    /// system (`img.regrid([2, 3], cMain, outshape=(...))`, ModMosaic's
+    /// mosaic stacking).  Returns a new in-memory image.
+    #[pyo3(signature = (axes, coordsys, outshape = None))]
+    fn regrid(
+        &self,
+        py: Python<'_>,
+        axes: Vec<usize>,
+        coordsys: &Bound<'_, PyAny>,
+        outshape: Option<Vec<usize>>,
+    ) -> PyResult<Py<image>> {
+        let img = self.inner.read().unwrap();
+        let obj: PyRef<'_, coordinates> = coordsys.extract()?;
+        let target = obj.csys.read().unwrap().clone();
+        let outshape = outshape.unwrap_or_else(|| img.shape().to_vec());
+        let regridded = cimg::regrid(&img, &axes, &target, &outshape).map_err(err)?;
+        let shape = regridded.shape().to_vec();
+        let name = regridded.path().display().to_string();
+        Py::new(
+            py,
+            image {
+                inner: RwLock::new(regridded),
+                shape,
+                name,
+            },
+        )
     }
 }
 

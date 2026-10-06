@@ -11,9 +11,11 @@
 pub mod coordsys;
 pub mod fits;
 pub mod image;
+pub mod regrid;
 pub mod write;
 
 pub use coordsys::{CoordError, Coordinate, CoordinateSystem};
 pub use fits::{CardValue, FitsError, FitsHeader, FitsImage};
 pub use image::{CasaImage, Image, ImageError};
+pub use regrid::regrid;
 pub use write::{create_casa_image, put_data, saveas, tofits, ImageMeta};

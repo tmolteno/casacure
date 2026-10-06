@@ -35,10 +35,22 @@ pub enum ImageError {
     Write(#[from] crate::table::WriteTableError),
 }
 
-/// An opened image: either a CASA image table or a FITS file.
+/// An opened image: a CASA image table, a FITS file, or an in-memory
+/// raster (the result of `regrid`).
 pub enum Image {
     Casa(CasaImage),
     Fits(FitsImageInfo),
+    Memory(MemoryImage),
+}
+
+/// An in-memory raster with its own coordinates/metadata (never persisted
+/// until `saveas`).
+pub struct MemoryImage {
+    pub data: ArrayValue,
+    /// The numpy-order shape (mirrors `data.shape` as usize).
+    pub shape: Vec<usize>,
+    pub coords: CoordinateSystem,
+    pub meta: super::write::ImageMeta,
 }
 
 /// The CASA-table flavour: the opened snapshot plus the raster column.
@@ -76,6 +88,7 @@ impl Image {
         match self {
             Image::Casa(c) => &c.path,
             Image::Fits(f) => &f.path,
+            Image::Memory(_) => std::path::Path::new(""),
         }
     }
 
@@ -85,6 +98,7 @@ impl Image {
         match self {
             Image::Casa(c) => &c.shape,
             Image::Fits(f) => &f.shape,
+            Image::Memory(m) => &m.shape,
         }
     }
 
@@ -96,6 +110,39 @@ impl Image {
                 shape: f.shape.iter().map(|&d| d as u32).collect(),
                 data: f.fits.data_array()?,
             }),
+            Image::Memory(m) => Ok(m.data.clone()),
+        }
+    }
+
+    /// Replace the raster (pyrap `putdata`).  A CASA-table image is
+    /// rewritten through a writable open and its snapshot refreshed; an
+    /// in-memory image swaps its raster (shape-checked).
+    pub fn put_data(&mut self, data: &ArrayValue) -> Result<(), ImageError> {
+        match self {
+            Image::Casa(c) => {
+                super::write::put_data(&c.path, data)?;
+                *self = Image::open(&c.path)?;
+                Ok(())
+            }
+            Image::Memory(m) => {
+                let want: Vec<u32> = m.shape.iter().map(|&d| d as u32).collect();
+                let coerced = super::write::coerce_float(data);
+                if coerced.shape != want {
+                    return Err(ImageError::Other {
+                        path: std::path::PathBuf::new(),
+                        msg: format!(
+                            "putdata: array shape {:?} does not match the image {:?}",
+                            coerced.shape, want
+                        ),
+                    });
+                }
+                m.data = coerced;
+                Ok(())
+            }
+            Image::Fits(_) => Err(ImageError::Other {
+                path: std::path::PathBuf::new(),
+                msg: "cannot putdata into a FITS file".into(),
+            }),
         }
     }
 
@@ -103,6 +150,7 @@ impl Image {
         match self {
             Image::Casa(c) => &c.coords,
             Image::Fits(f) => &f.coords,
+            Image::Memory(m) => &m.coords,
         }
     }
 
@@ -112,6 +160,13 @@ impl Image {
         match self {
             Image::Casa(c) => c.keywords_record("imageinfo").unwrap_or_default(),
             Image::Fits(f) => f.beam_record(),
+            Image::Memory(m) => {
+                let mut info = m.meta.imageinfo.clone();
+                if info.desc.fields.is_empty() {
+                    info = super::write::ImageMeta::default_info();
+                }
+                info
+            }
         }
     }
 
@@ -127,6 +182,7 @@ impl Image {
                 })
                 .unwrap_or_default(),
             Image::Fits(f) => f.fits.string_of("BUNIT").unwrap_or("").to_string(),
+            Image::Memory(m) => m.meta.units.clone(),
         };
         format!("'{raw}'")
     }
@@ -136,6 +192,7 @@ impl Image {
         match self {
             Image::Casa(c) => c.keywords_record("miscinfo").unwrap_or_default(),
             Image::Fits(_) => TableRecord::default(),
+            Image::Memory(m) => m.meta.miscinfo.clone(),
         }
     }
 }

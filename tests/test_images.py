@@ -10,6 +10,7 @@ When real python-casacore is installed, the same files are opened through
 """
 
 import os
+import pathlib
 
 import numpy as np
 import pytest
@@ -266,6 +267,29 @@ def test_create_with_coordsys_object(tmp_path):
     assert im.coordinates().dict()["direction0"]["cdelt"] == pytest.approx(
         src.coordinates().dict()["direction0"]["cdelt"]
     )
+
+
+def test_regrid_identity_is_exact(img):
+    """ModMosaic regrids every facet onto one grid; stacked facets share
+    their grid, so the identity regrid must be exact."""
+    data = img.getdata()
+    out = img.regrid([2, 3], img.coordinates(), outshape=list(data.shape))
+    assert list(out.shape()) == list(data.shape)
+    np.testing.assert_array_equal(out.getdata(), data)
+
+
+def test_regrid_returns_in_memory_image(img, tmp_path):
+    """The regrid result carries the target coordsys and can be saved."""
+    data = img.getdata()
+    out = img.regrid([2, 3], img.coordinates(), outshape=[1, 1, 4, 4])
+    assert list(out.shape()) == [1, 1, 4, 4]
+    d = out.getdata()
+    assert d.dtype == np.float32 and np.isfinite(d).all()
+    # Saving the in-memory result produces a readable table image.
+    out_dir = pathlib.Path(tmp_path)
+    out.saveas(str(out_dir / "stacked.image"))
+    again = ct.image(str(out_dir / "stacked.image"))
+    np.testing.assert_array_equal(again.getdata(), d)
 
 
 @needs_casacore
