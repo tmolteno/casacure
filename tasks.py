@@ -24,9 +24,10 @@ The three CI jobs (`.github/workflows/ci.yml`) are reproduced locally:
   * freethreaded — `invoke test --freethreaded` (no-GIL CPython 3.14t)
 
 `invoke release` runs the `test` job by default and the other two with
-`--sanitizers` / `--freethreaded` (or `--all-jobs` for all three).  The
-publish workflows (`publish-python.yml`, `publish-rust.yml`) are triggered
-by the tag push, exactly as before.
+`--sanitizers` / `--freethreaded` (or `--all-jobs` for all three).  The tag
+push triggers `ci.yml` (its `v*` trigger) as well as the publish workflows
+(`publish-python.yml`, `publish-rust.yml`); the release waits for all three
+runs of the tag before reporting success.
 
 Requires: invoke, plumbum, docker, gh (authenticated), cargo, rustup (for
 the --sanitizers job).
@@ -121,26 +122,32 @@ def _tag_exists(tag: str) -> bool:
 
 
 def _wait_for_ci(ref: str, timeout_s: int = 3600) -> None:
-    """Wait for the CI + Publish workflows of `ref` (the tag) to go green.
+    """Wait for the tag's CI + both publish workflows to go green.
 
-    Filters by workflow + headBranch: a bare `--limit 1` sees whatever ran
-    last (often the previous tag's run, still green) and would return before
-    the new build even registers.
+    Each workflow is queried on its own: `gh run list`'s `--workflow` is a
+    single-value flag, so passing it twice silently keeps only the last one
+    (that is why this used to wait forever for a second workflow name even
+    though every run was green).  Runs are matched by `headBranch`, which for
+    a tag push is the tag itself; a bare `--limit 1` would instead see
+    whatever ran last, often the previous tag's still-green run.
     """
+    workflows = ("ci.yml", "publish-python.yml", "publish-rust.yml")
     start = time.time()
     run_ids: dict[str, int] = {}
-    while len(run_ids) < 2:  # CI + Publish Python package
-        runs = json.loads(local["gh"]["run", "list", "-R", "tmolteno/casacure",
-                                     "--workflow", "ci.yml", "--workflow",
-                                     "publish-python.yml", "--limit", "10",
-                                     "--json", "databaseId,headBranch,name"]())
-        for r in runs:
-            if r["headBranch"] == ref:
-                run_ids.setdefault(r["name"], r["databaseId"])
-        if len(run_ids) >= 2:
+    while len(run_ids) < len(workflows):
+        for wf in workflows:
+            runs = json.loads(local["gh"]["run", "list", "-R", "tmolteno/casacure",
+                                         "--workflow", wf, "--limit", "10",
+                                         "--json", "databaseId,headBranch,workflowName"]())
+            for r in runs:
+                if r["headBranch"] == ref:
+                    run_ids.setdefault(r["workflowName"], r["databaseId"])
+        if len(run_ids) >= len(workflows):
             break
         if time.time() - start > 300:
-            msg = f"no CI/publish run appeared for {ref} in 300 s"
+            seen = ", ".join(sorted(run_ids)) or "none"
+            msg = (f"only these workflow runs appeared for {ref} in 300 s: {seen} "
+                   f"(expected {', '.join(workflows)})")
             raise RuntimeError(msg)
         print("  waiting for the workflow runs of", ref, "to register...")
         time.sleep(20)
@@ -152,11 +159,14 @@ def _wait_for_ci(ref: str, timeout_s: int = 3600) -> None:
                                  "--json", "status,conclusion",
                                  "--jq", '"\\(.status) \\(.conclusion)"']()
             line = result.strip()
-            if "success" in line:
+            status, _, conclusion = line.partition(" ")
+            if conclusion == "success":
                 print(f"    {name}: {line}")
                 break
-            if "failure" in line:
-                msg = (f"{name} CI failed (run {run_id}); see "
+            # Any other completed state (failure, cancelled, timed_out,
+            # skipped) is a failed release: do not spin until the timeout.
+            if status == "completed":
+                msg = (f"{name} did not succeed ({line or conclusion}); see "
                        f"gh run view {run_id} -R tmolteno/casacure --log-failed")
                 raise RuntimeError(msg)
             print(f"    {name}: {line}")
@@ -273,9 +283,9 @@ def release(c,
        them as `release: bump to X.Y.Z` (default; skip with --no-bump, or
        override with --version X.Y.Z which implies --no-bump since the tag is
        given explicitly).
-    3. tag vX.Y.Z and push, which triggers `publish-python.yml` and
-       `publish-rust.yml`.
-    4. wait for the publish workflows to go green.
+    3. tag vX.Y.Z and push, which triggers `ci.yml`, `publish-python.yml`
+       and `publish-rust.yml`.
+    4. wait for those three workflow runs of the tag to go green.
 
     Idempotent: a tag already on origin is verified and skipped, not re-pushed.
     """

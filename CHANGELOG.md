@@ -7,19 +7,16 @@ subtasks are moved here.
 
 ### Fixed
 
-- **The release procedure is `invoke release`** (README "Releasing",
-  `tasks.py`): the Docker CI gate, version bump, tag, push and
-  publish-wait in one command. Documented in README, TODO.md and
-  handover.md; do not hand-tag. The pre-release Docker image now
-  installs `astropy` (the new image fixtures need it in
-  `make_fixtures.py`).
-- **`invoke release` now stamps `CHANGELOG.md` for you**: the entries that
-  accumulated under `## [Unreleased]` move beneath the new release's dated
-  heading (`## [X.Y.Z] - <today>`), with a fresh empty `## [Unreleased]`
-  left on top, so the changelog no longer has to be edited by hand at
-  release time. A section that already exists (hand-written notes, or a
-  re-run) is left untouched, and `--no-bump`/`--version X.Y.Z` warn when the
-  version being tagged has no section.
+- **`invoke release` no longer times out waiting for the publish
+  workflows.** `gh run list`'s `--workflow` flag is a single value, so
+  passing `ci.yml` and `publish-python.yml` together silently kept only the
+  last one: the wait loop never saw two workflow names and raised
+  `no CI/publish run appeared for vX.Y.Z in 300 s` even when everything had
+  gone green — which is exactly what v3.8.25 hit, with the tag's CI, the
+  PyPI upload and the crates.io publish all green. Each workflow is now
+  queried on its own (the tag's `ci.yml` run is waited for as well), and a
+  run that completes *without* succeeding (cancelled, timed out) fails fast
+  instead of spinning until the one-hour timeout.
 
 ## [3.8.25] - 2026-10-07
 
@@ -54,6 +51,15 @@ subtasks are moved here.
 - New Rust dependencies: `sofars` 0.6 (MIT, SOFA algorithms) and
   `celestial-eop-data` 0.1 (MIT/Apache-2.0, IERS data); both pure Rust, so
   wheels still build without a C toolchain beyond the existing ones.
+- **The release procedure is `invoke release`** (`tasks.py`): the Docker CI
+  gate, version bump, tag, push and publish-wait in one command; do not
+  hand-tag. It now stamps `CHANGELOG.md` itself — the accumulated
+  `[Unreleased]` entries move beneath the new `## [X.Y.Z] - <today>`
+  heading, with a fresh empty `[Unreleased]` left on top (idempotent, and a
+  hand-written section wins) — and warns when `--no-bump`/`--version X.Y.Z`
+  tag a version that has no section. The pre-release gate also re-runs the
+  measures casacore-parity contract (below) inside the image, and CI runs it
+  without the shim so real python-casacore is visible.
 
 ### Fixed
 

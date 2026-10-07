@@ -337,17 +337,18 @@ them. `invoke test --sanitizers` and `--freethreaded` reproduce the `tsan`
 jobs as `docker run` commands on the same image.
 
 **After the gate passes**, `invoke release` commits the release, tags
-`vX.Y.Z`, pushes `main` + the tag (which fires `publish-python.yml` and
-`publish-rust.yml`, exactly as before), and polls `gh run list` /
-`gh run view` until both publish workflows go green — it fails loudly if
-either fails, rather than leaving a half-published release. A tag that is
+`vX.Y.Z`, pushes `main` + the tag — which fires `ci.yml` (its `v*` tag
+trigger), `publish-python.yml` and `publish-rust.yml` — and polls
+`gh run list` / `gh run view` until all three go green, failing loudly if
+any does not, rather than leaving a half-published release. A tag that is
 already on origin is verified and skipped, so the task is idempotent and
 safe to re-run.
 
-**What `invoke release` does not do:** it does not edit `CHANGELOG.md`.
-The convention is to write the changelog entry by hand first (the task
-commits `CHANGELOG.md` alongside `pyproject.toml`/`Cargo.toml` in the
-release commit), so the notes are always deliberate.
+**`CHANGELOG.md` notes are written as you go, under `## [Unreleased]`**;
+`invoke release` stamps the heading for you (see "Releasing" above), so the
+release commit carries the version bump and the newly dated notes together.
+Hand-written release notes win: a `## [X.Y.Z]` section that already exists
+is left alone.
 
 ## Development
 
