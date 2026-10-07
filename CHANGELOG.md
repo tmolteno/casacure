@@ -5,6 +5,8 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.26] - 2026-10-08
+
 ### Fixed
 
 - **`getcolslicenp` fills the buffer straight from the data files when the

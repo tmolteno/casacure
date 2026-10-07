@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/casacure", "crates/casacure-python"]
 
 [workspace.dependencies]
-casacure = { path = "crates/casacure", version = "3.8.25" }
+casacure = { path = "crates/casacure", version = "3.8.26" }
 # Astrometry engine for `casacure::measures`: a pure-Rust port of the IAU
 # SOFA routines (the same algorithms ERFA/pyerfa/astropy use). Pinned to the
 # 0.6 series: 0.6.1 is the version the accuracy tests in
@@ -14,7 +14,7 @@ sofars = "0.6.1"
 celestial-eop-data = "0.1"
 
 [workspace.package]
-version = "3.8.25"
+version = "3.8.26"
 authors = ["Tim Molteno <tim@elec.ac.nz>"]
 edition = "2021"
 license = "LGPL-3.0-or-later"
