@@ -2303,6 +2303,29 @@ impl Table {
             nrow as u64
         };
         let col_idx = self.col_index(column)?;
+        // Whole-cell fast path (DDFacet's chunk reader lives here): a slice
+        // that covers the fixed cell on a raw-supported column fills the
+        // buffer straight from the data files, one memcpy per row.  The
+        // per-cell path below costs ~20x on a 435-row chunk read: it builds a
+        // heap RecordValue per row and then converts element-by-element
+        // through fill_flat's dtype match (measured 2026-10-08, ssd0000.MS
+        // DATA 4x4 complex64: 0.70 ms/call vs python-casacore's 0.03).
+        let read_table = {
+            let inner = self.inner.lock().unwrap();
+            match &*inner {
+                Inner::Read(t) => Some(std::sync::Arc::clone(t)),
+                _ => None,
+            }
+        };
+        if let Some(t) = &read_table {
+            let desc = &t.dat.desc.columns[col_idx];
+            if slice_is_whole_cell(&blc, &trc, &inc_v, desc)
+                && t.raw_column_supported(col_idx)
+                && fill_numpy_raw(py, t, col_idx, startrow, nrow, buf)?
+            {
+                return Ok(());
+            }
+        }
         let cells =
             py.detach(|| self.read_colslice(col_idx, &blc, &trc, &inc_v, startrow, nrow))?;
         let cell = cell_shape_of(&cells).iter().product::<usize>().max(1);
@@ -3369,6 +3392,46 @@ fn split_inc_startrow_nrow(
     Err(PyTypeError::new_err(
         "getcolslice/getcolslicenp inc must be a sequence of ints (python-casacore) or an int (legacy casacure startrow)",
     ))
+}
+
+/// True when the `getcolslice`/`getcolslicenp` arguments select every element
+/// of the cell, so the read can go through the raw bulk path
+/// (`fill_numpy_raw`) instead of per-cell decoding.  Matches
+/// `Table::read_colslice`'s idiom: any negative `blc`/`trc` means the whole
+/// cell, an empty `blc`/`trc` pair too, and scalar columns ignore the slice.
+/// `desc.shape` is stored order, so compare against its reverse
+/// (python-casacore's logical order, as `fill_numpy_raw` also does).
+fn slice_is_whole_cell(
+    blc: &[i64],
+    trc: &[i64],
+    inc: &[i64],
+    desc: &core::tabledesc::ColumnDesc,
+) -> bool {
+    use core::tabledesc::ColumnKind;
+    if !matches!(desc.kind, ColumnKind::Array) {
+        return true; // scalar column: the slice is ignored by read_colslice
+    }
+    if (blc.is_empty() && trc.is_empty())
+        || blc.iter().any(|&b| b < 0)
+        || trc.iter().any(|&t| t < 0)
+    {
+        return true;
+    }
+    let Some(s) = &desc.shape else {
+        return false; // variable-shape array: no fixed whole to cover
+    };
+    if blc.len() != s.len() || trc.len() != s.len() {
+        return false;
+    }
+    blc.iter()
+        .zip(trc.iter())
+        .zip(s.iter().rev())
+        .enumerate()
+        .all(|(d, ((&b, &t), &stored))| {
+            let n = stored.max(0) as i64;
+            let step = inc.get(d).copied().unwrap_or(1).max(1);
+            b == 0 && step == 1 && t == n - 1
+        })
 }
 
 fn reshape_cell(shape: &[usize]) -> usize {

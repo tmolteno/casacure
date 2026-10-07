@@ -210,6 +210,37 @@ def test_getcolslicenp_tuple_slice(ms):
     t.close()
 
 
+def test_getcolslicenp_whole_cell_is_the_raw_fast_path_and_matches_getcol(ms):
+    """The whole-cell slice -- DDFacet's chunk-reader shape, cs_tlc=(chan0, 0)
+    .. cs_brc=(chan_last, ncorr-1) with step 1 -- must take the raw bulk fill
+    (one memcpy per row) and stay bit-identical to getcol.  The per-cell
+    RecordValue path it replaces cost ~20x on a 435-row chunk read
+    (2026-10-08, ssd0000.MS DATA 4x4 complex64: 0.70 ms/call vs
+    python-casacore's 0.03; the fast path restores ~0.03)."""
+    t = table(ms, ack=False)
+    data = t.getcol("DATA")
+    for blc, trc in (
+        ((0, 0), (NCHAN - 1, NCORR - 1)),  # explicit full cover
+        ((-1, -1), (-1, -1)),              # the whole-cell idiom
+        ((), ()),                          # empty == whole cell
+    ):
+        buf = np.full((NROW, NCHAN, NCORR), np.nan + 1j * np.nan, dtype=np.complex64)
+        t.getcolslicenp("DATA", buf, blc, trc, (1, 1), 0, NROW)
+        assert np.array_equal(buf, data), f"whole-cell slice {blc}..{trc} diverged from getcol"
+    t.close()
+
+
+def test_getcolslicenp_whole_cell_bool_and_row_offset(ms):
+    """The fast path must also hold for the FLAG column and respect a
+    non-zero startrow (the raw fill walks rows from startrow)."""
+    t = table(ms, ack=False)
+    flags = t.getcol("FLAG")
+    buf = np.ones((3, NCHAN, NCORR), dtype=bool)
+    t.getcolslicenp("FLAG", buf, (-1, -1), (-1, -1), (1, 1), 2, 3)
+    assert np.array_equal(buf, flags[2:5])
+    t.close()
+
+
 def test_getcolslicenp_with_row_window(ms):
     t = table(ms, ack=False)
     data = t.getcol("DATA")

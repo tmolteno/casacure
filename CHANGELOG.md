@@ -7,6 +7,20 @@ subtasks are moved here.
 
 ### Fixed
 
+- **`getcolslicenp` fills the buffer straight from the data files when the
+  slice covers the whole cell** (the DDFacet chunk-reader shape,
+  `cs_tlc=(chan0, 0) .. cs_brc=(chan_last, ncorr-1)`, step 1, and the
+  negative/empty whole-cell idioms): one memcpy per row through the
+  `getcol_raw` machinery instead of a heap `RecordValue` per row converted
+  element-by-element through `fill_flat`'s dtype match.  Measured on
+  ssd0000.MS DATA (435 rows, 4x4 complex64): 0.70 -> 0.025 ms/call
+  (python-casacore: 0.03).  DDFacet's stage-4 chunk reads had been paying
+  the per-cell path on every DATA/FLAG read, serialising the CF thread pool
+  behind the GIL -- the full 3GC SSD leg ran ~50x slower and ballooned to
+  ~54 GiB RSS (found by the meerkat_imaging pre-release gate, 2026-10-07/08).
+  Partial slices keep the per-cell path; data is bit-identical
+  (ImagingWeights caches compared across 60 channels).
+
 - **`invoke release` no longer times out waiting for the publish
   workflows.** `gh run list`'s `--workflow` flag is a single value, so
   passing `ci.yml` and `publish-python.yml` together silently kept only the
