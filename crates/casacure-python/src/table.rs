@@ -3428,7 +3428,7 @@ fn slice_is_whole_cell(
         .zip(s.iter().rev())
         .enumerate()
         .all(|(d, ((&b, &t), &stored))| {
-            let n = stored.max(0) as i64;
+            let n = stored.max(0);
             let step = inc.get(d).copied().unwrap_or(1).max(1);
             b == 0 && step == 1 && t == n - 1
         })
