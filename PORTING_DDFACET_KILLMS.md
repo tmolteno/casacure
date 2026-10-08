@@ -280,6 +280,17 @@ Three casacure gaps surfaced during the port and were fixed:
 - **`table.__len__`** (`casacure-python/src/table.rs`): `len(t)` -> `nrows()`,
   matching python-casacore.
 
+Note (issue #16): that chain now returns a **reference table** — the source's
+columns with a row order, no copied cells (2.48 → 0.046 GiB peak on the
+ssd0000.MS repro, and its `getkeyword`/subtable paths still resolve against
+the source directory through `name()`). The result is read-only, so
+killMS's *write* sites that go through `GiveMainTable` — `putcol` of
+`IMAGING_WEIGHT`/predicted data when a `TaQL` selection is set
+(`kMS.py:872,902,1108,1131`) — now raise instead of (as before #16) writing
+into a discarded temp copy of the selection; `AddCol`/`PutLOFARKeys` are
+unaffected where they open the MS directly. Routing those writes through the
+row order (as casacore does) is the follow-up — see `TODO.md` §3.
+
 ## 4. Out of scope
 
 - `Imager/ClassMontblancMachine.py` (montblanc extra; `me.uvw`/`me.baseline`).

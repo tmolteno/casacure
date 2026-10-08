@@ -21,6 +21,15 @@ long scan resident at ~the working set instead of the whole file.
   opening the output MS for update (the first thing dask-ms's
   write-changed-only path does) is at casacore parity — see "The write path"
   below.
+- A **`query()`/`sort()` result** is a reference table: the source's columns
+  plus a row order (`Vec<u64>`), never a copy of the selected cells (issue
+  #16). Five distinct selections of a 130 500-row MS peak at **0.046 GiB**
+  where the materialising form peaked at 2.48 GiB — and because the reads go
+  straight to the source's own storage managers they are faster than reading
+  the copy was (DDFacet's whole-cell `getcolslicenp` chunk reads: 0.036 vs
+  0.573 s for 300 chunks of DATA). `taql()` and projections that compute
+  values still materialise (and still write a `casacure-taql-*` scratch
+  directory), bounded by `malloc_trim` after each one.
 
 ## The measured numbers
 
@@ -150,6 +159,8 @@ grown in place keeps the whole-table rewrite. Such layouts are:
 | **+ typed-buffer `getcolnp`** | SSM numeric cells decode straight from the map into the numpy buffer (no per-cell `Vec<RecordValue>`), so a single whole-column read holds ~1 full buffer + the read window (2.2 GiB, casacore parity) |
 | **+ lazy cell store** | a writable open allocates nothing (the row count is authoritative; a column's cells are allocated on first write), so the dask-ms changed-only write path reaches parity: 801 → 80 MiB to open `bpcal.ms` writable, and 4.0× → 1.5× peak RSS on the flag workload |
 | **+ growth in place** | a flush on a table with more rows than its files appends default rows to each storage manager instead of regenerating the table, so writing a NEW table through dask-ms is chunk-bounded: 1865 → 188 MiB and 57.6 → 1.45 s for 256k rows, below casacore |
+| **+ `malloc_trim` after SELECT/sort** (3.8.27) | freed glibc arena pages from a materialising TaQL result go back to the OS, so 5 threads × 1 sort each retain 0.12 GiB instead of 10.2 GiB — the arena half of the "memory balloon" |
+| **+ reference-table `query()`/`sort()`** (issue #16) | a selection is a row order over the source, never a copy of its cells: the issue's repro drops 2.48 → 0.046 GiB peak and writes no scratch directory; the trim above is now only a safety net for `taql()` and computed projections |
 
 ## How it works
 

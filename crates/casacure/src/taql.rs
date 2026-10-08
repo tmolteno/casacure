@@ -1367,6 +1367,16 @@ fn row_ctx<'a>(t: &'a Table, tables: &'a [&'a Table]) -> EvalCtx<'a> {
 }
 
 fn writable_edit(t: &Table) -> TResult<WritableTable> {
+    // A reference table (`table.query()` / `table.sort()`) carries only a
+    // row order over its source; writing through one would silently edit the
+    // *source* table at the mapped rows. casacore refuses writes to its
+    // query/sort results too (`RuntimeError: ... is not writable`).
+    if t.is_view() {
+        return Err(TaqlError::Eval(format!(
+            "cannot modify {}: it is a reference table (query/sort result), which is read-only",
+            t.name()
+        )));
+    }
     WritableTable::from_table(std::path::PathBuf::from(t.name()), t)
         .map_err(|e| TaqlError::Eval(format!("cannot edit table {}: {e}", t.name())))
 }
@@ -2031,13 +2041,26 @@ fn run_select(sel: &Select, tables: &[&Table]) -> TResult<TaqlTable> {
         return Ok(out);
     }
 
-    // Row-mode: filter, sort, project.
+    // Row-mode: filter, sort, paginate — then project the cells out.
+    let rows = select_rows(&ctx, sel)?;
+    let mut out = project_rows(&ctx, sel, &rows)?;
+    out.source_keywords = source_keywords;
+    Ok(out)
+}
+
+/// The row-mode half of a SELECT: the source rows whose `WHERE` is true, in
+/// `ORDERBY` order, after `OFFSET`/`LIMIT`. The indices address `ctx.table`'s
+/// own row space — for a reference table (`$1` being a `table.query()`/
+/// `table.sort()` result) that is the *view's* rows, which is exactly what
+/// [`Table::row_order`] composes.
+fn select_rows(ctx: &EvalCtx<'_>, sel: &Select) -> TResult<Vec<i64>> {
+    let table = ctx.table;
     let mut rows: Vec<i64> = (0..table.nrows() as i64).collect();
     if let Some(where_) = &sel.where_ {
         rows.retain(|&r| ctx.eval_row(where_, r).map(|v| v.truthy()).unwrap_or(false));
     }
     if !sel.orderby.is_empty() {
-        sort_rows(&ctx, &mut rows, &sel.orderby)?;
+        sort_rows(ctx, &mut rows, &sel.orderby)?;
     }
     if let Some(off) = sel.offset {
         rows.drain(..(off.min(rows.len() as i64).max(0)) as usize);
@@ -2045,9 +2068,76 @@ fn run_select(sel: &Select, tables: &[&Table]) -> TResult<TaqlTable> {
     if let Some(limit) = sel.limit {
         rows.truncate(limit.max(0) as usize);
     }
-    let mut out = project_rows(&ctx, sel, &rows)?;
-    out.source_keywords = source_keywords;
-    Ok(out)
+    Ok(rows)
+}
+
+/// Whether a SELECT projects its source table's columns unchanged: `*`, or
+/// the same columns by name in the same order with no aliases. Only then is
+/// the result a pure row selection of the source, which a reference table
+/// ([`crate::table::Table::row_order`]) can serve without copying cells;
+/// computed columns, subsets and renames need the values materialised.
+fn identity_projection(sel: &Select, table: &Table) -> bool {
+    let Some(cols) = &sel.columns else {
+        return true;
+    };
+    if cols.len() != table.dat.desc.columns.len() {
+        return false;
+    }
+    cols.iter()
+        .zip(&table.dat.desc.columns)
+        .all(|((expr, alias), cd)| {
+            alias.is_none() && matches!(expr, Expr::Name(n) if *n == cd.name)
+        })
+}
+
+/// Run a `SELECT` as a **row order** instead of materialising it: the
+/// statement must be a plain `SELECT` over `$1` with an identity projection
+/// (see [`identity_projection`]), no `UNIQUE`, no `GROUPBY`/`HAVING` and no
+/// `INTO`, in which case the result's row `i` is `tables[0]`'s row
+/// `rows[i]` — the input for a casacore-style reference table
+/// ([`crate::table::Table::row_order`]).
+///
+/// `Ok(None)` means "not a pure row selection": the caller runs the same
+/// query through [`execute`] instead, which parses it the same way and
+/// materialises whatever it selects. Parse/evaluation errors are `Err`, as
+/// they are for [`execute`] — re-running would fail the same way.
+pub fn execute_row_order(query: &str, tables: &[&Table]) -> TResult<Option<Vec<u64>>> {
+    let toks = tokenize(query)?;
+    let mut p = Parser { toks, pos: 0 };
+    let kw = match p.peek() {
+        Some(Tok::Ident(w)) => w.clone(),
+        // Not a statement this can answer (an empty query is `execute`'s
+        // to reject).
+        _ => return Ok(None),
+    };
+    // Everything `execute_into` dispatches elsewhere (CREATE/COUNT/UPDATE/
+    // DELETE/INSERT/DROPTABLE/ALTER/SHOW/HELP/CALC) is not a row selection.
+    if !kw.eq_ignore_ascii_case("select") {
+        return Ok(None);
+    }
+    let sel = p.parse_select()?;
+    if matches!(p.peek(), Some(Tok::Ident(w)) if w == ";") {
+        p.next();
+    }
+    if p.pos < p.toks.len() {
+        return Err(TaqlError::Parse(format!(
+            "trailing tokens after query: {:?}",
+            &p.toks[p.pos..]
+        )));
+    }
+    if sel.into.is_some() || sel.unique || !sel.groupby.is_empty() || sel.having.is_some() {
+        return Ok(None);
+    }
+    let TableRef::Table(1) = sel.table else {
+        return Ok(None);
+    };
+    let table = tables.first().copied().ok_or(TaqlError::NoSuchTable(1))?;
+    if !identity_projection(&sel, table) {
+        return Ok(None);
+    }
+    let ctx = row_ctx(table, tables);
+    let rows = select_rows(&ctx, &sel)?;
+    Ok(Some(rows.into_iter().map(|r| r as u64).collect()))
 }
 
 /// The group pipeline: rows grouped by the group-by expressions, in
@@ -5671,5 +5761,104 @@ mod tests {
         // stringified to an empty integer in outputs.
         let r = query(&t, "SELECT NAME ~ regex('x') AS v FROM $1 LIMIT 1");
         assert_eq!(bools(r.getcol("v").unwrap()), [false]);
+    }
+
+    // ------------------------------------------------------------------
+    // `execute_row_order`: the row-order path behind `table.query()` /
+    // `table.sort()` (issue #16 — no cell is copied, only the selected
+    // row order is).
+    // ------------------------------------------------------------------
+
+    fn row_order(t: &Table, q: &str) -> Option<Vec<u64>> {
+        execute_row_order(q, &[t]).unwrap()
+    }
+
+    #[test]
+    fn row_order_filters_sorts_and_paginates() {
+        // probe: ANT=[1,2,0,2,1] WHAT=[10..50] VAL=[5.5,2.0,9.0,2.0,1.0]
+        let (_dir, t) = probe_table();
+        assert_eq!(
+            row_order(&t, "SELECT * FROM $1 WHERE ANT > 0"),
+            Some(vec![0, 1, 3, 4])
+        );
+        assert_eq!(
+            row_order(&t, "SELECT * FROM $1 ORDERBY VAL"),
+            Some(vec![4, 1, 3, 0, 2])
+        );
+        assert_eq!(
+            row_order(&t, "SELECT * FROM $1 ORDERBY VAL DESC"),
+            Some(vec![2, 0, 3, 1, 4])
+        );
+        assert_eq!(
+            row_order(&t, "SELECT * FROM $1 ORDERBY ANT, WHAT"),
+            Some(vec![2, 0, 4, 1, 3])
+        );
+        assert_eq!(
+            row_order(&t, "SELECT * FROM $1 ORDERBY ANT LIMIT 2 OFFSET 1"),
+            Some(vec![0, 4])
+        );
+        // An explicit projection of every source column, in order, is still
+        // a pure row selection.
+        assert_eq!(
+            row_order(&t, "SELECT ANT, WHAT, VAL, NAME FROM $1"),
+            Some(vec![0, 1, 2, 3, 4])
+        );
+    }
+
+    #[test]
+    fn row_order_matches_the_materialised_projection() {
+        let (_dir, t) = probe_table();
+        let q = "SELECT * FROM $1 WHERE ANT != 1 ORDERBY VAL DESC LIMIT 3";
+        let rows = row_order(&t, q).expect("pure row selection");
+        let materialised = query(
+            &t,
+            "SELECT ROWID() AS r FROM $1 WHERE ANT != 1 ORDERBY VAL DESC LIMIT 3",
+        );
+        let want: Vec<u64> = ints(materialised.getcol("r").unwrap())
+            .into_iter()
+            .map(|r| r as u64)
+            .collect();
+        assert_eq!(
+            rows, want,
+            "the row order must be exactly the selected row order"
+        );
+    }
+
+    #[test]
+    fn row_order_declines_what_it_cannot_serve_without_copying() {
+        let (_dir, t) = probe_table();
+        for q in [
+            // Computed / renamed / subset projections need the values.
+            "SELECT ANT * 2 AS doubled FROM $1",
+            "SELECT ANT FROM $1",
+            "SELECT ANT AS A FROM $1",
+            // De-duplication and grouping change the row set by value.
+            "SELECT UNIQUE ANT FROM $1",
+            "SELECT * FROM $1 GROUPBY ANT",
+            // Writing elsewhere, or reading a table that is not `$1`.
+            "SELECT * INTO 'casacure-row-order-should-not-create' FROM $1",
+            "SELECT * FROM 'nowhere-at-all' WHERE ANT > 0",
+            "SELECT * FROM $2 WHERE ANT > 0",
+            // Statements `execute` dispatches elsewhere.
+            "COUNT FROM $1",
+            "CALC 1 + 1",
+            "UPDATE $1 SET ANT = 1",
+            "DELETE FROM $1",
+            "",
+        ] {
+            assert_eq!(
+                execute_row_order(q, &[&t]).unwrap(),
+                None,
+                "{q} is not a pure row selection"
+            );
+        }
+    }
+
+    #[test]
+    fn row_order_reports_parse_errors_like_execute() {
+        let (_dir, t) = probe_table();
+        let q = "SELECT * FROM $1 WHERE ANT > 0 trailing garbage";
+        assert!(execute_row_order(q, &[&t]).is_err());
+        assert!(execute(q, &[&t]).is_err());
     }
 }

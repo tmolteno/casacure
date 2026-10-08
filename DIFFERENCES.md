@@ -88,11 +88,54 @@ latitude and reproduces real casacore's `AZEL` to under 1″.
 records the full accuracy contract, including the one IERS-prediction
 window where the bundled and astropy data disagree.
 
+## `query()`/`sort()` results are read-only reference tables
+
+**casacore behaviour** (probed against python-casacore 3.8.1). A
+`query()`/`sort()` result is a *reference table*: `name()` is a notional
+scratch path that does not exist on disk (`/tmp/tab2_1`), no data is copied,
+and the result is writable **iff its source is** — a `putcol` through it is
+routed by the row order into the source rows it maps to (writing `[1,2,3,4,5]`
+into a result sorted by `a` lands as `[4,1,3,2,5]` in source order).
+
+**casacure behaviour.** Since #16 the result is a reference table too (a row
+order, no cells copied — see the #16 entry in `CHANGELOG.md`), with three
+differences:
+
+- `name()` is the **source table's directory**. Subtable keywords,
+  `getdminfo`, `::SUBTABLE` opens and `table(t.name())` all resolve against
+  the real table; the cost is that `table(result.name())` re-opens the
+  *source*, not the selection (casacore re-opens its reference table).
+- The result is **always read-only** (`iswritable()` is `False`, writes raise
+  `ValueError: this is a reference table (a query()/sort() result):
+  casacure does not route writes through its row order yet (casacore does),
+  so it is read-only — write through the source table instead`).
+- The materialised fallbacks (`taql()`, computed projections) are unchanged:
+  those results are writable scratch tables with a real temp path.
+
+### Why
+
+Routing writes through the row order needs the write path (buffered cell
+store, merged reads, flush) to carry the permutation as well; refusing was
+the smaller correct step. It also fixes a silent data loss: before #16 a
+write through a `query()` result went into a temp copy of the selection and
+died with it, so `killMS`'s `GiveMainTable(readonly=False)` + `putcol` path
+lost its `IMAGING_WEIGHT`/`MODEL_DATA` writes instead of reporting anything.
+A loud error is strictly better than that, and the message says where to
+write instead.
+
+### How it is asserted
+
+`tests/test_query_sort_views.py::test_reference_tables_are_read_only` (the
+refusal and both messages) and
+`::test_writes_through_a_query_result_are_refused_not_lost` (the source
+table is unchanged afterwards); the read side is held against python-casacore's
+behaviour and against the materialising TaQL path by
+`::test_unchanged_result_matches_the_materialising_taql_path`.
+
 ## Other intentional divergences
 
-None currently. TaQL's `ORDER BY` is an unimplemented feature (a gap), not a
-deliberate divergence — unimplemented features and compatibility gaps are
-tracked in `ARE_WE_CURED.md`.
+None currently. Unimplemented features and compatibility gaps are tracked in
+`ARE_WE_CURED.md`.
 
 ## Locking: casacore's protocol, with the yield checked at operation entry
 

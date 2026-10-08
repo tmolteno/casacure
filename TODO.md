@@ -41,6 +41,18 @@ command — see README "Releasing"); do not hand-tag.
 - [X] Accept numpy object arrays directly in `putcol` (no segfault wart) — the Rust layer takes `RecordValue`s; the wart is a python-casacore segfault, absent by construction; binding-side conversion is pyo3-layer work
 - [X] `addrows`, `setmaxcachesize` (no-op) — via `WritableTable` (addrows + putcol + flush); `setmaxcachesize` is a no-op
 - [X] **Typed-buffer `getcolnp` (SSM numeric path) + mid-read page dropping** — decode StandardStMan scalar/array numeric cells straight from the mapped data file into the caller's numpy buffer, skipping the per-cell `Vec<RecordValue>`/`ArrayData` intermediate, and drop the mapped pages during a long read, so a single whole-column read holds ~the result buffer only (chunk=all peak 3.2 → 2.2 GiB, at casacore parity) and chunked reads are faster. ISM/TSM/strings/records keep the existing path. See `MEMORY.md`
+- [X] **`query()`/`sort()` return a reference table (row order), not a
+      materialised copy** — issue #16: one `Vec<u64>` per result, composed
+      through chained `query()`/`sort()`, with every read API mapping its
+      rows onto the source (2.48 → 0.046 GiB peak on the ssd0000.MS repro,
+      no scratch directory, DDFacet's whole-cell chunk reads 16x faster).
+      Non-row-order statements and `taql()` still materialise; reference
+      tables are read-only (`DIFFERENCES.md`), mutating TaQL against one is
+      refused. `tests/test_query_sort_views.py`,
+      `crates/casacure/tests/reference_table.rs`.
+      Follow-up: route writes through the row order (casacore does) — until
+      then `GiveMainTable(readonly=False)` + `putcol` raises instead of
+      silently losing the write as it did before #16.
 
 ## 4. Metadata and descriptors
 

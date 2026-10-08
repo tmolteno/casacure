@@ -5,6 +5,41 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`query()`/`sort()`/`select()` return a casacore-style *reference table*:
+  a row order over the source, no cells copied** (issue #16 — the "memory
+  balloon" on the DDFacet SSD leg).  Until now every selection materialised
+  the selected cells as heap `RecordValue` trees and wrote them to a temp
+  table: on the ssd0000.MS killMS case (130 500 rows, DATA 4x4 complex64)
+  one `t.query(...).sort("TIME")` peaked at **2.48 GiB** (the issue measured
+  2.05 GiB held per distinct selection before the 3.8.27 trim), and every
+  distinct `(path, query, sort key)` paid it again.  The same repro now
+  peaks at **0.046 GiB** — five live handles, `nrows()==130500` each — and
+  writes no `casacure-taql-*` directory at all.  The row order is one
+  `Vec<u64>` per result, composed through chained `query()`/`sort()`, and
+  every read API (`nrows`, `getcol(np/slice/slicenp)`, `getcell(slice)`,
+  `getvarcol`, `t[row]`, keywords, `getdminfo`, …) maps its rows onto the
+  source, so a reference table is a snapshot of exactly the rows it selects.
+  Reads got faster with it: DDFacet's whole-cell `getcolslicenp` chunk reads
+  through a sorted handle run **16x** faster than against the materialised
+  copy (0.036 vs 0.573 s for 300 chunks of ssd0000.MS DATA) because they go
+  straight to the source's tiled column, and ISM scalar chunk reads
+  (TIME/ANTENNA1/2) are 1.4x faster.  Statements that cannot be a pure row
+  selection (computed columns, `UNIQUE`, `GROUPBY`, `SELECT ... INTO`,
+  mutating TaQL) still materialise exactly as before, as does `taql()`.
+  The 3.8.27 `malloc_trim` stays as a safety net for those paths.
+  Reference tables are read-only, which matches casacore when the source is
+  read-only and, where casacore would route the write through the row order,
+  turns a pre-#16 **silent data loss** (writes through a `query()` result
+  went into a discarded temp copy — killMS's
+  `GiveMainTable(readonly=False)` + `putcol` path) into a loud error naming
+  the source table; see `DIFFERENCES.md` for the `name()`/writability
+  details.  `copy()` on a reference table copies the selected rows (it
+  materialises on demand), mutating TaQL against one is refused instead of
+  editing its source, and `column_source()` fails loudly if a read path ever
+  forgets to map its rows.
+
 ## [3.8.27] - 2026-10-08
 
 ### Fixed
@@ -19,8 +54,9 @@ subtasks are moved here.
   RSS against python-casacore's 8 GiB).  Reproduced minimally: 5 threads x 1
   sort each retained 10.2 GiB where one thread reused 2 GiB; with the trim it
   holds 0.12 GiB.  The deeper fix -- a non-materialising sort that returns a
-  row order like casacore's -- remains future work; until then the working
-  set is the live deduped stores only.
+  row order like casacore's -- was delivered in the `[Unreleased]` section
+  above (issue #16); this trim remains as the safety net for the paths that
+  still materialise (generic `taql()`, computed projections).
 
 ## [3.8.26] - 2026-10-08
 

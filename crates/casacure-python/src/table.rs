@@ -288,6 +288,11 @@ pub struct Table {
     /// `AutoLocking` yield bookkeeping for read handles (see
     /// [`Table::auto_tick`]).
     auto_state: Mutex<AutoLockState>,
+    /// Whether this handle is a **reference table** (a `query()`/`sort()`
+    /// result: a row order over the source table, no copied cells). Kept as
+    /// a plain flag so the write paths can explain their refusal without
+    /// re-locking `inner` (see [`Table::not_writable`]).
+    view: bool,
 }
 
 #[derive(Default)]
@@ -650,6 +655,25 @@ fn range_out_of_range(startrow: u64, end: u64, nrow: u64) -> PyErr {
     ))
 }
 
+/// The error a write op raises on a handle with no writable backing.
+///
+/// A **reference table** (a `query()`/`sort()` result) gets a specific
+/// message: casacore routes its writes through the row order (probed against
+/// python-casacore 3.8.1: `putcol` on a sorted result lands in the source
+/// rows it maps to), casacure does not yet, so it is refused loudly rather
+/// than sent nowhere — which is what the pre-reference-table implementation
+/// did: such writes went into a discarded temp copy of the selection.
+fn not_writable(view: bool) -> PyErr {
+    if view {
+        return PyValueError::new_err(
+            "this is a reference table (a query()/sort() result): casacure does not route \
+             writes through its row order yet (casacore does), so it is read-only — write \
+             through the source table instead",
+        );
+    }
+    PyValueError::new_err("table is not writable")
+}
+
 /// Apply a cell sub-array slice (0-based inclusive corners; scalar cells are
 /// returned unchanged).
 fn slice_cell(cell: RecordValue, blc: &[i64], trc: &[i64], inc: &[i64]) -> PyResult<RecordValue> {
@@ -828,13 +852,15 @@ fn fill_numpy_raw(
                     return Ok(false);
                 }
                 let sz = std::mem::size_of::<$ty>();
-                let mut row = 0usize;
                 // Decode straight from the mapped file into the caller's
                 // buffer with the GIL released (see fill_buffer_by_dtype), so
                 // the dask scheduler can overlap independent column reads.
+                // `off` is the visit's row offset in this call: a reference
+                // table (query/sort result) gathers its rows out of source
+                // order, so the buffer slot cannot be a visit counter.
                 py.detach(|| {
-                    t.getcol_raw(col_idx, startrow, nrow, |_, bytes| {
-                        let dst = &mut slice[row * count..(row + 1) * count];
+                    t.getcol_raw(col_idx, startrow, nrow, |off, _, bytes| {
+                        let dst = &mut slice[off * count..(off + 1) * count];
                         if bytes.len() < count * sz {
                             return Err(short(bytes.len(), count * sz));
                         }
@@ -858,7 +884,6 @@ fn fill_numpy_raw(
                                 *d = $from(b, le);
                             }
                         }
-                        row += 1;
                         Ok(())
                     })
                     .map_err(err)
@@ -881,13 +906,13 @@ fn fill_numpy_raw(
             if slice.len() as u64 != nrow {
                 return Ok(false);
             }
-            let mut row = 0usize;
-            t.getcol_raw(col_idx, startrow, nrow, |_, bytes| {
+            t.getcol_raw(col_idx, startrow, nrow, |off, _, bytes| {
                 let Some(&b) = bytes.first() else {
                     return Err(short(0, 1));
                 };
-                slice[row] = b != 0;
-                row += 1;
+                // `off` covers `0..nrow` exactly once (the row offset within
+                // this call), so every slot of the buffer is written.
+                slice[off] = b != 0;
                 Ok(())
             })
             .map_err(err)?;
@@ -906,15 +931,13 @@ fn fill_numpy_raw(
             if slice.len() as u64 != nrow * count as u64 {
                 return Ok(false);
             }
-            let mut row = 0usize;
             py.detach(|| {
-                t.getcol_raw_bits(col_idx, startrow, nrow, |bytes, skip, nelem| {
+                t.getcol_raw_bits(col_idx, startrow, nrow, |off, bytes, skip, nelem| {
                     if nelem != count || (skip + nelem).div_ceil(8) > bytes.len() {
                         return Err(short(bytes.len(), (skip + count).div_ceil(8)));
                     }
-                    let dst = &mut slice[row * count..(row + 1) * count];
+                    let dst = &mut slice[off * count..(off + 1) * count];
                     ::casacure::tsm::decode_bits_into(bytes, skip, dst);
-                    row += 1;
                     Ok(())
                 })
                 .map_err(err)
@@ -1099,6 +1122,7 @@ user,usernoread,permanent,permanentwait"
                 inner: Mutex::new(Inner::Write { shared }),
                 lock_options: options,
                 auto_state: Mutex::new(AutoLockState::default()),
+                view: false,
             });
         }
         if !writable {
@@ -1127,6 +1151,7 @@ user,usernoread,permanent,permanentwait"
                 inner: Mutex::new(Inner::Read(std::sync::Arc::new(read))),
                 lock_options: options,
                 auto_state: Mutex::new(AutoLockState::default()),
+                view: false,
             });
         }
         // Reuse a live shared backing for this directory so concurrent
@@ -1173,6 +1198,7 @@ user,usernoread,permanent,permanentwait"
                 inner: Mutex::new(Inner::Write { shared }),
                 lock_options: options,
                 auto_state: Mutex::new(AutoLockState::default()),
+                view: false,
             });
         }
         // A writable open of an existing table is LAZY: no column is
@@ -1195,6 +1221,7 @@ user,usernoread,permanent,permanentwait"
             inner: Mutex::new(Inner::Write { shared }),
             lock_options: options,
             auto_state: Mutex::new(AutoLockState::default()),
+            view: false,
         })
     }
 
@@ -1251,15 +1278,32 @@ user,usernoread,permanent,permanentwait"
         Ok(())
     }
 
-    /// A fresh read-only core table for running TaQL against the current
-    /// on-disk state.
-    fn core_running(&self) -> PyResult<::casacure::Table> {
-        // The on-disk state must include this handle's pending (unflushed)
-        // writes; `query()`/`sort()`/`select_run()` run against the files.
-        if let Inner::Write { shared, .. } = &*self.inner.lock().unwrap() {
-            flush_if_dirty(shared)?;
-        }
-        ::casacure::Table::open(self.dir_of(), false).map_err(err)
+    /// The core table TaQL runs against this handle's current state, as an
+    /// `Arc`: the call holds it without this handle's mutex (a long
+    /// `WHERE`/`ORDERBY` scan must not serialise other threads using the
+    /// same handle) and a reference table can keep its source open
+    /// afterwards.
+    ///
+    /// A read handle contributes its own snapshot — which for a
+    /// `query()`/`sort()` result *is* the reference table, so a chained
+    /// selection composes its row order instead of re-opening the source
+    /// directory and losing it. A write handle is flushed and re-opened
+    /// from disk, since its cell store is not a `Table`.
+    fn core_source(&self) -> PyResult<std::sync::Arc<::casacure::Table>> {
+        // Refresh a released auto-lock snapshot first (no-op for a
+        // reference table: it has no lock file of its own).
+        self.auto_tick()?;
+        let inner = self.inner.lock().unwrap();
+        Ok(match &*inner {
+            Inner::Read(t) => std::sync::Arc::clone(t),
+            Inner::Write { shared, .. } => {
+                // The on-disk state must include this handle's pending
+                // (unflushed) writes; `query()`/`sort()`/`select_run()`
+                // run against the files.
+                flush_if_dirty(shared)?;
+                std::sync::Arc::new(::casacure::Table::open(self.dir_of(), false).map_err(err)?)
+            }
+        })
     }
 
     /// Read cells for a column range from whichever backing is current.
@@ -1400,11 +1444,40 @@ impl Table {
         Ok(vt.into_any().unbind())
     }
 
-    /// Run `sql` (a `SELECT * FROM $1 ...`) against this table and return
-    /// the result as a new `table`.
+    /// Run `sql` against this table and return the result as a new `table`.
+    ///
+    /// A statement that is a pure **row selection** of this table
+    /// (`SELECT * FROM $1 [WHERE ...] [ORDERBY ...] [LIMIT/OFFSET]`) comes
+    /// back as a casacore-style *reference table*: the selected row order is
+    /// kept and no cell data is copied (issue #16 — the materialised form
+    /// held ~2 GiB of heap per distinct selection on a real MS, for the
+    /// lifetime of the handle). Anything else — computed columns, `UNIQUE`,
+    /// `GROUPBY`, `SELECT ... INTO`, mutating statements — materialises
+    /// through TaQL exactly as before.
     fn select_run(&self, py: Python<'_>, sql: &str) -> PyResult<Py<PyAny>> {
-        let core_t = self.core_running()?;
-        match core::taql::execute(sql, &[&core_t]).map_err(err)? {
+        let source = self.core_source()?;
+        // Row order first: parse and evaluate only the row-mode half of the
+        // statement (filter/sort/paginate), no projection.
+        if let Some(rows) = core::taql::execute_row_order(sql, &[&*source]).map_err(err)? {
+            let view = core::Table::row_order(std::sync::Arc::clone(&source), rows).map_err(err)?;
+            let path = view.name().to_string();
+            let out = Table {
+                path,
+                // casacore's query/sort results are read-only reference
+                // tables (`table.iswritable()` is False there too).
+                writable: false,
+                inner: Mutex::new(Inner::Read(std::sync::Arc::new(view))),
+                lock_options: core::lockfile::LockOptions::no_locking(),
+                auto_state: Mutex::new(AutoLockState::default()),
+                view: true,
+            };
+            // The row-mode evaluation still caches its key/WHERE columns as
+            // `TqValue`s; hand those arena pages back like the materialising
+            // path does.
+            trim_heap();
+            return Ok(out.into_pyobject(py)?.into_any().unbind());
+        }
+        match core::taql::execute(sql, &[&*source]).map_err(err)? {
             core::taql::TaqlResult::Query(out) => {
                 let out = taql_result_to_table(py, out)?
                     .into_pyobject(py)?
@@ -1412,6 +1485,25 @@ impl Table {
                     .unbind();
                 trim_heap();
                 Ok(out)
+            }
+            other => Err(PyRuntimeError::new_err(format!(
+                "taql: expected a SELECT result, got {other:?}"
+            ))),
+        }
+    }
+
+    /// A materialised copy of this handle's rows as a temp-dir table —
+    /// `copy()` on a reference table has to copy the *selected rows in their
+    /// order*, where `tablecopy` over `name()` would copy the whole source
+    /// table. Only reached for `copy`, so the materialisation cost is paid
+    /// on demand.
+    fn materialise_result(&self, py: Python<'_>) -> PyResult<Table> {
+        let source = self.core_source()?;
+        match core::taql::execute("SELECT * FROM $1", &[&*source]).map_err(err)? {
+            core::taql::TaqlResult::Query(out) => {
+                let t = taql_result_to_table(py, out)?;
+                trim_heap();
+                Ok(t)
             }
             other => Err(PyRuntimeError::new_err(format!(
                 "taql: expected a SELECT result, got {other:?}"
@@ -1569,7 +1661,7 @@ impl Table {
                     }
                     s.dirty = true;
                 }
-                _ => return Err(PyValueError::new_err("table is not writable")),
+                _ => return Err(not_writable(self.view)),
             }
         }
         Ok(())
@@ -1766,7 +1858,7 @@ impl Table {
                     }
                     s.dirty = true;
                 }
-                _ => return Err(PyValueError::new_err("table is not writable")),
+                _ => return Err(not_writable(self.view)),
             }
         }
         Ok(())
@@ -1788,7 +1880,7 @@ impl Table {
                     s.wt.addrows(n);
                     s.dirty = true;
                 }
-                _ => return Err(PyValueError::new_err("table is not writable")),
+                _ => return Err(not_writable(self.view)),
             }
         }
         Ok(())
@@ -1823,7 +1915,7 @@ impl Table {
         };
         let mut inner = self.inner.lock().unwrap();
         let Inner::Write { shared, .. } = &mut *inner else {
-            return Err(PyValueError::new_err("table is not writable"));
+            return Err(not_writable(self.view));
         };
         let mut s = shared.lock().unwrap();
         let nrow = s.wt.nrows();
@@ -2128,6 +2220,11 @@ impl Table {
     /// `copy(newtablename, deep=False, ...)` — copy this table on disk; `deep`
     /// also copies the subtable directories referenced by `Table:` keywords
     /// (like python-casacore's `table.copy`).
+    ///
+    /// A reference table (`query()`/`sort()` result) copies its **selected
+    /// rows in their order**: it is materialised first, because `name()`
+    /// (which `tablecopy` takes) is the source table's directory and copying
+    /// that would copy every source row instead of the result.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (new_table_name, deep = false, valuecopy = false, dminfo = None, _endian = "aipsrc", _memorytable = false, _copynorows = false))]
     fn copy(
@@ -2141,9 +2238,21 @@ impl Table {
         _memorytable: bool,
         _copynorows: bool,
     ) -> PyResult<()> {
-        let own: String = slf.call_method0("name")?.extract()?;
+        let materialised: Option<Table> = {
+            let this = slf.borrow();
+            let is_view = matches!(&*this.inner.lock().unwrap(), Inner::Read(t) if t.is_view());
+            if is_view {
+                Some(this.materialise_result(py)?)
+            } else {
+                None
+            }
+        };
+        let own: String = match &materialised {
+            Some(temp) => temp.path.clone(),
+            None => slf.call_method0("name")?.extract()?,
+        };
         let src = pyo3::types::PyString::new(py, &own);
-        crate::helpers::tablecopy(
+        let out = crate::helpers::tablecopy(
             py,
             src.as_any(),
             new_table_name,
@@ -2153,7 +2262,11 @@ impl Table {
             "aipsrc",
             false,
             false,
-        )
+        );
+        // The temp materialisation (and its scratch directory) goes away now
+        // that the copy is on disk.
+        drop(materialised);
+        out
     }
 
     /// `toascii(filename, columnnames=None)` — write the table (or the given
@@ -2712,7 +2825,7 @@ impl Table {
                     s.wt.putkeyword(name, rec);
                     s.dirty = true;
                 }
-                _ => return Err(PyValueError::new_err("table is not writable")),
+                _ => return Err(not_writable(self.view)),
             }
         }
         Ok(())
@@ -2737,7 +2850,7 @@ impl Table {
                     s.wt.removekeyword(name);
                     s.dirty = true;
                 }
-                _ => return Err(PyValueError::new_err("table is not writable")),
+                _ => return Err(not_writable(self.view)),
             }
         }
         Ok(())
@@ -2761,7 +2874,7 @@ impl Table {
                     s.wt.putcolkeyword(col_idx, name, rec).map_err(err)?;
                     s.dirty = true;
                 }
-                _ => return Err(PyValueError::new_err("table is not writable")),
+                _ => return Err(not_writable(self.view)),
             }
         }
         Ok(())
@@ -2792,7 +2905,7 @@ impl Table {
                     s.wt.removecolkeyword(col_idx, name).map_err(err)?;
                     s.dirty = true;
                 }
-                _ => return Err(PyValueError::new_err("table is not writable")),
+                _ => return Err(not_writable(self.view)),
             }
         }
         Ok(())
@@ -2969,7 +3082,7 @@ impl Table {
     ) -> PyResult<()> {
         let mut inner = self.inner.lock().unwrap();
         let Inner::Write { shared, .. } = &mut *inner else {
-            return Err(PyValueError::new_err("table is not writable"));
+            return Err(not_writable(self.view));
         };
         let mut s = shared.lock().unwrap();
         for (row, value) in (startrow..).zip(values) {
@@ -3034,7 +3147,7 @@ impl Table {
         let shared = {
             let inner = self.inner.lock().unwrap();
             let Inner::Write { shared, .. } = &*inner else {
-                return Err(PyValueError::new_err("table is not writable"));
+                return Err(not_writable(self.view));
             };
             std::sync::Arc::clone(shared)
         };
@@ -3884,6 +3997,7 @@ fn taql_result_to_table(_py: Python<'_>, out: core::taql::TaqlTable) -> PyResult
         // TaQL result tables are fresh temp-dir tables with one handle.
         lock_options: core::lockfile::LockOptions::no_locking(),
         auto_state: Mutex::new(AutoLockState::default()),
+        view: false,
     })
 }
 

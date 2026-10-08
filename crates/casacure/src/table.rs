@@ -1018,6 +1018,25 @@ pub struct Table {
     pub ism_files: Vec<(u32, crate::ism::IsmFile)>,
     /// TiledColumnStMan storage managers, keyed by DM sequence number.
     pub tsm_files: Vec<(u32, crate::tsm::TsmFile)>,
+    /// The row order of a casacore-style **reference table**
+    /// (`table.query()` / `table.sort()`), `None` for a real table.
+    ///
+    /// A reference table copies no cell data: it carries the source table's
+    /// descriptor and the row permutation, and every read maps its row `i`
+    /// to the source's row `rows[i]` (see [`Table::row_order`]). The handle
+    /// holds the source open through the `Arc`, so it stays a valid snapshot
+    /// after the caller's own handle closes.
+    view: Option<Box<ViewOrder>>,
+}
+
+/// A reference table's row order: `rows[i]` is the source row that answers
+/// row `i`. `source` is always a *real* table — chained `query()`/`sort()`
+/// results compose their permutations at construction
+/// ([`Table::row_order`]) so a view never points at another view.
+#[derive(Debug)]
+struct ViewOrder {
+    rows: Vec<u64>,
+    source: std::sync::Arc<Table>,
 }
 
 impl Drop for Table {
@@ -1249,6 +1268,7 @@ impl Table {
             ssm_files,
             ism_files,
             tsm_files,
+            view: None,
         })
     }
 
@@ -1306,6 +1326,89 @@ impl Table {
     /// `table.iswritable()`).
     pub fn is_writable(&self) -> bool {
         self.writable
+    }
+
+    /// Whether this handle is a **reference table** (a `table.query()` /
+    /// `table.sort()` result): a row order over the source table instead of
+    /// its own data files. Reference tables are read-only and hold no lock
+    /// of their own (see [`Table::row_order`]).
+    pub fn is_view(&self) -> bool {
+        self.view.is_some()
+    }
+
+    /// A casacore-style **reference table** over `source`: row `i` of the
+    /// result answers with `source`'s row `rows[i]` (repeats allowed), and
+    /// no cell data is copied — the whole result costs one `Vec<u64>`.
+    ///
+    /// When `source` is itself a reference table the two orders compose, so
+    /// the result always references the real table in exactly one hop; this
+    /// is what makes chained `t.query(...).sort(...)` lazy.
+    ///
+    /// The returned handle is a read-only snapshot of the source's
+    /// descriptor:
+    ///
+    /// * `is_writable()` is `false` — casacore's query/sort results are
+    ///   read-only too (`table.iswritable()` -> `False`, `putcol` ->
+    ///   `RuntimeError: ... is not writable`, probed against python-casacore
+    ///   3.8.1);
+    /// * `lock_file()` is `None` and the lock options are `NoLocking`, so
+    ///   `lock`/`unlock`/`resync` (and the Python layer's `auto_tick`, which
+    ///   would otherwise re-open the directory and lose the row order) are
+    ///   no-ops;
+    /// * `name()` is the source table's directory, so subtable keyword
+    ///   resolution, `getdminfo` and `::SUBTABLE`-style paths keep pointing
+    ///   at the real table;
+    /// * `dat` is the source's descriptor (columns, keywords) cloned, and
+    ///   the data-file sets are empty: every read maps its rows and delegates
+    ///   to the source, and [`Table::column_source`] fails loudly if one
+    ///   forgets to.
+    ///
+    /// Errors when `rows` indexes past the end of `source` (a malformed
+    /// composed order; TaQL-produced orders cannot).
+    pub fn row_order(
+        source: std::sync::Arc<Table>,
+        rows: Vec<u64>,
+    ) -> Result<Table, TableReadError> {
+        let (base, rows) = match &source.view {
+            // Compose with the existing order: `rows` addresses the view,
+            // the view's own rows address the real table.
+            Some(v) => {
+                let base = std::sync::Arc::clone(&v.source);
+                let mut composed = Vec::with_capacity(rows.len());
+                for r in rows {
+                    let s = *v
+                        .rows
+                        .get(r as usize)
+                        .ok_or(TableReadError::RowOutOfRange {
+                            row: r,
+                            column: format!("<reference table of {} rows>", v.rows.len()),
+                        })?;
+                    composed.push(s);
+                }
+                (base, composed)
+            }
+            None => (source, rows),
+        };
+        let view = ViewOrder { rows, source: base };
+        let path = view.source.path.clone();
+        let dat = view.source.dat.clone();
+        let effective = crate::lockfile::LockOptions::no_locking().effective();
+        Ok(Table {
+            path,
+            writable: false,
+            locked: false,
+            lock_file: None,
+            lock_options: effective,
+            lock_held: None,
+            sync_seen: None,
+            dat,
+            // Never read directly: every entry point maps its rows and
+            // delegates to `view.source` first (see `column_source`).
+            ssm_files: Vec::new(),
+            ism_files: Vec::new(),
+            tsm_files: Vec::new(),
+            view: Some(Box::new(view)),
+        })
     }
 
     /// casacore `table.lock(write=True, nattempts=0)`: acquire the lock and
@@ -1441,9 +1544,13 @@ impl Table {
     /// (casacore `table.close()`).
     pub fn close(self) {}
 
-    /// Number of rows (casacore `table.nrows()`).
+    /// Number of rows (casacore `table.nrows()`): the row order's length for
+    /// a reference table, the header's count otherwise.
     pub fn nrows(&self) -> u64 {
-        self.dat.header.nrow
+        match &self.view {
+            Some(v) => v.rows.len() as u64,
+            None => self.dat.header.nrow,
+        }
     }
 
     /// Column names in column order (casacore `table.colnames()`).
@@ -1620,6 +1727,26 @@ pub enum TableReadError {
     Tsm(#[from] crate::tsm::TsmError),
 }
 
+/// `(source row, destination index)` pairs for an explicit row list — the
+/// gather order a reference table's reads use. Sorted ascending by source
+/// row (a list that is already non-decreasing is kept as it is, so an
+/// unsorted-selection or identity row order reads in one pass), so the
+/// storage managers see contiguous runs instead of one scattered resolve per
+/// row; `destination` is the index the value has to land at in the caller's
+/// own row order.
+fn source_order(rows: &[u64]) -> Vec<(u64, usize)> {
+    let mut order: Vec<(u64, usize)> = rows
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(dest, src)| (src, dest))
+        .collect();
+    if !rows.windows(2).all(|w| w[0] <= w[1]) {
+        order.sort_unstable_by_key(|&(src, _)| src);
+    }
+    order
+}
+
 impl Table {
     /// The data-manager sequence number and the column's index within that
     /// manager for `col_idx` (the per-manager column order follows table
@@ -1643,8 +1770,20 @@ impl Table {
 
     /// The storage manager serving `col_idx`, resolved once so a ranged read
     /// does not repeat the binding lookups for every row.
+    ///
+    /// A reference table has no data files of its own — its entry points map
+    /// their rows and call this on the *source* first. Reaching here with
+    /// `view` set means an entry point was missed, so it fails loudly instead
+    /// of answering with data the row order never selected.
     fn column_source(&self, col_idx: usize) -> Result<ColumnSource<'_>, TableReadError> {
         let desc = &self.dat.desc.columns[col_idx];
+        if self.view.is_some() {
+            return Err(TableReadError::UnsupportedColumn(
+                desc.name.clone(),
+                "reference table (query/sort result): its reads must map rows to the source table"
+                    .into(),
+            ));
+        }
         let (seq, within) = self.column_manager(col_idx);
         // The ColumnSet binding is authoritative: a real MS can bind a
         // column to IncrementalStMan while its description still declares
@@ -1745,8 +1884,13 @@ impl Table {
             })
     }
 
-    /// Read one cell (`table.getcell(col, row)`).
+    /// Read one cell (`table.getcell(col, row)`); a reference table maps
+    /// `row` through its order first.
     pub fn getcell(&self, col_idx: usize, row: u64) -> Result<RecordValue, TableReadError> {
+        if let Some(v) = &self.view {
+            let src = self.view_row(v, col_idx, row)?;
+            return v.source.getcell(col_idx, src);
+        }
         // Under the flush gate for reading: a same-process patch write must
         // not be in flight while this cell decodes off the mapped files.
         let flush_gate = crate::flushgate::gate(&self.path);
@@ -1755,12 +1899,60 @@ impl Table {
         self.read_cell_from(&src, &self.dat.desc.columns[col_idx], row)
     }
 
+    /// The source row a reference table's `row` addresses (bounds-checked
+    /// against the row order, so an invalid read reports the row the caller
+    /// asked for, not the source row it would have hit).
+    fn view_row(&self, v: &ViewOrder, col_idx: usize, row: u64) -> Result<u64, TableReadError> {
+        v.rows
+            .get(row as usize)
+            .copied()
+            .ok_or(TableReadError::RowOutOfRange {
+                row,
+                column: self
+                    .dat
+                    .desc
+                    .columns
+                    .get(col_idx)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| "<reference table>".to_string()),
+            })
+    }
+
+    /// The source rows serving reference-table rows `startrow..startrow+nrow`
+    /// (bounds-checked against the row order; an empty range is always fine,
+    /// exactly as for a real table).
+    fn view_rows(
+        &self,
+        column: &str,
+        startrow: u64,
+        nrow: u64,
+    ) -> Result<Vec<u64>, TableReadError> {
+        let v = self.view.as_ref().expect("view_rows on a real table");
+        if nrow == 0 {
+            return Ok(Vec::new());
+        }
+        let len = v.rows.len() as u64;
+        let end = startrow.saturating_add(nrow);
+        if end > len {
+            let row = if startrow >= len { startrow } else { len };
+            return Err(TableReadError::RowOutOfRange {
+                row,
+                column: column.to_string(),
+            });
+        }
+        Ok(v.rows[startrow as usize..end as usize].to_vec())
+    }
+
     /// Drop the data files' mapped pages (`MADV_DONTNEED`) after a bulk read
     /// has copied the cell data out, so a long streaming scan (dask-ms
     /// chunked full-column reads) stays resident at ~the current chunk
     /// instead of the whole file — the analogue of casacore's bounded LRU
     /// storage-manager cache. Pages re-read later simply fault back in.
     pub fn drop_data_file_pages(&self) {
+        if let Some(v) = &self.view {
+            v.source.drop_data_file_pages();
+            return;
+        }
         for (_, f) in &self.ssm_files {
             f.drop_data_pages();
         }
@@ -1818,9 +2010,12 @@ impl Table {
     }
 
     /// Read `nrow` cells of `col_idx` starting at `startrow`, calling
-    /// `visit(logical_shape, element_bytes)` once per row with the raw
-    /// element bytes **borrowed from the mapped data file** (no per-cell
-    /// allocation), in the data file's byte order. Only columns
+    /// `visit(row_offset, logical_shape, element_bytes)` once per row with
+    /// the raw element bytes **borrowed from the mapped data file** (no
+    /// per-cell allocation), in the data file's byte order. `row_offset` is
+    /// the row's position within this call (`0..nrow`), which is what lets a
+    /// reference table's scattered rows be gathered out of source order into
+    /// the caller's own buffer layout. Only columns
     /// [`Table::raw_column_supported`] accepts, except tiled Bool arrays
     /// (bit-packed: use [`Table::getcol_raw_bits`]). The shape is empty for
     /// scalar and tiled cells. An unset tiled cell visits zeros. Long reads
@@ -1835,12 +2030,34 @@ impl Table {
         mut visit: F,
     ) -> Result<(), TableReadError>
     where
-        F: FnMut(&[u32], &[u8]) -> Result<(), TableReadError>,
+        F: FnMut(usize, &[u32], &[u8]) -> Result<(), TableReadError>,
     {
-        use crate::tabledesc::ColumnKind;
+        if let Some(v) = &self.view {
+            let desc = &self.dat.desc.columns[col_idx];
+            let rows = self.view_rows(&desc.name, startrow, nrow)?;
+            return v.source.gather_raw(col_idx, &rows, &mut visit);
+        }
         // Under the flush gate for reading (see `getcell`).
         let flush_gate = crate::flushgate::gate(&self.path);
         let _gate_r = flush_gate.read().unwrap();
+        self.getcol_raw_impl(col_idx, startrow, nrow, &mut visit)
+    }
+
+    /// [`Table::getcol_raw`]'s body for a real table. The caller holds the
+    /// flush gate (so [`Table::gather_raw`] can walk whole runs through it
+    /// under a single acquisition); `visit` receives the row's offset within
+    /// `startrow..startrow+nrow`.
+    fn getcol_raw_impl<F>(
+        &self,
+        col_idx: usize,
+        startrow: u64,
+        nrow: u64,
+        visit: &mut F,
+    ) -> Result<(), TableReadError>
+    where
+        F: FnMut(usize, &[u32], &[u8]) -> Result<(), TableReadError>,
+    {
+        use crate::tabledesc::ColumnKind;
         let desc = &self.dat.desc.columns[col_idx];
         let src = self.column_source(col_idx).map_err(|e| match e {
             TableReadError::UnsupportedColumn(name, reason) => {
@@ -1852,13 +2069,14 @@ impl Table {
             ColumnSource::Ssm { file, spec, within } => {
                 let mut done = 0u64;
                 for r in startrow..startrow + nrow {
+                    let off = (r - startrow) as usize;
                     if matches!(desc.kind, ColumnKind::Array) {
                         let (shape, _nelem, bytes) =
                             file.array_cell_region(spec, within, desc, r)?;
-                        visit(&shape, bytes)?;
+                        visit(off, &shape, bytes)?;
                     } else {
                         let bytes = file.scalar_cell_raw(spec, within, desc, r)?;
-                        visit(&[], bytes)?;
+                        visit(off, &[], bytes)?;
                     }
                     done += 1;
                     if done.is_multiple_of(4096) {
@@ -1867,7 +2085,12 @@ impl Table {
                 }
             }
             ColumnSource::Ism { file, within } => {
-                file.for_each_cell_raw(within, desc, startrow, nrow, |bytes| visit(&[], bytes))?;
+                let mut off = 0usize;
+                file.for_each_cell_raw(within, desc, startrow, nrow, |bytes| {
+                    visit(off, &[], bytes)?;
+                    off += 1;
+                    Ok::<(), TableReadError>(())
+                })?;
             }
             ColumnSource::Tsm { file } => {
                 if desc.data_type == crate::record::DataType::Bool {
@@ -1882,15 +2105,16 @@ impl Table {
                 let mut gathered = Vec::new();
                 let mut done = 0u64;
                 for r in startrow..startrow + nrow {
+                    let off = (r - startrow) as usize;
                     match file.cell_place(desc, r)? {
                         Some((_, crate::tsm::CellPlace::Contiguous(loc))) => {
-                            visit(&[], file.location_bytes(&loc))?
+                            visit(off, &[], file.location_bytes(&loc))?
                         }
                         Some((_, crate::tsm::CellPlace::Tiled(tc))) => {
                             tc.gather_bytes(&mut gathered);
-                            visit(&[], &gathered)?
+                            visit(off, &[], &gathered)?
                         }
-                        None => visit(&[], &zeros[..])?,
+                        None => visit(off, &[], &zeros[..])?,
                     }
                     done += 1;
                     if done.is_multiple_of(4096) {
@@ -1905,10 +2129,47 @@ impl Table {
         Ok(())
     }
 
+    /// [`Table::getcol_raw`] for an explicit, possibly scattered `rows` list:
+    /// `visit(dest, shape, bytes)` gets `dest` = the row's index in `rows`.
+    ///
+    /// The source is read in ascending row order in maximal contiguous runs
+    /// — one bucket-index walk per run instead of one per row (an
+    /// IncrementalStMan resolve parses the bucket's column index, so
+    /// per-row resolves are the quadratic case `ism.rs` warns about) — while
+    /// the visits land in the caller's own row order.
+    fn gather_raw<F>(
+        &self,
+        col_idx: usize,
+        rows: &[u64],
+        visit: &mut F,
+    ) -> Result<(), TableReadError>
+    where
+        F: FnMut(usize, &[u32], &[u8]) -> Result<(), TableReadError>,
+    {
+        debug_assert!(self.view.is_none(), "gather_raw on a reference table");
+        let order = source_order(rows);
+        let flush_gate = crate::flushgate::gate(&self.path);
+        let _gate_r = flush_gate.read().unwrap();
+        let mut i = 0usize;
+        while i < order.len() {
+            let start = order[i].0;
+            let mut j = i + 1;
+            while j < order.len() && order[j].0 == order[j - 1].0 + 1 {
+                j += 1;
+            }
+            let base = i;
+            self.getcol_raw_impl(col_idx, start, (j - i) as u64, &mut |off, shape, bytes| {
+                visit(order[base + off].1, shape, bytes)
+            })?;
+            i = j;
+        }
+        Ok(())
+    }
+
     /// The bit-packed twin of [`Table::getcol_raw`] for a tiled Bool array
-    /// column: `visit(bytes, skip, nelem)` per row, the cell's bits starting
-    /// `skip` bits into `bytes` (LSB-first, casacore `bitToBool` order). An
-    /// unset cell visits zero bits.
+    /// column: `visit(row_offset, bytes, skip, nelem)` per row, the cell's
+    /// bits starting `skip` bits into `bytes` (LSB-first, casacore
+    /// `bitToBool` order). An unset cell visits zero bits.
     pub fn getcol_raw_bits<F>(
         &self,
         col_idx: usize,
@@ -1917,11 +2178,31 @@ impl Table {
         mut visit: F,
     ) -> Result<(), TableReadError>
     where
-        F: FnMut(&[u8], usize, usize) -> Result<(), TableReadError>,
+        F: FnMut(usize, &[u8], usize, usize) -> Result<(), TableReadError>,
     {
+        if let Some(v) = &self.view {
+            let desc = &self.dat.desc.columns[col_idx];
+            let rows = self.view_rows(&desc.name, startrow, nrow)?;
+            return v.source.gather_raw_bits(col_idx, &rows, &mut visit);
+        }
         // Under the flush gate for reading (see `getcell`).
         let flush_gate = crate::flushgate::gate(&self.path);
         let _gate_r = flush_gate.read().unwrap();
+        self.getcol_raw_bits_impl(col_idx, startrow, nrow, &mut visit)
+    }
+
+    /// [`Table::getcol_raw_bits`]'s body for a real table; the caller holds
+    /// the flush gate.
+    fn getcol_raw_bits_impl<F>(
+        &self,
+        col_idx: usize,
+        startrow: u64,
+        nrow: u64,
+        visit: &mut F,
+    ) -> Result<(), TableReadError>
+    where
+        F: FnMut(usize, &[u8], usize, usize) -> Result<(), TableReadError>,
+    {
         let desc = &self.dat.desc.columns[col_idx];
         let ColumnSource::Tsm { file } = self.column_source(col_idx)? else {
             return Err(TableReadError::UnsupportedRaw {
@@ -1937,16 +2218,17 @@ impl Table {
         let mut gathered = Vec::new();
         let mut done = 0u64;
         for r in startrow..startrow + nrow {
+            let off = (r - startrow) as usize;
             match file.cell_place(desc, r)? {
                 Some((_, crate::tsm::CellPlace::Contiguous(loc))) => {
-                    visit(file.location_bytes(&loc), loc.skip, loc.nelem)?
+                    visit(off, file.location_bytes(&loc), loc.skip, loc.nelem)?
                 }
                 Some((_, crate::tsm::CellPlace::Tiled(tc))) => {
                     // A multi-tile cell: its bits packed from bit 0.
                     tc.gather_bits(&mut gathered);
-                    visit(&gathered, 0, tc.nelem)?
+                    visit(off, &gathered, 0, tc.nelem)?
                 }
-                None => visit(&zeros[..], 0, nelem_default)?,
+                None => visit(off, &zeros[..], 0, nelem_default)?,
             }
             done += 1;
             if done.is_multiple_of(4096) {
@@ -1955,6 +2237,40 @@ impl Table {
         }
         if nrow >= Self::STREAMING_DROP_ROWS {
             self.drop_data_file_pages();
+        }
+        Ok(())
+    }
+
+    /// [`Table::getcol_raw_bits`] for an explicit `rows` list (see
+    /// [`Table::gather_raw`]): `visit(dest, bytes, skip, nelem)`.
+    fn gather_raw_bits<F>(
+        &self,
+        col_idx: usize,
+        rows: &[u64],
+        visit: &mut F,
+    ) -> Result<(), TableReadError>
+    where
+        F: FnMut(usize, &[u8], usize, usize) -> Result<(), TableReadError>,
+    {
+        debug_assert!(self.view.is_none(), "gather_raw_bits on a reference table");
+        let order = source_order(rows);
+        let flush_gate = crate::flushgate::gate(&self.path);
+        let _gate_r = flush_gate.read().unwrap();
+        let mut i = 0usize;
+        while i < order.len() {
+            let start = order[i].0;
+            let mut j = i + 1;
+            while j < order.len() && order[j].0 == order[j - 1].0 + 1 {
+                j += 1;
+            }
+            let base = i;
+            self.getcol_raw_bits_impl(
+                col_idx,
+                start,
+                (j - i) as u64,
+                &mut |off, bytes, skip, nelem| visit(order[base + off].1, bytes, skip, nelem),
+            )?;
+            i = j;
         }
         Ok(())
     }
@@ -1978,13 +2294,18 @@ impl Table {
     }
 
     /// Read `nrow` cells starting at `startrow` (`table.getcol` /
-    /// `getcolnp`).
+    /// `getcolnp`); a reference table reads its mapped source rows instead.
     pub fn getcol(
         &self,
         col_idx: usize,
         startrow: u64,
         nrow: u64,
     ) -> Result<Vec<RecordValue>, TableReadError> {
+        if let Some(v) = &self.view {
+            let desc = &self.dat.desc.columns[col_idx];
+            let rows = self.view_rows(&desc.name, startrow, nrow)?;
+            return v.source.gather_cells(col_idx, &rows);
+        }
         // Under the flush gate for reading (see `getcell`).
         let flush_gate = crate::flushgate::gate(&self.path);
         let _gate_r = flush_gate.read().unwrap();
@@ -2022,6 +2343,79 @@ impl Table {
         Ok(out)
     }
 
+    /// [`Table::getcol`] for an explicit `rows` list (see
+    /// [`Table::gather_raw`]): values come back in `rows` order, read from
+    /// the source in ascending order in maximal contiguous runs.
+    fn gather_cells(
+        &self,
+        col_idx: usize,
+        rows: &[u64],
+    ) -> Result<Vec<RecordValue>, TableReadError> {
+        debug_assert!(self.view.is_none(), "gather_cells on a reference table");
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let order = source_order(rows);
+        let flush_gate = crate::flushgate::gate(&self.path);
+        let _gate_r = flush_gate.read().unwrap();
+        let desc = &self.dat.desc.columns[col_idx];
+        let src = self.column_source(col_idx)?;
+        let mut slots: Vec<Option<RecordValue>> = rows.iter().map(|_| None).collect();
+        let mut i = 0usize;
+        while i < order.len() {
+            let start = order[i].0;
+            let mut j = i + 1;
+            while j < order.len() && order[j].0 == order[j - 1].0 + 1 {
+                j += 1;
+            }
+            match &src {
+                // One linear walk of the run's bucket interval indexes.
+                ColumnSource::Ism { file, within } => {
+                    let big_endian = file.header.big_endian;
+                    let mut k = i;
+                    file.for_each_cell_raw(*within, desc, start, (j - i) as u64, |cell| {
+                        slots[order[k].1] =
+                            Some(crate::ssm::decode_scalar(cell, desc, big_endian)?);
+                        k += 1;
+                        Ok::<(), crate::ism::IsmError>(())
+                    })
+                    .map_err(|e| match e {
+                        crate::ism::IsmError::RowOutOfRange { row } => {
+                            TableReadError::RowOutOfRange {
+                                row,
+                                column: desc.name.clone(),
+                            }
+                        }
+                        other => other.into(),
+                    })?;
+                }
+                _ => {
+                    for k in i..j {
+                        let r = order[k].0;
+                        slots[order[k].1] =
+                            Some(self.read_cell_from(&src, desc, r).map_err(|e| match e {
+                                TableReadError::RowOutOfRange { .. } => {
+                                    TableReadError::RowOutOfRange {
+                                        row: r,
+                                        column: desc.name.clone(),
+                                    }
+                                }
+                                other => other,
+                            })?);
+                    }
+                }
+            }
+            i = j;
+        }
+        if rows.len() as u64 >= Self::STREAMING_DROP_ROWS {
+            self.drop_data_file_pages();
+        }
+        Ok(slots
+            .into_iter()
+            .map(|s| s.expect("every destination row was read"))
+            .collect())
+    }
+
     /// Read a slice of each array cell (`table.getcolslice(col, blc, trc,
     /// startrow, nrow)`): `blc`/`trc` are the inclusive start/end for each
     /// logical dimension.
@@ -2046,6 +2440,19 @@ impl Table {
         startrow: u64,
         nrow: u64,
     ) -> Result<Vec<RecordValue>, TableReadError> {
+        if let Some(v) = &self.view {
+            // Gather the mapped source rows in run order (one pass over the
+            // storage manager), then slice each cell — same result as
+            // per-row `getcellslice_inc`, without one gate/bucket resolve
+            // per row.
+            let desc = &self.dat.desc.columns[col_idx];
+            let rows = self.view_rows(&desc.name, startrow, nrow)?;
+            let cells = v.source.gather_cells(col_idx, &rows)?;
+            return cells
+                .into_iter()
+                .map(|cell| slice_stored_cell(cell, blc, trc, inc))
+                .collect();
+        }
         let mut out = Vec::with_capacity(nrow as usize);
         for r in startrow..startrow + nrow {
             out.push(self.getcellslice_inc(col_idx, r, blc, trc, inc)?);
@@ -2074,16 +2481,8 @@ impl Table {
         trc: &[i64],
         inc: &[i64],
     ) -> Result<RecordValue, TableReadError> {
-        let cell = self.getcell(col_idx, row)?;
-        let RecordValue::Array(arr) = cell else {
-            return Ok(cell);
-        };
-        if blc.is_empty() && trc.is_empty() {
-            return Ok(RecordValue::Array(arr));
-        }
-        Ok(RecordValue::Array(slice_array_value_inc(
-            &arr, blc, trc, inc,
-        )?))
+        // A reference table maps `row` inside `getcell`.
+        slice_stored_cell(self.getcell(col_idx, row)?, blc, trc, inc)
     }
 
     /// Read all cells, keyed per row as `"r0"`, `"r1"`, ... (`getvarcol`).
@@ -2091,6 +2490,26 @@ impl Table {
         let n = self.nrows();
         self.getcol(col_idx, 0, n)
     }
+}
+
+/// Apply a cell sub-array slice to a value read from storage: the body of
+/// [`Table::getcellslice_inc`] — non-array cells are returned unchanged, an
+/// empty `blc`/`trc` means the whole cell.
+fn slice_stored_cell(
+    cell: RecordValue,
+    blc: &[i64],
+    trc: &[i64],
+    inc: &[i64],
+) -> Result<RecordValue, TableReadError> {
+    let RecordValue::Array(arr) = cell else {
+        return Ok(cell);
+    };
+    if blc.is_empty() && trc.is_empty() {
+        return Ok(RecordValue::Array(arr));
+    }
+    Ok(RecordValue::Array(slice_array_value_inc(
+        &arr, blc, trc, inc,
+    )?))
 }
 
 /// Slice an array value by inclusive per-dimension `blc`/`trc` (logical
@@ -5898,7 +6317,8 @@ mod tests {
             }
             // The raw bulk paths (the python getcol fast paths).
             let mut r = 0usize;
-            t.getcol_raw_bits(0, 0, nrows as u64, |bytes, skip, nelem| {
+            t.getcol_raw_bits(0, 0, nrows as u64, |off, bytes, skip, nelem| {
+                assert_eq!(off, r, "raw FLAG visit order");
                 let mut v = vec![false; nelem];
                 crate::tsm::decode_bits_into(bytes, skip, &mut v);
                 assert_eq!(
@@ -5912,7 +6332,8 @@ mod tests {
             .unwrap();
             assert_eq!(r, nrows);
             let mut r = 0usize;
-            t.getcol_raw(1, 0, nrows as u64, |_, bytes| {
+            t.getcol_raw(1, 0, nrows as u64, |off, _, bytes| {
+                assert_eq!(off, r, "raw DATA visit order");
                 let RecordValue::Array(a) = expect(r, gen_of).1 else {
                     unreachable!()
                 };
