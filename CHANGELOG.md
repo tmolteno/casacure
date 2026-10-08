@@ -40,6 +40,20 @@ subtasks are moved here.
   editing its source, and `column_source()` fails loudly if a read path ever
   forgets to map its rows.
 
+- **The memory tests no longer report the pytest parent's resident set as a
+  worker's peak.** `tests/test_memory_chunking.py`'s harness forks a worker
+  and polls its `VmHWM`, but a child inherits the parent's high-water across
+  `fork` (`dup_mm` seeds it with the current RSS) and only resets it at
+  `execve`, so a poll landing in that window recorded the pytest process's
+  footprint and clamped every worker in the suite to it. With a heavier suite
+  parent that made `test_flagging_write_respects_chunk_size` read real
+  casacore at 198.9 MiB @2000 vs 198.7 MiB @50000 — the parent's number in
+  both — hiding the chunk-size scaling it asserts, and `invoke test` failed.
+  Polling now starts only once the child's `/proc/<pid>/cmdline` shows its
+  own argv (a trivial worker measured 371 → 72 MiB under a 300 MiB-ballast
+  parent), with a regression test that keeps a 200 MiB ballast for the rest
+  of the module.
+
 ## [3.8.27] - 2026-10-08
 
 ### Fixed

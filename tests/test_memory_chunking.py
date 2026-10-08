@@ -184,6 +184,15 @@ sys.stdout.flush()
 # --- helpers ---
 
 
+def _cmdline(pid):
+    """`pid`'s NUL-separated argv, or `None` when /proc cannot answer."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
 def _run(script, args, env_extra):
     """Run `script` with `args` in a fresh subprocess of this interpreter.
 
@@ -195,8 +204,23 @@ def _run(script, args, env_extra):
       ~600 MiB container-level peak on a 9 MiB process in sandboxed runs;
     * ``ru_maxrss`` is per-process cumulative and *survives execve*, so a
       worker forked from a heavyweight pytest parent would inherit the
-      parent's peak.  VmHWM is tied to the process image (reset by exec),
-      which is exactly the peak we want.
+      parent's peak.
+
+    VmHWM is reset by the `execve` (the new mm starts at 0), but it is
+    *inherited by the fork* until then: `dup_mm` seeds the child's high-water
+    with the parent's current RSS, so a poll landing between `fork` and
+    `execve` records the pytest parent's resident set as the worker's peak.
+    That is not hypothetical — a worker doing nothing was measured at
+    371 MiB under a 300 MiB-ballast parent — and it clamps every worker to
+    the parent's high-water, which made `test_flagging_write_respects_
+    chunk_size` fail with the chunk-size scaling invisible (real casacore
+    read 198.9 MiB @2000 vs 198.7 MiB @50000: both the parent's number).
+
+    So polling starts only once the child has exec'd: its
+    `/proc/<pid>/cmdline` is then this script's argv, where before it is
+    byte-identical to ours (the kernel installs the new mm, and with it the
+    new cmdline, in one step).  Without /proc the check is skipped and the
+    old immediate polling is kept.
     """
     import tempfile
     import time
@@ -206,6 +230,7 @@ def _run(script, args, env_extra):
     out = tempfile.NamedTemporaryFile("w+", suffix=".out", delete=False)
     name = out.name
     out.close()
+    parent_cmdline = _cmdline(os.getpid())
     pid = os.fork()
     if pid == 0:
         with open(name, "w") as f:
@@ -215,15 +240,20 @@ def _run(script, args, env_extra):
         os.execve(sys.executable, [sys.executable, "-c", script, *args], env)
     peak_kib = 0
     status_path = f"/proc/{pid}/status"
+    # No /proc (non-Linux): measure as before rather than never.
+    started = parent_cmdline is None
     while True:
-        try:
-            with open(status_path) as f:
-                for line in f:
-                    if line.startswith("VmHWM:"):
-                        peak_kib = max(peak_kib, int(line.split()[1]))
-                        break
-        except FileNotFoundError:
-            pass  # not yet visible / already gone; waitpid below is decisive
+        if not started and _cmdline(pid) not in (None, parent_cmdline):
+            started = True
+        if started:
+            try:
+                with open(status_path) as f:
+                    for line in f:
+                        if line.startswith("VmHWM:"):
+                            peak_kib = max(peak_kib, int(line.split()[1]))
+                            break
+            except FileNotFoundError:
+                pass  # not yet visible / already gone; waitpid is decisive
         wpid, status = os.waitpid(pid, os.WNOHANG)
         if wpid:
             exitcode = os.waitstatus_to_exitcode(status)
@@ -341,6 +371,39 @@ def _measure_open(path, mode, backend):
 
 
 # --- tests ---
+
+
+def test_worker_peak_is_not_the_pytest_parents_footprint(ms):
+    """`_run` must not report the *parent's* resident set as a worker's peak.
+
+    The child inherits the parent's VmHWM across `fork` (`dup_mm` seeds the
+    high-water with the current RSS) and only gets a fresh one at `execve`,
+    so polling in that window clamps every worker in the suite to the pytest
+    parent's footprint.  That is what failed
+    `test_flagging_write_respects_chunk_size` once the suite's parent was
+    heavier than a flag worker: real casacore read 198.9 MiB @2000 vs
+    198.7 MiB @50000 — both the parent's number, so the chunk-size scaling
+    the test asserts was invisible.
+
+    The ballast is held for the rest of the module, so every later
+    measurement in this file also runs against a parent heavier than its
+    worker: they pass only because the fork window is skipped.
+    """
+    if not CASACURE_AVAILABLE:
+        pytest.skip("need casacure importable")
+    lean = _run(_PROBE, [], _casacure_env())[2]
+    ballast = bytearray(200 * 1024 * 1024)
+    ballast[::4096] = b"x" * len(ballast[::4096])
+    try:
+        heavy = _run(_PROBE, [], _casacure_env())[2]
+    finally:
+        del ballast
+    assert heavy - lean < 20, (
+        f"an import-only worker's reported peak moved {lean:.1f} -> "
+        f"{heavy:.1f} MiB when the pytest parent grew by 200 MiB: the poll is "
+        "reading the parent's VmHWM (it must start only after the child's "
+        "`execve`)"
+    )
 
 
 @pytest.mark.parametrize("backend", BACKENDS)

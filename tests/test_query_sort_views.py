@@ -431,11 +431,17 @@ print("%.1f" % (hwm_mib() - baseline))
 
 
 def _run_vmhwm(script, args):
-    """Run `script` in a fresh subprocess of this interpreter and return its
-    peak VmHWM in MiB (polled by the parent: a child's own `ru_maxrss`
-    survives execve and would inherit pytest's peak)."""
-    import time
+    """Run `script` in a fresh subprocess of this interpreter and return the
+    growth the *worker itself* reported (its last stdout field).
 
+    The parent deliberately does not poll `/proc/<pid>/status` the way
+    `test_memory_chunking._run` does: a child inherits the parent's VmHWM
+    across `fork` (`dup_mm` seeds the high-water with the current RSS) and
+    only resets it at `execve`, so an early poll can record the pytest
+    parent's resident set — measured at 371 MiB for a trivial worker under a
+    300 MiB-ballast parent.  Each worker takes its own `baseline` and `hwm`
+    from `/proc/self/status`, so the growth is exact without any polling.
+    """
     out = tempfile.NamedTemporaryFile("w+", suffix=".out", delete=False)
     name = out.name
     out.close()
@@ -446,22 +452,8 @@ def _run_vmhwm(script, args):
             os.dup2(f.fileno(), 2)
         os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         os.execve(sys.executable, [sys.executable, "-c", script, *args], dict(os.environ))
-    peak_kib = 0
-    status = f"/proc/{pid}/status"
-    while True:
-        try:
-            with open(status) as f:
-                for line in f:
-                    if line.startswith("VmHWM:"):
-                        peak_kib = max(peak_kib, int(line.split()[1]))
-                        break
-        except FileNotFoundError:
-            pass
-        wpid, state = os.waitpid(pid, os.WNOHANG)
-        if wpid:
-            code = os.waitstatus_to_exitcode(state)
-            break
-        time.sleep(0.01)
+    _, state = os.waitpid(pid, 0)
+    code = os.waitstatus_to_exitcode(state)
     with open(name) as f:
         text = f.read()
     os.unlink(name)
