@@ -7,6 +7,21 @@ subtasks are moved here.
 
 ## [3.8.27] - 2026-10-08
 
+### Fixed
+
+- **`SELECT`/`sort` results and handle closes return freed glibc arena pages
+  to the OS** (`malloc_trim(0)`): TaQL results are materialised as heap
+  `RecordValue` trees -- GiBs on a real MS -- and those allocations land in
+  the *calling thread's* glibc arena, whose freed pages glibc never gives
+  back.  With DDFacet's pool threads each sorting its own selection, the
+  retained arena high-water marks summed to ~30 GiB over an imaging run (the
+  "memory balloon" the meerkat_imaging pre-release gate measured at 37-54 GiB
+  RSS against python-casacore's 8 GiB).  Reproduced minimally: 5 threads x 1
+  sort each retained 10.2 GiB where one thread reused 2 GiB; with the trim it
+  holds 0.12 GiB.  The deeper fix -- a non-materialising sort that returns a
+  row order like casacore's -- remains future work; until then the working
+  set is the live deduped stores only.
+
 ## [3.8.26] - 2026-10-08
 
 ### Fixed
