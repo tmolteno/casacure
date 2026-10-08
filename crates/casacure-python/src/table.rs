@@ -256,6 +256,26 @@ fn find_write(dir: &std::path::Path) -> Option<std::sync::Arc<std::sync::Mutex<W
     }
 }
 
+/// Return free glibc arena memory to the OS.  `SELECT`/`sort` results are
+/// materialised as heap `RecordValue` trees (GiBs on a real MS); those
+/// allocations land in the *calling thread's* glibc arena, whose freed pages
+/// glibc otherwise never gives back -- with DDFacet's pool threads each
+/// sorting, the retained high-water marks summed to tens of GiB (2026-10-08:
+/// 5 threads x 1 sort each retained 10.2 GiB where the same work on one
+/// thread reused 2 GiB; `MALLOC_ARENA_MAX=2` bounded it to 4.1 GiB, which is
+/// how the arenas were identified).  Trimming after each materialising
+/// selection and on close hands the freed pages back; live allocations are
+/// untouched.
+#[cfg(target_os = "linux")]
+fn trim_heap() {
+    extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    unsafe { malloc_trim(0) };
+}
+#[cfg(not(target_os = "linux"))]
+fn trim_heap() {}
+
 /// python-casacore-compatible `table` object.
 #[pyclass(name = "table")]
 pub struct Table {
@@ -1385,10 +1405,14 @@ impl Table {
     fn select_run(&self, py: Python<'_>, sql: &str) -> PyResult<Py<PyAny>> {
         let core_t = self.core_running()?;
         match core::taql::execute(sql, &[&core_t]).map_err(err)? {
-            core::taql::TaqlResult::Query(out) => Ok(taql_result_to_table(py, out)?
-                .into_pyobject(py)?
-                .into_any()
-                .unbind()),
+            core::taql::TaqlResult::Query(out) => {
+                let out = taql_result_to_table(py, out)?
+                    .into_pyobject(py)?
+                    .into_any()
+                    .unbind();
+                trim_heap();
+                Ok(out)
+            }
             other => Err(PyRuntimeError::new_err(format!(
                 "taql: expected a SELECT result, got {other:?}"
             ))),
@@ -1969,6 +1993,11 @@ impl Table {
                 lf.lock().unwrap().release_read().map_err(err)?;
             }
         }
+        drop(inner);
+        // A closed handle may have been the last owner of a materialised
+        // store (query/sort trees, a writable cell store); give its arena
+        // pages back to the OS (see trim_heap).
+        trim_heap();
         Ok(())
     }
 

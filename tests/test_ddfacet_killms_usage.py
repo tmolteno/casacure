@@ -210,13 +210,24 @@ def test_getcolslicenp_tuple_slice(ms):
     t.close()
 
 
+import casacore as _cc
+
+# the shim package sets a marker attribute; matching "casacure" in __file__
+# is wrong here (the checkout path itself contains it -- see
+# tests/shim/casacore)
+_IS_CASACURE = getattr(_cc, "__casacure_shim__", False)
+
+
+@pytest.mark.skipif(not _IS_CASACURE,
+                    reason="pins casacure's raw bulk-fill fast path")
 def test_getcolslicenp_whole_cell_is_the_raw_fast_path_and_matches_getcol(ms):
     """The whole-cell slice -- DDFacet's chunk-reader shape, cs_tlc=(chan0, 0)
     .. cs_brc=(chan_last, ncorr-1) with step 1 -- must take the raw bulk fill
     (one memcpy per row) and stay bit-identical to getcol.  The per-cell
     RecordValue path it replaces cost ~20x on a 435-row chunk read
     (2026-10-08, ssd0000.MS DATA 4x4 complex64: 0.70 ms/call vs
-    python-casacore's 0.03; the fast path restores ~0.03)."""
+    python-casacore's 0.03; the fast path restores ~0.03).  The whole-cell
+    idioms (negative/empty corners) are casacure extensions."""
     t = table(ms, ack=False)
     data = t.getcol("DATA")
     for blc, trc in (
@@ -224,9 +235,11 @@ def test_getcolslicenp_whole_cell_is_the_raw_fast_path_and_matches_getcol(ms):
         ((-1, -1), (-1, -1)),              # the whole-cell idiom
         ((), ()),                          # empty == whole cell
     ):
-        buf = np.full((NROW, NCHAN, NCORR), np.nan + 1j * np.nan, dtype=np.complex64)
+        buf = np.full((NROW, NCHAN, NCORR), np.nan + 1j * np.nan,
+                      dtype=np.complex64)
         t.getcolslicenp("DATA", buf, blc, trc, (1, 1), 0, NROW)
-        assert np.array_equal(buf, data), f"whole-cell slice {blc}..{trc} diverged from getcol"
+        assert np.array_equal(buf, data), (
+            f"whole-cell slice {blc}..{trc} diverged from getcol")
     t.close()
 
 
@@ -236,7 +249,7 @@ def test_getcolslicenp_whole_cell_bool_and_row_offset(ms):
     t = table(ms, ack=False)
     flags = t.getcol("FLAG")
     buf = np.ones((3, NCHAN, NCORR), dtype=bool)
-    t.getcolslicenp("FLAG", buf, (-1, -1), (-1, -1), (1, 1), 2, 3)
+    t.getcolslicenp("FLAG", buf, (0, 0), (NCHAN - 1, NCORR - 1), (1, 1), 2, 3)
     assert np.array_equal(buf, flags[2:5])
     t.close()
 
