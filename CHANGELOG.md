@@ -5,6 +5,8 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.28] - 2026-10-09
+
 ### Fixed
 
 - **`query()`/`sort()`/`select()` return a casacore-style *reference table*:
