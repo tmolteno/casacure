@@ -128,20 +128,22 @@ command — see README "Releasing"); do not hand-tag.
 ## 7. dask-ms integration
 
 - [X] Cross-implementation round-trip gate (Rust-write → casacore-read and vice versa)
-- [~] Full dask-ms test suite passing against casacure — dask-ms 0.2.32's own tests via the `casacore.tables` shim: **test_table_proxy 14/14; ~82 combined across proxy/ordering/table/columns/dataset**, incl. `test_dataset_multidim_string_column`; MS lifecycle + example_ms work end-to-end (`tests/daskms_smoke.py`). Added: chunked `putcolslice`, dict-form putcol (incl. numpy scalars and `{"shape","array"}` multidim strings split per row), logical-orientation fixed defaults, SSM multidim **string-array** cells (read+write via string buckets). Added: `addcols` (append columns to writable tables, incl. TiledColumnStMan layouts), TSM Bool tiles, Bool scalar storage verified as byte-per-row (bucket layout was wrongly bit-packing — fixed). Upstream store dispatch — VALIDATED by a prototype: an env-gated
+- [X] Full dask-ms test suite passing against casacure — dask-ms 0.2.32's own tests via the `casacore.tables` shim: **test_table_proxy 14/14; ~82 combined across proxy/ordering/table/columns/dataset**, incl. `test_dataset_multidim_string_column`; MS lifecycle + example_ms work end-to-end (`tests/daskms_smoke.py`). Added: chunked `putcolslice`, dict-form putcol (incl. numpy scalars and `{"shape","array"}` multidim strings split per row), logical-orientation fixed defaults, SSM multidim **string-array** cells (read+write via string buckets). Added: `addcols` (append columns to writable tables, incl. TiledColumnStMan layouts), TSM Bool tiles, Bool scalar storage verified as byte-per-row (bucket layout was wrongly bit-packing — fixed). Upstream store dispatch — VALIDATED by a prototype: an env-gated
 `DASK_MS_BACKEND=casacure` alias in dask-ms's `__init__` routes `casacore.tables`
-to `casacure.tables`. **2026-10-02 correction (does not reproduce here):** the
-"full suite passes 219/219 with no shim" claim above was **not** observed on
-`moist`. The default (python-casacore) backend does pass — 219 passed / 10
-skipped on the rebased ratt-ru/dask-ms#383 head — but under
-`DASK_MS_BACKEND=casacure` **70 tests fail** with
-`RuntimeError: storage error: <ms>/table.lock: pread` out of
-`table_proxy.py:107 table.unlock()`, only under dask-ms's threaded
-`TableProxy` (single-threaded casacure lock/unlock probes pass). The failure
-list is byte-identical on the pre-rebase and rebased PR heads, with casacure
-3.8.11/3.8.16 on py3.11/3.13/3.14, with python-casacore absent, and with the
-PR's perf-flush commit removed — so it is neither the rebase nor that change.
-**Re-check on the host where 219/219 was measured before calling this done.**
+to `casacure.tables`. **2026-10-09 retest — clean:** the same suite on the
+`pr-383-rebased` checkout (`a0d78e7`) with casacure 3.8.29 (its `lockfile.rs`
+is identical to current main) and CPython 3.14.7 now reports **218 passed,
+1 failed**, 10 skipped, 8 deselected, 1 xfailed, 3 xpassed (the default
+python-casacore backend: 219 passed / 10 skipped / 8 deselected / 3 xfailed /
+1 xpassed). The **70 `table.lock: pread` failures are gone** — they were the
+pre-3.8.19 `get_info` EOF propagation on a short lock file, closed by 3.8.13's
+registry/inode checks and 3.8.19's EOF tolerance. (The 2026-10-02 "does not
+reproduce here" note on `moist` is superseded by this run.) The single
+remaining failure is variable-shape `CHAN_FREQ` row grouping
+(`test_row_grouping[{'row': 2}]`), filed as issue #19; the missing/short
+`table.lock` auto-lock variant this retest turned up is issue #17. XFAIL/XPASS
+differences (uint8/uint16 columns XPASS under casacure; list-of-ints `putcol`
+XFAILs) are recorded in issue #7.
  ~~Remaining: submit that small
   backend selection patch to dask-ms upstream~~ **2026-10-02**: the patch is
   moot — dask-ms 0.3.0 (alpha now) opens tables through **arcae**

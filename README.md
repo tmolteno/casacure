@@ -47,9 +47,11 @@ Status is tracked in [ARE_WE_CURED.md](ARE_WE_CURED.md); the outline is in
 
 - **Drop-in replacement for `casacore.tables`.** `casacure.tables` mirrors the
   python-casacore interface, so existing packages — most notably **dask-ms** —
-  run unchanged. The full dask-ms 0.2.32 test suite passes against it
-  (219/219 on Python 3.13 and 3.14), reading, writing and updating real
-  Measurement Sets.
+  run unchanged. The dask-ms 0.2.32 test suite runs against it — 218 of 219
+  tests on the casacure backend (2026-10-09; the one divergence is
+  variable-shape `CHAN_FREQ` row grouping in
+  [issue #19](https://github.com/tmolteno/casacure/issues/19)) — reading,
+  writing and updating real Measurement Sets.
 - **No C++ casacore library.** The table engine is pure Rust. There is no
   casacore build, no multi-hour C++ dependency compile, and no Fortran/C
   system library (`wcs`, `measures`, `images`, …) to install. `pip install
@@ -81,8 +83,10 @@ Status is tracked in [ARE_WE_CURED.md](ARE_WE_CURED.md); the outline is in
 
 ## Using casacure in place of casacore
 
-casacure provides a python-casacore-compatible surface. The whole dask-ms 0.2.32
-test suite passes against it (219/219 on both Python 3.13 and 3.14), including
+casacure provides a python-casacore-compatible surface. The dask-ms 0.2.32
+test suite runs against it — 218 of 219 tests on the casacure backend
+(2026-10-09; the one divergence is variable-shape `CHAN_FREQ` row grouping,
+[issue #19](https://github.com/tmolteno/casacure/issues/19)) — including
 reading, writing and updating real Measurement Sets.
 
 ### Direct API
