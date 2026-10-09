@@ -5,6 +5,8 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.31] - 2026-10-09
+
 ### Fixed
 
 - **A read-only handle on a table with a missing or short `table.lock`
