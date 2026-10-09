@@ -425,6 +425,7 @@ mod tests {
                 values: Vec::new(),
             },
             kind,
+            tile_shape: None,
         }
     }
 

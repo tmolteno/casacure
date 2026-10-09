@@ -547,10 +547,12 @@ def test_addcols_dminfo_flat_record_selects_storage(tmp_path):
     p = str(tmp_path / "t.tab")
     t = table(p, maketabdesc([makescacoldesc("TIME", 0.0)]), 3)
     t.putcol("TIME", [1.0, 2.0, 3.0])
+    # The tile shape is CASA order (the stored cell dims plus the rows per
+    # tile): cell [4, 2] + 2 rows/tile — 3 rows do not divide evenly.
     t.addcols(
         maketabdesc(makearrcoldesc("DATA", 0.0 + 0.0j, ndim=2, shape=[2, 4])),
         {"TYPE": "TiledShapeStMan", "NAME": "TiledData",
-         "SPEC": {"DEFAULTTILESHAPE": np.array([2, 4], dtype=np.int32)}},
+         "SPEC": {"DEFAULTTILESHAPE": np.array([4, 2, 2], dtype=np.int32)}},
     )
     values = np.arange(3 * 2 * 4, dtype=np.float64).reshape(3, 2, 4) * (1.0 + 1.0j)
     t.putcol("DATA", values)
@@ -560,6 +562,7 @@ def test_addcols_dminfo_flat_record_selects_storage(tmp_path):
     dm = {v["NAME"]: v for v in t.getdminfo().values()}
     assert dm["TiledData"]["TYPE"] == "TiledShapeStMan"
     assert dm["TiledData"]["COLUMNS"] == ["DATA"]
+    assert dm["TiledData"]["SPEC"]["DEFAULTTILESHAPE"] == [4, 2, 2]
     np.testing.assert_array_equal(t.getcol("TIME"), [1.0, 2.0, 3.0])
     np.testing.assert_array_equal(t.getcol("DATA"), values)
     t.close()

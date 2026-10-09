@@ -160,6 +160,7 @@ pub fn add_imaging_columns(path: &Path) -> Result<Vec<String>, MsUtilError> {
                 values: Vec::new(),
             },
             kind: crate::tabledesc::ColumnKind::Array,
+            tile_shape: None,
         };
         wt.addcol(c);
         added.push("IMAGING_WEIGHT".into());
@@ -293,7 +294,7 @@ mod tests {
         let data_desc = format!(
             r#"{{"DATA":{{"valueType":"complex","dataManagerType":"TiledColumnStMan","dataManagerGroup":"DATA_GROUP","option":4,"maxlen":0,"comment":"The data column","ndim":2,"shape":[{nchan},{ncorr}],"_c_order":true,"keywords":{{}}}}}}"#
         );
-        ms::default_ms(path, Some(&data_desc)).expect("default_ms");
+        ms::default_ms(path, Some(&data_desc), None).expect("default_ms");
         // Give the main table some rows and fill DATA (tiled complex array).
         let (read, mut wt) = WritableTable::open_for_update(path).expect("open update");
         wt.addrows(nrow);
@@ -459,6 +460,7 @@ mod tests {
                         values: Vec::new(),
                     },
                     kind: crate::tabledesc::ColumnKind::Scalar(RecordValue::Double(0.0)),
+                    tile_shape: None,
                 }],
             },
         );

@@ -59,6 +59,15 @@ pub struct ColumnDesc {
     pub max_length: i32,
     pub keywords: TableRecord,
     pub kind: ColumnKind,
+    /// The tile shape this column's tiled storage uses (CASA order: the cell
+    /// dimensions plus the rows per tile), when it is known rather than
+    /// derived: set from a dminfo record's `SPEC.DEFAULTTILESHAPE` at
+    /// creation, and from the stored TSM header at open, so regenerating the
+    /// column (`create_table` / row growth) reproduces the exact tiling
+    /// instead of silently re-tiling to the derived shape. Not persisted in
+    /// `table.dat` (casacore keeps the tile shape in the TSM header, as does
+    /// this crate).
+    pub tile_shape: Option<Vec<i64>>,
 }
 
 impl ColumnDesc {
@@ -288,6 +297,7 @@ pub(crate) fn column_from_desc_dict(
         max_length,
         keywords,
         kind,
+        tile_shape: None,
     })
 }
 
@@ -315,6 +325,281 @@ impl TableDesc {
     pub fn column(&self, name: &str) -> Option<&ColumnDesc> {
         self.columns.iter().find(|c| c.name == name)
     }
+}
+
+/// The data-manager types table creation can write (`create_table`'s
+/// supported managers); anything else fails fast rather than at the flush
+/// that regenerates the table.
+pub const SUPPORTED_DM_TYPES: [&str; 4] = [
+    "StandardStMan",
+    "IncrementalStMan",
+    "TiledColumnStMan",
+    "TiledShapeStMan",
+];
+
+/// Why a dminfo record could not be applied to a table description.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DmInfoError {
+    /// A `dminfo` mapping value (or its `COLUMNS` field) is not the
+    /// expected record/list shape.
+    BadRecord,
+    /// The record's `TYPE` is a manager table creation cannot write.
+    UnsupportedType { type_name: String },
+    /// The record's `COLUMNS` names a column the description does not have.
+    UnknownColumn { column: String },
+    /// The record's `SPEC` carries a field creation cannot honour (as
+    /// opposed to the recognised cache-sizing fields, which are accepted
+    /// and ignored — they do not change the on-disk layout).
+    BadSpecField { manager: String, field: String },
+    /// `SPEC.DEFAULTTILESHAPE` is malformed or does not fit the column.
+    BadTileShape { detail: String },
+}
+
+impl std::fmt::Display for DmInfoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DmInfoError::BadRecord => {
+                write!(f, "dminfo values must be dicts with a list of COLUMNS")
+            }
+            DmInfoError::UnsupportedType { type_name } => write!(
+                f,
+                "unsupported data-manager type {type_name:?} in dminfo; casacure supports {}",
+                SUPPORTED_DM_TYPES.join(", ")
+            ),
+            DmInfoError::UnknownColumn { column } => write!(
+                f,
+                "dminfo names column {column:?}, which is not among the columns being created"
+            ),
+            DmInfoError::BadSpecField { manager, field } => write!(
+                f,
+                "unsupported SPEC field {field:?} for data-manager type {manager:?} in dminfo"
+            ),
+            DmInfoError::BadTileShape { detail } => {
+                write!(f, "bad SPEC.DEFAULTTILESHAPE in dminfo: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DmInfoError {}
+
+/// Apply a data-manager-info record (the `dminfo` argument of table
+/// creation, `addcols` and the deep `tablecopy`) to the columns being
+/// created: each record's `TYPE`/`NAME` — and its
+/// `SPEC.DEFAULTTILESHAPE` for a tiled manager — land on the columns the
+/// record names in `COLUMNS`, or on every column when it names none.
+///
+/// Both caller shapes are accepted, matching casacore's
+/// `Table::addColumns(desc, dminfo)`:
+/// * a flat record `{TYPE, NAME, SPEC}` (python-casacore's documented
+///   form) applies to every column;
+/// * a `getdminfo()`-shaped mapping `{field: {TYPE, NAME, COLUMNS, ...}}`
+///   applies each record to the columns it names.
+///
+/// A mapping record with neither `TYPE` nor `COLUMNS` — python-casacore's
+/// `makedminfo(tabdesc, dmgroup_spec)` *input* shape, keyed by group name
+/// (`{"DataGroup": {"DEFAULTTILESHAPE": ...}}`) — refines the columns that
+/// already declare that `dataManagerGroup` in their descriptors (every
+/// column, when no descriptor does): it sets a manager's tile shape or
+/// group name without re-routing columns between managers.
+///
+/// A record given without a `TYPE` keeps its columns' declared manager and
+/// only renames the group. `SEQNR` is ignored (managers are numbered in
+/// column order), and the cache-sizing `SPEC` fields are accepted and
+/// ignored: they tune reads, not the on-disk layout. Any other SPEC field —
+/// `HYPERCUBES` above all — fails loudly: silently creating a different
+/// layout than the caller asked for is the bug this guards against.
+pub fn apply_dminfo(
+    dminfo: &crate::record::TableRecord,
+    cols: &mut [ColumnDesc],
+) -> Result<(), DmInfoError> {
+    use crate::record::{ArrayData, RecordValue};
+    if dminfo.values.is_empty() || cols.is_empty() {
+        return Ok(());
+    }
+    let field_str = |rec: &crate::record::TableRecord, key: &str| -> Option<String> {
+        match rec.get(key) {
+            Some(RecordValue::String(s)) => Some(s.clone()),
+            _ => None,
+        }
+    };
+    // A flat record has TYPE at the top level and applies to the whole set.
+    if dminfo.get("TYPE").is_some() {
+        return apply_dm_record(
+            dminfo,
+            field_str(dminfo, "TYPE").as_deref(),
+            field_str(dminfo, "NAME").as_deref(),
+            None,
+            false,
+            cols,
+        );
+    }
+    // getdminfo()-shaped mapping: one record per data manager. Column
+    // targeting by declared group (a `dmgroup_spec` entry) reads the
+    // groups the descriptors came in with, not those an earlier record
+    // set.
+    let declared_groups: Vec<String> = cols.iter().map(|c| c.data_manager_group.clone()).collect();
+    for (field, value) in dminfo.desc.fields.iter().zip(dminfo.values.iter()) {
+        let RecordValue::Record(rec) = value else {
+            return Err(DmInfoError::BadRecord);
+        };
+        let columns: Option<Vec<usize>> = match rec.get("COLUMNS") {
+            None => {
+                if rec.get("TYPE").is_some() {
+                    // A typed record without targets governs every column.
+                    None
+                } else {
+                    // A dmgroup_spec entry: the columns declaring this
+                    // group (every column when none does).
+                    let key = field.name.as_str();
+                    let matched: Vec<usize> = declared_groups
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, g)| g.as_str() == key)
+                        .map(|(i, _)| i)
+                        .collect();
+                    if matched.is_empty() {
+                        None
+                    } else {
+                        Some(matched)
+                    }
+                }
+            }
+            Some(RecordValue::Array(av)) => {
+                let names = match &av.data {
+                    ArrayData::String(names) => names,
+                    _ => return Err(DmInfoError::BadRecord),
+                };
+                let mut out = Vec::with_capacity(names.len());
+                for col_name in names {
+                    let idx = cols
+                        .iter()
+                        .position(|c| &c.name == col_name)
+                        .ok_or_else(|| DmInfoError::UnknownColumn {
+                            column: col_name.clone(),
+                        })?;
+                    out.push(idx);
+                }
+                Some(out)
+            }
+            Some(_) => return Err(DmInfoError::BadRecord),
+        };
+        apply_dm_record(
+            rec,
+            field_str(rec, "TYPE").as_deref(),
+            field_str(rec, "NAME")
+                .as_deref()
+                .or(Some(field.name.as_str())),
+            columns.as_deref(),
+            // A dmgroup_spec entry carries its SPEC fields at the top
+            // level — the record itself is the SPEC.
+            rec.get("TYPE").is_none() && rec.get("COLUMNS").is_none(),
+            cols,
+        )?;
+    }
+    Ok(())
+}
+
+/// Apply one dminfo record to its target columns: `columns` selects them by
+/// index (`None` = every column), `dm_type`/`name` set the manager type
+/// and group, and the record's `SPEC` is validated (its
+/// `DEFAULTTILESHAPE` is kept on the columns for the storage writers). A
+/// `dmgroup_spec` entry (`record_is_spec`) has no `TYPE`/`COLUMNS`/`SPEC`
+/// wrapper — the record itself carries the SPEC fields.
+fn apply_dm_record(
+    rec: &crate::record::TableRecord,
+    dm_type: Option<&str>,
+    name: Option<&str>,
+    columns: Option<&[usize]>,
+    record_is_spec: bool,
+    cols: &mut [ColumnDesc],
+) -> Result<(), DmInfoError> {
+    use crate::record::{ArrayData, RecordValue};
+    if let Some(t) = dm_type {
+        if !SUPPORTED_DM_TYPES.contains(&t) {
+            return Err(DmInfoError::UnsupportedType {
+                type_name: t.to_string(),
+            });
+        }
+    }
+    // Validate SPEC before touching any column, so a rejected record
+    // rejects as a whole.
+    let mut tile_shape = None;
+    let spec = match rec.get("SPEC") {
+        Some(RecordValue::Record(spec)) => Some(spec),
+        Some(_) => return Err(DmInfoError::BadRecord),
+        None if record_is_spec => Some(rec),
+        None => None,
+    };
+    if let Some(spec) = spec {
+        if !spec.values.is_empty() {
+            let manager = dm_type.unwrap_or("StandardStMan").to_string();
+            for field in &spec.desc.fields {
+                match field.name.as_str() {
+                    // Cache sizes and the derived cube geometry do not
+                    // change the stored bytes; ignore them.
+                    "MaxCacheSize" | "MAXIMUMCACHESIZE" | "BUCKETSIZE" | "PERSCACHESIZE"
+                    | "IndexLength" | "IndexSize" | "DEFAULTCUBESHAPE" => {}
+                    "DEFAULTTILESHAPE" => {
+                        let dims: Vec<i64> = match spec.get("DEFAULTTILESHAPE") {
+                            Some(RecordValue::Array(av)) => match &av.data {
+                                ArrayData::Int(v) => v.iter().map(|&d| d as i64).collect(),
+                                ArrayData::Int64(v) => v.clone(),
+                                _ => {
+                                    return Err(DmInfoError::BadTileShape {
+                                        detail: "expected a list of integers".into(),
+                                    })
+                                }
+                            },
+                            _ => {
+                                return Err(DmInfoError::BadTileShape {
+                                    detail: "expected a list of integers".into(),
+                                })
+                            }
+                        };
+                        if dims.len() < 2 || dims.iter().any(|&d| d <= 0) {
+                            return Err(DmInfoError::BadTileShape {
+                                detail: format!("expected positive dimensions, got {dims:?}"),
+                            });
+                        }
+                        // A tile shape on a non-tiled manager cannot be
+                        // created.
+                        if matches!(dm_type, Some("StandardStMan") | Some("IncrementalStMan")) {
+                            return Err(DmInfoError::BadSpecField {
+                                manager,
+                                field: "DEFAULTTILESHAPE".into(),
+                            });
+                        }
+                        tile_shape = Some(dims);
+                    }
+                    other => {
+                        return Err(DmInfoError::BadSpecField {
+                            manager,
+                            field: other.to_string(),
+                        })
+                    }
+                }
+            }
+        }
+    }
+    // Resolve the targets (all columns, or the selected ones).
+    let targets: Vec<usize> = match columns {
+        None => (0..cols.len()).collect(),
+        Some(idxs) => idxs.to_vec(),
+    };
+    for idx in targets {
+        let cd = &mut cols[idx];
+        if let Some(t) = dm_type {
+            cd.data_manager_type = t.to_string();
+        }
+        // The group defaults to the (possibly new) manager type, as
+        // casacore names a manager given without an explicit NAME.
+        cd.data_manager_group = name
+            .map(str::to_string)
+            .unwrap_or_else(|| cd.data_manager_type.clone());
+        cd.tile_shape = tile_shape.clone();
+    }
+    Ok(())
 }
 
 /// Parse a framed `"TableDesc"` object from the stream.
@@ -410,6 +695,7 @@ fn parse_column_desc(r: &mut Reader<'_>) -> Result<ColumnDesc, TableDescError> {
         max_length,
         keywords,
         kind,
+        tile_shape: None,
     })
 }
 
@@ -588,6 +874,7 @@ mod tests {
             max_length: 0,
             keywords,
             kind,
+            tile_shape: None,
         }
     }
 
@@ -605,6 +892,7 @@ mod tests {
             max_length: 0,
             keywords: empty_record(),
             kind: ColumnKind::Scalar(default),
+            tile_shape: None,
         }
     }
 
@@ -640,6 +928,7 @@ mod tests {
                     max_length: 0,
                     keywords: kw_record(),
                     kind: ColumnKind::Array,
+                    tile_shape: None,
                 },
                 ColumnDesc {
                     name: "REC".into(),
@@ -653,6 +942,7 @@ mod tests {
                     max_length: 0,
                     keywords: empty_record(),
                     kind: ColumnKind::Record,
+                    tile_shape: None,
                 },
             ],
         };

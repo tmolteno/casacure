@@ -5,6 +5,39 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`table()`, `default_ms()`, `tablecopy()`/`copy()` and
+  `default_ms_subtable()` honour their `dminfo` argument** (issue #20).
+  All four creation paths accepted `dminfo` and silently dropped it, so a
+  caller asking for tiled storage got StandardStMan columns with no error —
+  and no test could build a tiled fixture through casacure (the DDFacet
+  chunk reader fell back to the slow per-cell path for FLAG on any
+  casacure-created MS). The application now goes through one core
+  implementation (`tabledesc::apply_dminfo`, shared with `addcols`): a flat
+  `{TYPE, NAME, SPEC}` record covers every column, a `getdminfo()`-shaped
+  mapping applies per `COLUMNS`, and a `makedminfo(tabdesc, dmgroup_spec)`
+  entry (keyed by group, no `TYPE`/`COLUMNS`) refines the columns that
+  already declare that group. `SPEC.DEFAULTTILESHAPE` is honoured end to
+  end — `ColumnDesc` carries the requested tile shape, the TSM writers lay
+  it out (including cell-splitting tiles, which dask-ms's `_fit_tile_shape`
+  produces for wide rows and real casacore writes natively; casacore reads
+  the result byte-compatibly, verified by the cross-implementation gate),
+  row growth regenerates headers with it, and a reopen re-derives it from
+  the stored header so a later rewrite re-tiles identically. `SEQNR` and
+  the cache-sizing SPEC fields are accepted and ignored; an unsupported
+  manager, a SPEC field creation cannot honour (`HYPERCUBES` above all) or
+  a named column the description lacks raises (`ValueError`/`KeyError`) —
+  the silent fallback was the bug. `tablecopy(deep=True, dminfo=...)` is
+  casacore's storage conversion: the copy's columns are read back and
+  regenerated under the requested managers, keywords and subtables
+  preserved. Tests: `crates/casacure/tests/dminfo_create.rs` (apply forms,
+  fail-loud matrix, tiled create/read-back, cell-splitting round trip with
+  `getcol_raw_bits` equality, growth, deep-copy conversion) and
+  `tests/test_dminfo.py` (the issue's reproducer, `default_ms`/
+  `default_ms_subtable`/`tablecopy`/`copy`, `makedminfo` round trip,
+  reopen-rewrite tiling stability, fail-loud).
+
 ## [3.8.31] - 2026-10-09
 
 ### Fixed

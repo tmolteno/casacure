@@ -47,6 +47,8 @@ pub enum MsError {
     Storage(String),
     #[error(transparent)]
     Record(#[from] crate::record::RecordError),
+    #[error(transparent)]
+    DmInfo(#[from] crate::tabledesc::DmInfoError),
 }
 
 fn schema_desc(table: &str, complete: bool) -> Result<TableDesc, MsError> {
@@ -98,11 +100,19 @@ fn merge_extra_columns(desc: &mut TableDesc, extra: &str) -> Result<(), MsError>
     Ok(())
 }
 
-/// `default_ms(path, tabdesc=...)`: create the main MS table from the
-/// required columns plus any extra columns in `extra_desc`, and the standard
-/// subtable tree (each subtable in `<path>/<NAME>`), linked from the main
-/// table by `TpTable` keywords.
-pub fn default_ms(path: &Path, extra_desc: Option<&str>) -> Result<(), MsError> {
+/// `default_ms(path, tabdesc=..., dminfo=...)`: create the main MS table
+/// from the required columns plus any extra columns in `extra_desc`, and
+/// the standard subtable tree (each subtable in `<path>/<NAME>`), linked
+/// from the main table by `TpTable` keywords. `dminfo` (the python-casacore
+/// argument) picks the main table's storage managers — `table()`-style
+/// records setting `TYPE`/`NAME`/`SPEC.DEFAULTTILESHAPE` on the columns
+/// they name — so a created MS can carry tiled DATA/FLAG/etc. straight
+/// away; unmentioned columns keep the schema's StandardStMan.
+pub fn default_ms(
+    path: &Path,
+    extra_desc: Option<&str>,
+    dminfo: Option<&TableRecord>,
+) -> Result<(), MsError> {
     // Subtable links are stored relative to the MS's parent directory (or
     // absolute when outside it), which only round-trips when the MS path is
     // absolute — a relative `ms.ms/ANTENNA` joined at read time against the
@@ -111,6 +121,9 @@ pub fn default_ms(path: &Path, extra_desc: Option<&str>) -> Result<(), MsError> 
     let mut desc = required_ms_desc(None)?;
     if let Some(extra) = extra_desc {
         merge_extra_columns(&mut desc, extra)?;
+    }
+    if let Some(dm) = dminfo {
+        crate::tabledesc::apply_dminfo(dm, &mut desc.columns)?;
     }
     // The main-table keyword record already carries MS_VERSION from the
     // vendored `_keywords_`; link the standard subtables.
@@ -186,7 +199,7 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let path = base.join("test.ms");
-        default_ms(&path, None).unwrap();
+        default_ms(&path, None, None).unwrap();
 
         // Main table files + 12 subtable directories.
         assert!(path.join("table.dat").exists());
@@ -301,7 +314,7 @@ mod tests {
         let path =
             crate::testdir::TestDir::new(format!("casacure-ms-extra-{}", std::process::id()));
         let extra = r#"{"DATA":{"_c_order":true,"comment":"DATA column","dataManagerGroup":"StandardStMan","dataManagerType":"StandardStMan","keywords":{},"maxlen":0,"ndim":2,"option":0,"valueType":"COMPLEX"}}"#;
-        default_ms(&path, Some(extra)).unwrap();
+        default_ms(&path, Some(extra), None).unwrap();
         let t = Table::open(&path, true).unwrap();
         let cols = t.colnames();
         assert!(cols.contains(&"DATA".to_string()), "DATA missing: {cols:?}");

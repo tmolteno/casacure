@@ -304,37 +304,25 @@ fn err<E: std::fmt::Display>(e: E) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
-/// The data-manager types the flush path can create (`create_table`'s
-/// supported managers); anything else fails fast in `addcols` rather than
-/// at the close() that flushes.
-const SUPPORTED_DM_TYPES: [&str; 4] = [
-    "StandardStMan",
-    "IncrementalStMan",
-    "TiledColumnStMan",
-    "TiledShapeStMan",
-];
-
-/// Set one column's data-manager type and group from a `dminfo` record's
-/// `TYPE`/`NAME` fields (either may be absent; the group defaults to the
-/// type, as casacore names a manager given without an explicit NAME).
-fn apply_dm_record(
-    cd: &mut core::tabledesc::ColumnDesc,
-    dm_type: Option<&str>,
-    name: Option<&str>,
-) -> PyResult<()> {
-    if let Some(t) = dm_type {
-        if !SUPPORTED_DM_TYPES.contains(&t) {
-            return Err(PyValueError::new_err(format!(
-                "unsupported data-manager type {t:?} in dminfo; casacure supports {}",
-                SUPPORTED_DM_TYPES.join(", ")
-            )));
-        }
-        cd.data_manager_type = t.to_string();
+/// Map a core dminfo error to the python-casacore exception classes:
+/// structural mistakes are `TypeError`, a named column the description
+/// lacks is `KeyError`, and unsupported managers / SPEC fields are
+/// `ValueError` (the fail-loud contract of issue #20).
+fn dm_err(e: core::tabledesc::DmInfoError) -> PyErr {
+    match e {
+        core::tabledesc::DmInfoError::BadRecord => PyTypeError::new_err(e.to_string()),
+        core::tabledesc::DmInfoError::UnknownColumn { .. } => PyKeyError::new_err(e.to_string()),
+        _ => PyValueError::new_err(e.to_string()),
     }
-    cd.data_manager_group = name
-        .map(str::to_string)
-        .unwrap_or_else(|| cd.data_manager_type.clone());
-    Ok(())
+}
+
+/// The `dminfo` argument of table creation / `addcols` / deep `tablecopy`
+/// as the core record `apply_dminfo` consumes.
+pub(crate) fn dminfo_record(py: Python<'_>, dminfo: &Bound<'_, PyAny>) -> PyResult<TableRecord> {
+    match convert::pyobject_to_record(py, dminfo)? {
+        RecordValue::Record(rec) => Ok(rec),
+        _ => Err(PyTypeError::new_err("dminfo must be a dict")),
+    }
 }
 
 /// Normalise the three documented `addcols` descriptor forms to the
@@ -401,9 +389,9 @@ fn normalize_coldesc<'py>(
     ))
 }
 
-/// Apply `addcols`'s `dminfo` argument to the columns being added, so the
-/// flush that regenerates the table puts each new column in the manager the
-/// caller asked for (`create_table` groups columns by the descriptor's
+/// Apply the `dminfo` argument to the columns being added (`addcols`), so
+/// the flush that regenerates the table puts each new column in the manager
+/// the caller asked for (`create_table` groups columns by the descriptor's
 /// data-manager type/group, and writes one block file per group).
 ///
 /// Both shapes callers use are accepted, matching casacore's
@@ -414,66 +402,19 @@ fn normalize_coldesc<'py>(
 ///   what dask-ms's descriptor builders pass — applies each record to the
 ///   columns it names in `COLUMNS`.
 ///
-/// `SPEC` and `SEQNR` are not carried: casacure derives the storage spec
-/// from the column shape and numbers managers in column order, and the file
-/// it writes records the derived spec (a TSM's tile shape) for casacore to
-/// read back.
+/// `SPEC.DEFAULTTILESHAPE` is honoured (a tiled column is written with the
+/// requested tiles), `SEQNR` and the cache-sizing SPEC fields are ignored,
+/// and an unsupported manager or SPEC field raises `ValueError` — a silent
+/// fallback to another layout is the bug of issue #20. Validation and
+/// application live in the core (`tabledesc::apply_dminfo`), shared with
+/// the `table()`/`default_ms()` creation paths.
 fn apply_dminfo(
+    py: Python<'_>,
     dminfo: &Bound<'_, PyAny>,
     cols: &mut [core::tabledesc::ColumnDesc],
 ) -> PyResult<()> {
-    let dict = dminfo
-        .cast::<PyDict>()
-        .map_err(|_| PyTypeError::new_err("dminfo must be a dict"))?;
-    if dict.is_empty() || cols.is_empty() {
-        return Ok(());
-    }
-    let field_str = |rec: &Bound<'_, PyDict>, key: &str| -> Option<String> {
-        rec.get_item(key)
-            .ok()
-            .flatten()
-            .and_then(|v| v.extract::<String>().ok())
-    };
-    // A flat record has TYPE at the top level and applies to the whole call.
-    if dict.contains("TYPE")? {
-        let dm_type = field_str(dict, "TYPE");
-        let name = field_str(dict, "NAME");
-        for cd in cols.iter_mut() {
-            apply_dm_record(cd, dm_type.as_deref(), name.as_deref())?;
-        }
-        return Ok(());
-    }
-    // getdminfo()-shaped mapping: one record per data manager.
-    for (key, value) in dict.iter() {
-        let rec = value
-            .cast::<PyDict>()
-            .map_err(|_| PyTypeError::new_err("dminfo values must be dicts"))?;
-        let dm_type = field_str(rec, "TYPE");
-        let name = field_str(rec, "NAME").or_else(|| key.extract::<String>().ok());
-        match rec.get_item("COLUMNS")? {
-            Some(columns_value) => {
-                let names: Vec<String> = columns_value.extract()?;
-                for col_name in &names {
-                    let cd = cols
-                        .iter_mut()
-                        .find(|c| &c.name == col_name)
-                        .ok_or_else(|| {
-                            PyKeyError::new_err(format!(
-                                "dminfo names column {col_name:?}, which is not among the \
-                             columns being added"
-                            ))
-                        })?;
-                    apply_dm_record(cd, dm_type.as_deref(), name.as_deref())?;
-                }
-            }
-            None => {
-                for cd in cols.iter_mut() {
-                    apply_dm_record(cd, dm_type.as_deref(), name.as_deref())?;
-                }
-            }
-        }
-    }
-    Ok(())
+    let rec = dminfo_record(py, dminfo)?;
+    core::tabledesc::apply_dminfo(&rec, cols).map_err(dm_err)
 }
 
 /// A `casacure.tables.table` object stored as an MS keyword becomes a table
@@ -1063,12 +1004,16 @@ user,usernoread,permanent,permanentwait"
 
     /// Open or create a table; `desc_json` is the python-casacore table-desc
     /// dict (creates when given) and `nrow` its initial row count.
+    /// `dminfo` (the parsed `dminfo` argument, creation only) picks the new
+    /// columns' storage managers before the table is written
+    /// (`tabledesc::apply_dminfo`); it is ignored when opening.
     ///
     /// Runs without the GIL where the caller detaches: opening takes the
     /// mode's open lock, which may block on another process.
     fn open_or_create(
         path: &str,
         desc_json: Option<&str>,
+        dminfo: Option<&core::record::TableRecord>,
         nrow: u64,
         writable: bool,
         options: core::lockfile::LockOptions,
@@ -1095,7 +1040,10 @@ user,usernoread,permanent,permanentwait"
             PathBuf::from(&abs)
         };
         if let Some(desc_string) = desc_json {
-            let desc = core::tabledesc::TableDesc::from_desc_json(desc_string).map_err(err)?;
+            let mut desc = core::tabledesc::TableDesc::from_desc_json(desc_string).map_err(err)?;
+            if let Some(dm) = dminfo {
+                core::tabledesc::apply_dminfo(dm, &mut desc.columns).map_err(dm_err)?;
+            }
             let mut wt = core::WritableTable::create_with_lock(&dir, desc, options).map_err(err)?;
             // Write the empty table, then grow it: the growth appends
             // default rows in place (zeroed tiles, default buckets, empty or
@@ -1654,7 +1602,7 @@ impl Table {
                     let mut s = shared.lock().unwrap();
                     let mut columns = parsed.columns;
                     if let Some(dminfo) = dminfo {
-                        apply_dminfo(dminfo, &mut columns)?;
+                        apply_dminfo(py, dminfo, &mut columns)?;
                     }
                     for cd in columns {
                         s.wt.addcol(cd);
@@ -3748,13 +3696,13 @@ fn spec_to_dict(py: Python<'_>, spec: &core::DmSpec) -> PyResult<Py<PyAny>> {
 /// Module-level `table(...)` factory.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
-#[pyo3(signature = (name, tabledesc = None, nrow = 0, _dminfo = None, readonly = false, _ack = true, lockoptions = None, *_args, **_kwargs))]
+#[pyo3(signature = (name, tabledesc = None, nrow = 0, dminfo = None, readonly = false, _ack = true, lockoptions = None, *_args, **_kwargs))]
 pub fn table(
     py: Python<'_>,
     name: &Bound<'_, PyAny>,
     tabledesc: Option<&Bound<'_, PyAny>>,
     nrow: i64,
-    _dminfo: Option<&Bound<'_, PyAny>>,
+    dminfo: Option<&Bound<'_, PyAny>>,
     readonly: bool,
     _ack: bool,
     lockoptions: Option<&Bound<'_, PyAny>>,
@@ -3778,6 +3726,12 @@ pub fn table(
         }
         _ => None,
     };
+    // python-casacore only consults `dminfo` when the tabledesc creates a
+    // new table; it is inert on an open.
+    let dminfo_rec = match (desc_json.as_deref(), dminfo) {
+        (Some(_), Some(dm)) if !dm.is_none() => Some(dminfo_record(py, dm)?),
+        _ => None,
+    };
     // python-casacore's default: `lockoptions='default'` (AutoLocking).
     let options = match lockoptions {
         Some(lo) if !lo.is_none() => Table::parse_lockoptions(lo)?,
@@ -3789,6 +3743,7 @@ pub fn table(
         Table::open_or_create(
             &name,
             desc_json.as_deref(),
+            dminfo_rec.as_ref(),
             nrow.max(0) as u64,
             !readonly,
             options,
@@ -3894,6 +3849,7 @@ pub fn taql(
             let t = Table::open_or_create(
                 &path.display().to_string(),
                 None,
+                None,
                 0,
                 true,
                 core::lockfile::LockOptions::no_locking(),
@@ -3986,6 +3942,7 @@ fn taql_result_to_table(_py: Python<'_>, out: core::taql::TaqlTable) -> PyResult
                 values: Vec::new(),
             },
             kind,
+            tile_shape: None,
         });
         all.push(cells.clone());
     }

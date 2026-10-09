@@ -68,6 +68,14 @@ pub enum TsmError {
         cube_shape: Vec<i64>,
         tile_shape: Vec<i64>,
     },
+    #[error(
+        "unsupported tile shape {tile_shape:?} for cells of shape {cell_shape:?}: tiles need \
+         the cell's dimensionality with a positive row count and positive dimensions"
+    )]
+    BadTileShape {
+        cell_shape: Vec<i64>,
+        tile_shape: Vec<i64>,
+    },
     #[error("tile data file {0} does not exist")]
     MissingTileFile(String),
     #[error("unsupported tiled element type {0:?}")]
@@ -1208,8 +1216,34 @@ pub(crate) fn tsm_layout(
         cell_elems as usize * elem_size
     };
     let rows_per_tile = (DEFAULT_TILE_BYTES / cell_bytes.max(1)).max(1) as u64;
-    let n_tiles = nrow.div_ceil(rows_per_tile).max(1);
-    let tile_elems = cell_elems * rows_per_tile as i64;
+    tsm_layout_with_rows(cell_shape, cell_shape, data_type, nrow, rows_per_tile)
+}
+
+/// [`tsm_layout`] with an explicit rows-per-tile (a caller-requested
+/// `SPEC.DEFAULTTILESHAPE`) and the tile's cell part: the tile grid holds
+/// `prod(ceil(cell / tile_cell))` buckets per row layer (one when the tiles
+/// cover the cell), so the tile file carries that many buckets per
+/// rows-per-tile layer.
+pub(crate) fn tsm_layout_with_rows(
+    cell_shape: &[i64],
+    tile_cell: &[i64],
+    data_type: DataType,
+    nrow: u64,
+    rows_per_tile: u64,
+) -> Result<TsmLayout, TsmError> {
+    let elem_size = elem_size(data_type)?;
+    let is_bool = data_type == DataType::Bool;
+    let rows_per_tile = rows_per_tile.max(1);
+    let layer_tiles: u64 = cell_shape
+        .iter()
+        .zip(tile_cell)
+        .map(|(&c, &t)| (c as u64).div_ceil(t as u64))
+        .product();
+    let n_tiles = nrow.div_ceil(rows_per_tile).max(1) * layer_tiles;
+    // A bucket holds one tile: the tile's own pixels (its cell part times
+    // the rows per tile) — for whole-cell tiles that is the cell times the
+    // rows, for cell-splitting tiles it is smaller.
+    let tile_elems: i64 = tile_cell.iter().product::<i64>() * rows_per_tile as i64;
     let bucket_size = if is_bool {
         (tile_elems as usize).div_ceil(8)
     } else {
@@ -1220,6 +1254,35 @@ pub(crate) fn tsm_layout(
         n_tiles,
         bucket_size,
     })
+}
+
+/// Validate a caller-requested tile shape (a dminfo
+/// `SPEC.DEFAULTTILESHAPE`, CASA order: the cell dimensions plus the rows
+/// per tile) against the column's cell shape, returning
+/// `(cell part, rows per tile)`. The tile must have the cell's
+/// dimensionality with positive dimensions; its cell part may split the
+/// cell across tiles (dask-ms asks for this on wide rows) — the runs of
+/// the split are what [`tile_runs`] precomputes, for the writer below and
+/// for the reader's gather.
+pub(crate) fn requested_tile_shape<'a>(
+    cell_shape: &[i64],
+    tile: &'a [i64],
+) -> Result<(&'a [i64], u64), TsmError> {
+    let (rows, cell_part) = tile.split_last().ok_or_else(|| TsmError::BadTileShape {
+        cell_shape: cell_shape.to_vec(),
+        tile_shape: tile.to_vec(),
+    })?;
+    let rows = u64::try_from(*rows).map_err(|_| TsmError::BadTileShape {
+        cell_shape: cell_shape.to_vec(),
+        tile_shape: tile.to_vec(),
+    })?;
+    if rows == 0 || cell_part.len() != cell_shape.len() || tile.iter().any(|&t| t <= 0) {
+        return Err(TsmError::BadTileShape {
+            cell_shape: cell_shape.to_vec(),
+            tile_shape: tile.to_vec(),
+        });
+    }
+    Ok((cell_part, rows))
 }
 
 /// Place `src`'s bits (LSB-first) into `out` starting at bit `bit`,
@@ -1431,11 +1494,14 @@ fn tsm_header(p: TsmHeaderParams<'_>) -> Vec<u8> {
     hw.into_bytes()
 }
 
-/// The header of a casacure-layout TSM column of `nrow` rows (one real
-/// cube, default tiles), the length its tile file must have, and the tile
-/// file's sequence number: what growing a column in place rewrites.  The
-/// tile data itself is unchanged by growth — tile `t` stays at
-/// `t * bucket_size` and new rows land in zeroed (default) bytes.
+/// The header (+ tile-file length, tile-file sequence number) a column
+/// grown from `old` to `new` rows must have, so growth extends the tile
+/// file in place. `tile_shape` (a dminfo `SPEC.DEFAULTTILESHAPE`: the cell
+/// dimensions plus the rows per tile, CASA order) overrides the derived
+/// rows-per-tile when given.  The tile data itself is unchanged by growth —
+/// tile `t` stays at `t * bucket_size` and new rows land in zeroed
+/// (default) bytes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn tsm_grown_header(
     stman_type: &str,
     big_endian: bool,
@@ -1444,8 +1510,15 @@ pub(crate) fn tsm_grown_header(
     data_type: DataType,
     cell_shape: &[i64],
     nrow: u64,
+    tile_shape: Option<&[i64]>,
 ) -> Result<(Vec<u8>, u64, u32), TsmError> {
-    let layout = tsm_layout(cell_shape, data_type, nrow)?;
+    let layout = match tile_shape {
+        None => tsm_layout(cell_shape, data_type, nrow)?,
+        Some(tile) => {
+            let (cell_part, rows) = requested_tile_shape(cell_shape, tile)?;
+            tsm_layout_with_rows(cell_shape, cell_part, data_type, nrow, rows)?
+        }
+    };
     let tile_file_len = layout.bucket_size * layout.n_tiles as usize;
     let hdr = tsm_header(TsmHeaderParams {
         stman_type,
@@ -1457,56 +1530,63 @@ pub(crate) fn tsm_grown_header(
         nrow,
         layout: &layout,
         tile_file_len,
-        tile_cell: None,
+        tile_cell: tile_shape.map(|t| &t[..t.len() - 1]),
     });
     let file_seq = u32::from(stman_type == "TiledShapeStMan");
     Ok((hdr, tile_file_len as u64, file_seq))
 }
 
-/// Whether `header` has exactly the layout casacure writes for a column of
-/// `cell_shape` cells (CASA order): one real cube at file offset 0 with the
-/// default tile shape, in the tile file [`tsm_grown_header`] names, and
-/// (TiledShapeStMan) the single-hypercube row map.  Only such a column can
-/// be grown in place by rewriting its header.
-pub(crate) fn is_casacure_layout(
-    header: &TsmHeader,
-    data_type: DataType,
-    cell_shape: &[i64],
-) -> bool {
+/// The tile shape of a header stored in the exact layout this crate writes
+/// — a single real cube (any tile shape, whole-cell or cell-splitting),
+/// the casacure file numbering, and (TiledShapeStMan) the single-hypercube
+/// row maps — so that regenerating the column (a flush that rewrites it,
+/// row growth) can reproduce the tiling verbatim. `None` for any other
+/// layout: those columns are re-tiled to the derived shape when rewritten,
+/// which is also what a rewrite of a casacore-written column has always
+/// done.
+pub(crate) fn stored_casacure_tile(header: &TsmHeader) -> Option<Vec<i64>> {
     let is_shape = header.root_type == "TiledShapeStMan";
-    let Ok(layout) = tsm_layout(cell_shape, data_type, header.nrrow) else {
-        return false;
-    };
-    let real = usize::from(is_shape);
-    let file_seq = real as u32;
-    if header.cubes.len() != real + 1 || header.files.len() != 1 {
-        return false;
+    if !is_shape && header.root_type != "TiledColumnStMan" {
+        return None;
     }
-    if header.files[0].sequence_nr != file_seq {
-        return false;
+    if header.data_types.len() != 1 {
+        return None;
+    }
+    let real = usize::from(is_shape);
+    if header.cubes.len() != real + 1 || header.files.len() != 1 {
+        return None;
+    }
+    if header.files[0].sequence_nr != real as u32 {
+        return None;
     }
     let cube = &header.cubes[real];
-    let mut cube_shape = cell_shape.to_vec();
-    cube_shape.push(header.nrrow as i64);
-    let mut tile_shape = cell_shape.to_vec();
-    tile_shape.push(layout.rows_per_tile as i64);
+    let nrdim = cube.nrdim as usize;
+    if nrdim < 1 || cube.cube_shape.len() != nrdim || cube.tile_shape.len() != nrdim {
+        return None;
+    }
+    if cube.cube_shape.iter().any(|&c| c < 0) || cube.tile_shape.iter().any(|&t| t <= 0) {
+        return None;
+    }
+    if cube.file_seq_nr != real as i32 || cube.file_offset != 0 {
+        return None;
+    }
     let maps_ok = !is_shape
         || (header.nrrow == 0 && header.row_map.is_empty())
         || (header.row_map == [header.nrrow as u32 - 1]
             && header.cube_map == [1]
             && header.pos_map == [header.nrrow as u32 - 1]);
-    cube.file_seq_nr == file_seq as i32
-        && cube.file_offset == 0
-        && cube.cube_shape == cube_shape
-        && cube.tile_shape == tile_shape
-        && maps_ok
+    if !maps_ok {
+        return None;
+    }
+    Some(cube.tile_shape.clone())
 }
 
 /// Write a whole bool column straight from its row bit-slices: the
 /// typed-buffer form of [`write_tsm_file`].  `rows[r]` holds cell `r`'s
 /// `cell_elems` bools (LSB-first); rows pack contiguously into the tiles —
 /// no per-row byte-aligning, intermediate `Vec<u8>` cells, or set-bit
-/// scatter at write time.
+/// scatter at write time.  `tile_shape` (the cell dimensions plus the rows
+/// per tile, CASA order) overrides the derived rows-per-tile when given.
 pub fn write_tsm_file_bool(
     stman_type: &str,
     big_endian: bool,
@@ -1514,6 +1594,7 @@ pub fn write_tsm_file_bool(
     hypercolumn_name: &str,
     cell_shape: &[i64],
     rows: &[&[bool]],
+    tile_shape: Option<&[i64]>,
 ) -> Result<(Vec<u8>, Vec<u8>, u32), TsmError> {
     if stman_type != "TiledColumnStMan" && stman_type != "TiledShapeStMan" {
         return Err(TsmError::UnexpectedType {
@@ -1530,13 +1611,51 @@ pub fn write_tsm_file_bool(
         return Err(TsmError::UnsupportedType(DataType::Bool));
     }
     let nrow = rows.len() as u64;
-    let layout = tsm_layout(cell_shape, DataType::Bool, nrow)?;
+    // The tile grid: whole-cell tiles place each row's bits contiguously;
+    // cell-splitting tiles scatter the row over the planned runs (element
+    // units), one bucket per grid position per row layer.
+    let (tile_cell, rows_per_tile, layer_tiles) = match tile_shape {
+        None => (cell_shape.to_vec(), None, 1u64),
+        Some(tile) => {
+            let (cell_part, rows) = requested_tile_shape(cell_shape, tile)?;
+            (
+                cell_part.to_vec(),
+                Some(rows),
+                cell_shape
+                    .iter()
+                    .zip(cell_part)
+                    .map(|(&c, &t)| (c as u64).div_ceil(t as u64))
+                    .product(),
+            )
+        }
+    };
+    let layout = match rows_per_tile {
+        None => tsm_layout(cell_shape, DataType::Bool, nrow)?,
+        Some(rows) => tsm_layout_with_rows(cell_shape, &tile_cell, DataType::Bool, nrow, rows)?,
+    };
+    let tile_cell_elems = tile_cell.iter().product::<i64>() as usize;
+    let runs = if tile_cell == cell_shape {
+        Vec::new()
+    } else {
+        tile_runs(cell_shape, &tile_cell)
+    };
     let mut tile_file = vec![0u8; layout.bucket_size * layout.n_tiles as usize];
     for (row, r) in rows.iter().enumerate() {
         let tile = row as u64 / layout.rows_per_tile;
-        let in_tile = row as u64 % layout.rows_per_tile;
-        let bucket = tile as usize * layout.bucket_size;
-        or_bits_at(&mut tile_file[bucket..], r, in_tile as usize * cell_elems);
+        let in_tile = (row as u64 % layout.rows_per_tile) as usize;
+        if runs.is_empty() {
+            let bucket = tile as usize * layout.bucket_size;
+            or_bits_at(&mut tile_file[bucket..], r, in_tile * cell_elems);
+        } else {
+            for run in &runs {
+                let bucket = ((tile * layer_tiles) as usize + run.tile) * layout.bucket_size;
+                or_bits_at(
+                    &mut tile_file[bucket..bucket + layout.bucket_size],
+                    &r[run.dst..run.dst + run.len],
+                    in_tile * tile_cell_elems + run.src,
+                );
+            }
+        }
     }
     let hdr = tsm_header(TsmHeaderParams {
         stman_type,
@@ -1548,7 +1667,7 @@ pub fn write_tsm_file_bool(
         nrow,
         layout: &layout,
         tile_file_len: tile_file.len(),
-        tile_cell: None,
+        tile_cell: tile_shape.map(|t| &t[..t.len() - 1]),
     });
     let real_file_seq = if stman_type == "TiledShapeStMan" {
         1
@@ -1559,6 +1678,11 @@ pub fn write_tsm_file_bool(
 }
 
 /// casacore numbers TiledShapeStMan's first real tile file 1.
+///
+/// `tile_shape` (the cell dimensions plus the rows per tile, CASA order — a
+/// dminfo `SPEC.DEFAULTTILESHAPE`) overrides the derived rows-per-tile when
+/// given; the tiles must cover a whole cell ([`requested_tile_shape`]).
+#[allow(clippy::too_many_arguments)]
 pub fn write_tsm_file(
     stman_type: &str,
     big_endian: bool,
@@ -1567,6 +1691,7 @@ pub fn write_tsm_file(
     data_type: DataType,
     cell_shape: &[i64],
     cells: &[Vec<u8>],
+    tile_shape: Option<&[i64]>,
 ) -> Result<(Vec<u8>, Vec<u8>, u32), TsmError> {
     if stman_type != "TiledColumnStMan" && stman_type != "TiledShapeStMan" {
         return Err(TsmError::UnexpectedType {
@@ -1586,7 +1711,38 @@ pub fn write_tsm_file(
         return Err(TsmError::UnsupportedType(data_type));
     }
     let nrow = cells.len() as u64;
-    let layout = tsm_layout(cell_shape, data_type, nrow)?;
+    // The tile grid: without a requested tile shape the tiles are whole
+    // cells (derived rows per tile); with one, the tile's cell part may
+    // split the cell — each row then scatters over the runs [`tile_runs`]
+    // plans, one bucket per grid position per row layer, mirroring the
+    // reader's gather.
+    let (tile_cell, layer_tiles) = match tile_shape {
+        None => (cell_shape.to_vec(), 1u64),
+        Some(tile) => {
+            let (cell_part, _) = requested_tile_shape(cell_shape, tile)?;
+            (
+                cell_part.to_vec(),
+                cell_shape
+                    .iter()
+                    .zip(cell_part)
+                    .map(|(&c, &t)| (c as u64).div_ceil(t as u64))
+                    .product(),
+            )
+        }
+    };
+    let layout = match tile_shape {
+        None => tsm_layout(cell_shape, data_type, nrow)?,
+        Some(tile) => {
+            let (_, rows) = requested_tile_shape(cell_shape, tile)?;
+            tsm_layout_with_rows(cell_shape, &tile_cell, data_type, nrow, rows)?
+        }
+    };
+    let tile_cell_elems = tile_cell.iter().product::<i64>() as usize;
+    let runs = if tile_cell == cell_shape {
+        Vec::new()
+    } else {
+        tile_runs(cell_shape, &tile_cell)
+    };
 
     // Tile data file (data-file endianness; rows fill the tile grid). Bool
     // cells are bit-packed (LSB-first), so a row's bits start at an
@@ -1595,17 +1751,40 @@ pub fn write_tsm_file(
     let mut tile_file = vec![0u8; layout.bucket_size * layout.n_tiles as usize];
     for (row, cell) in cells.iter().enumerate() {
         let tile = row as u64 / layout.rows_per_tile;
-        let in_tile = row as u64 % layout.rows_per_tile;
-        let bucket = tile as usize * layout.bucket_size;
-        if is_bool {
-            or_bytes_at(
-                &mut tile_file[bucket..],
-                cell,
-                in_tile as usize * cell_elems as usize,
-            );
+        let in_tile = (row as u64 % layout.rows_per_tile) as usize;
+        if runs.is_empty() {
+            let bucket = tile as usize * layout.bucket_size;
+            if is_bool {
+                or_bytes_at(
+                    &mut tile_file[bucket..],
+                    cell,
+                    in_tile * cell_elems as usize,
+                );
+            } else {
+                let off = bucket + in_tile * cell_bytes;
+                tile_file[off..off + cell_bytes].copy_from_slice(cell);
+            }
+        } else if is_bool {
+            // The cell's packed bits scatter over the runs (element units,
+            // LSB-first): cell[dst..dst+len] lands at the run's tile bit.
+            for run in &runs {
+                let bucket = ((tile * layer_tiles) as usize + run.tile) * layout.bucket_size;
+                or_bits_from(
+                    &mut tile_file[bucket..bucket + layout.bucket_size],
+                    in_tile * tile_cell_elems + run.src,
+                    cell,
+                    run.dst * 8,
+                    run.len * 8,
+                );
+            }
         } else {
-            let off = bucket + in_tile as usize * cell_bytes;
-            tile_file[off..off + cell_bytes].copy_from_slice(cell);
+            for run in &runs {
+                let bucket = ((tile * layer_tiles) as usize + run.tile) * layout.bucket_size;
+                let s = bucket + in_tile * tile_cell_elems * elem_size + run.src * elem_size;
+                let d = run.dst * elem_size;
+                tile_file[s..s + run.len * elem_size]
+                    .copy_from_slice(&cell[d..d + run.len * elem_size]);
+            }
         }
     }
 
@@ -1619,7 +1798,7 @@ pub fn write_tsm_file(
         nrow,
         layout: &layout,
         tile_file_len: tile_file.len(),
-        tile_cell: None,
+        tile_cell: tile_shape.map(|t| &t[..t.len() - 1]),
     });
     let real_file_seq = if stman_type == "TiledShapeStMan" {
         1
@@ -1852,6 +2031,7 @@ mod tests {
                 values: Vec::new(),
             },
             kind: ColumnKind::Array,
+            tile_shape: None,
         }
     }
 
@@ -1907,6 +2087,7 @@ mod tests {
             dt,
             &casa_shape,
             &cells,
+            None,
         )
         .unwrap();
         let header = parse_header(&header_bytes).unwrap();
@@ -1984,6 +2165,7 @@ mod tests {
             DataType::Bool,
             &[3, 2],
             &cells,
+            None,
         )
         .unwrap();
         // The six elements pack into one byte, LSB-first: bits 0, 2, 3 set.
@@ -2021,6 +2203,7 @@ mod tests {
             DataType::Bool,
             &[3],
             &rows,
+            None,
         )
         .unwrap();
         let header = parse_header(&header).unwrap();
@@ -2118,9 +2301,11 @@ mod tests {
                 let shape = vec![cell_elems as i64];
                 let cells: Vec<Vec<u8>> = rows.iter().map(|r| encode_bits(r)).collect();
                 let general =
-                    write_tsm_file(stman, false, 0, "g", DataType::Bool, &shape, &cells).unwrap();
+                    write_tsm_file(stman, false, 0, "g", DataType::Bool, &shape, &cells, None)
+                        .unwrap();
                 let typed_rows: Vec<&[bool]> = rows.iter().map(|r| r.as_slice()).collect();
-                let typed = write_tsm_file_bool(stman, false, 0, "g", &shape, &typed_rows).unwrap();
+                let typed =
+                    write_tsm_file_bool(stman, false, 0, "g", &shape, &typed_rows, None).unwrap();
                 assert_eq!(general.0, typed.0, "header {stman} cell_elems {cell_elems}");
                 assert_eq!(general.1, typed.1, "tile {stman} cell_elems {cell_elems}");
                 assert_eq!(
@@ -2146,7 +2331,7 @@ mod tests {
             .collect();
         // 1-D cell of 1024 dcomplex (CASA shape).
         let (header, tile_data, _) =
-            write_tsm_file("TiledColumnStMan", false, 0, "g", dt, &[1024], &cells).unwrap();
+            write_tsm_file("TiledColumnStMan", false, 0, "g", dt, &[1024], &cells, None).unwrap();
         let header = parse_header(&header).unwrap();
         let rows_per_tile = header.cubes[0].tile_shape[1];
         assert_eq!(rows_per_tile, 32);
@@ -2176,6 +2361,7 @@ mod tests {
             DataType::Int,
             &[3, 2],
             &cells,
+            None,
         )
         .unwrap();
         let header = parse_header(&header).unwrap();
@@ -2206,7 +2392,8 @@ mod tests {
                 "g",
                 DataType::Int,
                 &[3, 2],
-                &cells
+                &cells,
+                None
             ),
             Err(TsmError::UnsupportedType(DataType::Int))
         ));
@@ -2223,6 +2410,7 @@ mod tests {
             DataType::Int,
             &[1],
             &cells,
+            None,
         )
         .unwrap();
         // Corrupt the root type name "TiledColumnStMan" in place.
@@ -2577,6 +2765,7 @@ mod tests {
             DataType::Int,
             &[3, 2],
             &cells,
+            None,
         )
         .unwrap();
         let header = parse_header(&header_bytes).unwrap();
@@ -2619,6 +2808,7 @@ mod tests {
             DataType::Float,
             &[2],
             &cells,
+            None,
         )
         .unwrap();
         let mut header = parse_header(&header_bytes).unwrap();

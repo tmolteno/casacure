@@ -664,6 +664,7 @@ mod tests {
                 values: Vec::new(),
             },
             kind: ColumnKind::Scalar(RecordValue::Int(0)),
+            tile_shape: None,
         }
     }
 

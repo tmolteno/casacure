@@ -2010,6 +2010,7 @@ mod tests {
                 values: Vec::new(),
             },
             kind: ColumnKind::Scalar(crate::record::RecordValue::Int(0)),
+            tile_shape: None,
         }
     }
 

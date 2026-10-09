@@ -1585,7 +1585,7 @@ fn run_alter(
     let tr = parse_table_ref(&mut p)?;
 
     enum Op {
-        Add(crate::tabledesc::ColumnDesc),
+        Add(Box<crate::tabledesc::ColumnDesc>),
         Drop(String),
         Rename(String, String),
         SetKeyword(String, Expr),
@@ -1602,7 +1602,7 @@ fn run_alter(
                         p.next();
                     }
                 }
-                ops.push(Op::Add(parse_column_spec(&mut p)?));
+                ops.push(Op::Add(Box::new(parse_column_spec(&mut p)?)));
             }
             "DROP" => {
                 p.next();
@@ -1670,7 +1670,7 @@ fn run_alter(
                         cd.name
                     )));
                 }
-                wt.addcol(cd);
+                wt.addcol(*cd);
             }
             Op::Drop(name) => {
                 let idx = wt
@@ -1912,6 +1912,7 @@ fn desc_of_result(
                 values: Vec::new(),
             },
             kind: crate::tabledesc::ColumnKind::Scalar(def),
+            tile_shape: None,
         }
     }
     let mut desc = crate::tabledesc::TableDesc {
@@ -1977,6 +1978,7 @@ fn desc_of_result(
                         values: Vec::new(),
                     },
                     kind: crate::tabledesc::ColumnKind::Array,
+                    tile_shape: None,
                 }
             }
             other => {
@@ -4658,6 +4660,7 @@ fn parse_column_spec(p: &mut Parser) -> Result<ColumnDesc, TaqlError> {
         max_length: maxlen as i32,
         keywords,
         kind: column_kind,
+        tile_shape: None,
     })
 }
 
@@ -4729,6 +4732,7 @@ mod tests {
             max_length: 0,
             keywords: empty_record(),
             kind: ColumnKind::Scalar(def),
+            tile_shape: None,
         }
     }
 

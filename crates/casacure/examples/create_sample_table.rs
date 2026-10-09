@@ -31,6 +31,7 @@ fn scalar(name: &str, dt: DataType, default: RecordValue) -> ColumnDesc {
         max_length: 0,
         keywords: empty_record(),
         kind: ColumnKind::Scalar(default),
+        tile_shape: None,
     }
 }
 
@@ -49,6 +50,7 @@ fn arr(name: &str, dt: DataType, casa_shape: &[i64]) -> ColumnDesc {
         max_length: 0,
         keywords: empty_record(),
         kind: ColumnKind::Array,
+        tile_shape: None,
     }
 }
 

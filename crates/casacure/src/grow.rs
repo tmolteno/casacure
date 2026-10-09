@@ -225,10 +225,19 @@ pub(crate) fn tsm_grow(
         .get(real)
         .filter(|c| !c.cube_shape.is_empty())
         .map(|c| c.cube_shape[..c.cube_shape.len() - 1].to_vec());
+    // The tile shape the stored layout uses (a column created from a dminfo
+    // SPEC.DEFAULTTILESHAPE): growth must regenerate the header with it, or
+    // growing the rows would silently re-tile the column.
+    let stored_tile = crate::tsm::stored_casacure_tile(&h);
     let usable = |s: &Vec<i64>| !s.is_empty() && s.iter().all(|&d| d > 0);
     let cell_shape = if old > 0 {
+        // The stored layout is one this crate writes — single whole-cell
+        // cube, casacure file numbering (any tile shape, derived or a
+        // requested SPEC.DEFAULTTILESHAPE): growth regenerates the header
+        // with the stored tile below. `on_disk` is that cube's cell shape,
+        // so a stored tile always matches it.
         match on_disk {
-            Some(s) if crate::tsm::is_casacure_layout(&h, dtype, &s) => s,
+            Some(s) if stored_tile.is_some() => s,
             _ => return Ok(false),
         }
     } else {
@@ -241,6 +250,14 @@ pub(crate) fn tsm_grow(
             None => return Ok(false),
         }
     };
+    // The tile shape the regenerated header must carry: the stored one when
+    // the layout has it, else the descriptor's requested shape. Only the
+    // dimensionality has to fit the cell here (a cell-splitting tile's cell
+    // part legitimately differs); anything malformed falls back to the
+    // derived shape via the whole-table rewrite, not a wrong header.
+    let tile_shape: Option<Vec<i64>> = stored_tile
+        .or_else(|| cd.tile_shape.clone())
+        .filter(|t| t.len() == cell_shape.len() + 1 && t.iter().all(|&d| d > 0));
     if dry_run {
         return Ok(true);
     }
@@ -252,6 +269,7 @@ pub(crate) fn tsm_grow(
         dtype,
         &cell_shape,
         new,
+        tile_shape.as_deref(),
     )
     .map_err(|e| e.to_string())?;
     let tile_path = dir.join(format!("table.f{seq}_TSM{file_seq}"));

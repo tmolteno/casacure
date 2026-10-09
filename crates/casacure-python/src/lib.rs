@@ -40,7 +40,9 @@ fn casa_type(numpy_dtype: &str) -> PyResult<String> {
 
 /// `default_ms(path, tabdesc=None, dminfo=None)` — create the full MS tree
 /// (main table + the 12 standard subtables), mirroring casacore. Returns the
-/// main table (usable as a context manager).
+/// main table (usable as a context manager). `dminfo` selects the main
+/// table's storage managers (`tabledesc::apply_dminfo`), so a created MS
+/// carries tiled DATA/FLAG/... straight away.
 #[pyfunction]
 #[pyo3(signature = (path, tabdesc = None, dminfo = None))]
 fn default_ms(
@@ -50,7 +52,6 @@ fn default_ms(
     dminfo: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyAny>> {
     let path_str = table::path_string(path)?;
-    let _ = dminfo;
     let extra = match tabdesc {
         Some(d) if !d.is_none() => {
             if let Ok(dict) = d.cast::<PyDict>() {
@@ -62,8 +63,16 @@ fn default_ms(
         }
         _ => None,
     };
-    ::casacure::ms::default_ms(std::path::Path::new(&path_str), extra.as_deref())
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let dminfo_rec = match dminfo {
+        Some(dm) if !dm.is_none() => Some(table::dminfo_record(py, dm)?),
+        _ => None,
+    };
+    ::casacure::ms::default_ms(
+        std::path::Path::new(&path_str),
+        extra.as_deref(),
+        dminfo_rec.as_ref(),
+    )
+    .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let t = table::table(
         py,
         path,

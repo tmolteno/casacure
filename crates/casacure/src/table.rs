@@ -152,6 +152,42 @@ pub fn patch_copy_nrow(dir: &std::path::Path, nrow: u64) -> Result<(), TableDatE
     Ok(())
 }
 
+/// Convert a table's storage in place per a dminfo record — the deep
+/// `tablecopy(dminfo=...)` conversion. Every column is read back into
+/// memory and the table is regenerated under the dminfo-applied schema
+/// (`create_table`), so the named columns land in the requested managers
+/// with the requested tile shapes while keywords and subtable links are
+/// preserved. Like casacore's own deep copy this holds the whole table in
+/// memory; record-column and multi-shape tiled data convert only as far as
+/// `create_table` can write them, and fail loudly otherwise.
+pub fn apply_dminfo_in_place(
+    dir: &std::path::Path,
+    dminfo: &crate::record::TableRecord,
+) -> Result<(), TableDatError> {
+    let t = Table::open(dir, true)?;
+    let n = t.nrows();
+    let mut desc = t.dat.desc.clone();
+    crate::tabledesc::apply_dminfo(dminfo, &mut desc.columns)
+        .map_err(|e| TableDatError::Storage(e.to_string()))?;
+    let mut wt = WritableTable::create(dir, desc);
+    if n > 0 {
+        wt.addrows(n);
+    }
+    for j in 0..wt.desc.columns.len() {
+        let name = wt.desc.columns[j].name.clone();
+        let vals = t
+            .getcol(j, 0, n)
+            .map_err(|e| TableDatError::Storage(format!("read column {name}: {e}")))?;
+        for (r, v) in vals.into_iter().enumerate() {
+            wt.putcell(j, r as u64, v)
+                .map_err(|e| TableDatError::Storage(format!("buffer column {name}: {e}")))?;
+        }
+    }
+    wt.flush()
+        .map(|_| ())
+        .map_err(|e| TableDatError::Storage(e.to_string()))
+}
+
 /// Errors from creating a CASA table.
 #[derive(Debug, Error)]
 pub enum TableCreateError {
@@ -934,7 +970,13 @@ fn build_tsm_data(
             rows.push(v.as_slice());
         }
         return crate::tsm::write_tsm_file_bool(
-            stman_type, big_endian, seq_nr, dm_name, &cradle, &rows,
+            stman_type,
+            big_endian,
+            seq_nr,
+            dm_name,
+            &cradle,
+            &rows,
+            cd.tile_shape.as_deref(),
         )
         .map_err(|e| {
             TableCreateError::Io(std::io::Error::other(format!(
@@ -968,6 +1010,7 @@ fn build_tsm_data(
         cd.data_type,
         &cradle,
         &cells,
+        cd.tile_shape.as_deref(),
     )
     .map_err(|e| {
         TableCreateError::Io(std::io::Error::other(format!(
@@ -1126,6 +1169,32 @@ pub(crate) type DataFiles = (
     Vec<(u32, crate::tsm::TsmFile)>,
 );
 
+/// Descriptor equality for the flush path: everything `table.dat` stores.
+/// The columns' requested tile shape is excluded — it lives in the TSM
+/// header (table.dat does not carry it), so a desc read back from disk
+/// always carries `None` there.
+fn desc_equal_on_disk(a: &crate::tabledesc::TableDesc, b: &crate::tabledesc::TableDesc) -> bool {
+    a.name == b.name
+        && a.version == b.version
+        && a.comment == b.comment
+        && a.keywords == b.keywords
+        && a.private_keywords == b.private_keywords
+        && a.columns.len() == b.columns.len()
+        && a.columns.iter().zip(b.columns.iter()).all(|(x, y)| {
+            x.name == y.name
+                && x.comment == y.comment
+                && x.data_type == y.data_type
+                && x.data_manager_type == y.data_manager_type
+                && x.data_manager_group == y.data_manager_group
+                && x.options == y.options
+                && x.ndim == y.ndim
+                && x.shape == y.shape
+                && x.max_length == y.max_length
+                && x.keywords == y.keywords
+                && x.kind == y.kind
+        })
+}
+
 fn read_table_dir(path: &std::path::Path) -> Result<DataFiles, TableDatError> {
     // Gated for reading: a same-process writer's patch/rewrite phases hold
     // the gate for writing, so an open never parses a half-written file
@@ -1165,6 +1234,31 @@ fn read_table_dir(path: &std::path::Path) -> Result<DataFiles, TableDatError> {
                     "unsupported data-manager type {other}"
                 )))
             }
+        }
+    }
+    // A column whose tiled storage carries the exact layout this crate
+    // writes keeps the tile shape it was created with: a later flush that
+    // regenerates the column (a written column, row growth) would otherwise
+    // silently re-tile it to the derived shape. Columns stored in any other
+    // layout (real casacore files, exotic tilings) keep `None` and re-tile
+    // on rewrite, as they always have.
+    for cd in &mut dat.desc.columns {
+        let Some(set_col) = dat
+            .column_set
+            .columns
+            .iter()
+            .find(|c| c.original_name == cd.name)
+        else {
+            continue;
+        };
+        let Some((_, tsm)) = tsm_files
+            .iter()
+            .find(|(seq, _)| *seq == set_col.data_manager_seq)
+        else {
+            continue;
+        };
+        if let Some(tile) = crate::tsm::stored_casacure_tile(&tsm.header) {
+            cd.tile_shape = Some(tile);
         }
     }
     Ok((dat, ssm_files, ism_files, tsm_files))
@@ -3468,8 +3562,11 @@ impl WritableTable {
         };
         self.flush_preserving(&dir, &dat)?;
         // Keywords (and any other descriptor change) live in table.dat:
-        // regenerate it around the unchanged data managers.
-        if self.meta_dirty || dat.desc != self.desc {
+        // regenerate it around the unchanged data managers.  The tile shape
+        // is not part of the comparison — table.dat does not carry it (it
+        // lives in the TSM header), so an open re-derives it from there and
+        // it never differs on disk.
+        if self.meta_dirty || !desc_equal_on_disk(&dat.desc, &self.desc) {
             self.rewrite_table_dat(&dir, &dat)?;
             self.meta_dirty = false;
         }
@@ -5132,6 +5229,7 @@ mod tests {
             max_length: max_len,
             keywords: empty_record(),
             kind: ColumnKind::Scalar(zero_value(dt)),
+            tile_shape: None,
         }
     }
 
@@ -5323,6 +5421,7 @@ mod tests {
             max_length: 0,
             keywords: empty_record(),
             kind: ColumnKind::Array,
+            tile_shape: None,
         }
     }
 
@@ -5468,6 +5567,7 @@ mod tests {
             max_length: 0,
             keywords: empty_record(),
             kind: ColumnKind::Array,
+            tile_shape: None,
         }
     }
 
@@ -6118,6 +6218,7 @@ mod tests {
                 max_length: 0,
                 keywords: empty_record(),
                 kind: ColumnKind::Array,
+                tile_shape: None,
             },
             ColumnDesc {
                 name: "FLAG_ROW".into(),
@@ -6131,6 +6232,7 @@ mod tests {
                 max_length: 0,
                 keywords: empty_record(),
                 kind: ColumnKind::Scalar(zero_value(DataType::Bool)),
+                tile_shape: None,
             },
             scalar_col("SCAN_NUMBER", DataType::Int, 0),
         ];
@@ -6235,6 +6337,7 @@ mod tests {
             max_length: 0,
             keywords: empty_record(),
             kind: ColumnKind::Array,
+            tile_shape: None,
         };
         let mut desc = typed_desc();
         desc.columns = vec![

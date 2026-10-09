@@ -41,6 +41,7 @@ fn scalar(name: &str, dt: DataType, default: RecordValue, dm: &str) -> ColumnDes
         max_length: 0,
         keywords: empty_record(),
         kind: ColumnKind::Scalar(default),
+        tile_shape: None,
     }
 }
 
@@ -60,6 +61,7 @@ fn array(name: &str, dt: DataType, casa_shape: Vec<i64>, dm: &str) -> ColumnDesc
         max_length: 0,
         keywords: empty_record(),
         kind: ColumnKind::Array,
+        tile_shape: None,
     }
 }
 

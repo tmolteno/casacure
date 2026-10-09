@@ -402,7 +402,6 @@ pub fn tablecopy(
         )));
     }
     let _ = valuecopy;
-    let _ = dminfo;
     copy_dir(sp, dp)?;
     if deep {
         // Breadth-first copy of every subtable referenced by a `Table:`
@@ -444,6 +443,18 @@ pub fn tablecopy(
                 }
             }
         }
+    }
+    // A dminfo on a copy is the storage conversion of casacore's deep copy:
+    // the copied main table is regenerated under the requested managers
+    // (every column is read back and rewritten — `Table::apply_dminfo_in_place`),
+    // while the subtables keep their copied storage. An unsupported manager
+    // or SPEC field raises ValueError rather than silently producing a
+    // different layout (issue #20).
+    if let Some(dm) = dminfo {
+        let rec = table::dminfo_record(py, dm)?;
+        ::casacure::apply_dminfo_in_place(dp, &rec).map_err(|e| {
+            PyRuntimeError::new_err(format!("tablecopy: applying dminfo to {dst}: {e}"))
+        })?;
     }
     Ok(())
 }

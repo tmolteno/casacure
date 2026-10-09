@@ -38,13 +38,15 @@ pub use ssm::{
     ARRAY_REF_SIZE,
 };
 pub use table::{
-    build_table_dat, casa_value_type, create_table, default_cell_value, get_dminfo,
-    lock_sync_nrrow, parse_table_dat, parse_table_header, patch_copy_nrow, slice_array_value,
-    slice_array_value_inc, DmInfo, DmSpec, Table, TableCreateError, TableDat, TableDatError,
-    TableError, TableHeader, TableReadError, WritableTable, WriteTableError, ROWS_PER_BUCKET,
+    apply_dminfo_in_place, build_table_dat, casa_value_type, create_table, default_cell_value,
+    get_dminfo, lock_sync_nrrow, parse_table_dat, parse_table_header, patch_copy_nrow,
+    slice_array_value, slice_array_value_inc, DmInfo, DmSpec, Table, TableCreateError, TableDat,
+    TableDatError, TableError, TableHeader, TableReadError, WritableTable, WriteTableError,
+    ROWS_PER_BUCKET,
 };
 pub use tabledesc::{
-    parse_table_desc, write_table_desc, ColumnDesc, ColumnKind, TableDesc, TableDescError,
+    apply_dminfo, parse_table_desc, write_table_desc, ColumnDesc, ColumnKind, DmInfoError,
+    TableDesc, TableDescError, SUPPORTED_DM_TYPES,
 };
 pub use tsm::{write_tsm_file, TsmCube, TsmError, TsmFile, TsmHeader, TsmTileFile};
 pub use types::{UnknownValueType, ValueType};
