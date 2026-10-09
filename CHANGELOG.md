@@ -5,6 +5,24 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A read-only handle on a table with a missing or short `table.lock`
+  failed on its 26th operation** (`RuntimeError: pread`, issue #17). The
+  `AutoLocking` yield check (`LockFile::inspect_has_waiter`) is the one
+  request-list reader that did not go through the EOF tolerance 3.8.19
+  gave `get_info`: a byte-level copy's missing lock file is served by a
+  `/dev/null` fd (whose pread is a hard EOF), and a lock file shorter
+  than its 4-byte request-list count (e.g. one made by `default_ms`'s
+  `NoLocking` create) read past the end. A missing lock file now reports
+  "no waiter" without touching the file, and a short request-list area
+  reads as zero waiters — both are legitimate lock-file states, as
+  `acquire`/`get_info` already treat them. Found by the dask-ms backend
+  re-test (issue #7): `tests/test_locking.py` gains a two-case
+  regression (removed / truncated lock file, 30 read-only `getcol`
+  calls) and `crates/casacure/src/lockfile.rs` gains the matching unit
+  tests.
+
 ## [3.8.30] - 2026-10-09
 
 ## [3.8.29] - 2026-10-09

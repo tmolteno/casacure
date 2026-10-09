@@ -556,6 +556,14 @@ mod posix {
         /// check (every 25th call and at most once per interval) for a
         /// waiting process in the request list.
         pub fn inspect_has_waiter(&mut self, always: bool) -> io::Result<bool> {
+            // A missing lock file (a byte-level copy: casacore's
+            // `mustExist=False`) has no request list to read — its `file`
+            // is `/dev/null`, where a pread is a hard EOF — and no other
+            // process can be waiting on it. Every lock request succeeds,
+            // exactly as `acquire` behaves.
+            if self.missing {
+                return Ok(false);
+            }
             if !always {
                 if self.interval > 0 && self.inspect_count < 25 {
                     self.inspect_count += 1;
@@ -570,7 +578,16 @@ mod posix {
                     }
                 }
             }
-            let nr = self.nr_req_id()?;
+            let nr = match self.nr_req_id() {
+                Ok(nr) => nr,
+                // A short/empty request-list area (a lock file that has
+                // never held one — e.g. one made by `default_ms`'s
+                // `NoLocking` create) has no waiters: the same legitimate
+                // state `get_info` treats as empty rather than propagating
+                // the EOF.
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => 0,
+                Err(e) => return Err(e),
+            };
             self.last_inspect = Some(Instant::now());
             Ok(nr > 0)
         }
@@ -1023,6 +1040,38 @@ mod tests {
         assert!(lf.acquire(LockType::Write, 1).unwrap());
         assert!(lf.get_info().unwrap().is_none());
         lf.release_write(None).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_has_waiter_tolerates_a_missing_lock_file() {
+        // A byte-level copy has no `table.lock`: the request list lives in
+        // `/dev/null`, whose pread is an EOF. The auto-locking yield must
+        // report "no waiter" rather than propagate that EOF (the Python
+        // `auto_tick` path raised `RuntimeError: pread` after 25 reads).
+        let dir = temp_dir("inspect-missing");
+        let opts = LockOptions::locking_default().effective();
+        let lf = attach(&dir, &opts, false).unwrap().unwrap();
+        let mut lf = lf.lock().unwrap();
+        assert!(lf.missing);
+        assert!(!lf.inspect_has_waiter(true).unwrap());
+        // The throttle path must not reach the file either.
+        assert!(!lf.inspect_has_waiter(false).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_has_waiter_tolerates_a_short_request_list() {
+        // A lock file shorter than its 4-byte request-list count (one made
+        // by a `NoLocking` create, or truncated) has no waiters; reading it
+        // must not propagate the EOF.
+        let dir = temp_dir("inspect-short");
+        std::fs::write(dir.join("table.lock"), b"\x00").unwrap();
+        let opts = LockOptions::locking_default().effective();
+        let lf = attach(&dir, &opts, false).unwrap().unwrap();
+        let mut lf = lf.lock().unwrap();
+        assert!(!lf.missing);
+        assert!(!lf.inspect_has_waiter(true).unwrap());
     }
 
     #[cfg(unix)]

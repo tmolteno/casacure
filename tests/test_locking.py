@@ -380,3 +380,26 @@ def test_auto_locking_reader_yields_to_a_waiting_writer(ms_path):
     assert r.haslock(write=False)
     assert r.nrows() == 4
     r.close()
+
+
+@pytest.mark.parametrize("mutate", ["remove", "truncate"], ids=["missing", "short"])
+def test_read_only_auto_locking_tolerates_a_bad_lock_file(ms_path, mutate):
+    """A read-only AutoLocking handle must not fail its yield check when the
+    table has no usable `table.lock`: a byte-level copy has none (casacore's
+    `mustExist=False` contract) and a lock file shorter than its
+    request-list count has no waiters.  casacure used to propagate the
+    request-list pread EOF, so the 26th operation raised
+    `RuntimeError: pread` (issue #17)."""
+    lock_path = os.path.join(ms_path, "table.lock")
+    if mutate == "remove":
+        os.remove(lock_path)
+    else:
+        with open(lock_path, "wb") as f:
+            f.write(b"\x00")
+
+    r = table(ms_path, readonly=True, ack=False)
+    for _ in range(30):  # past the 25-call inspect throttle
+        got = r.getcol("DATA")
+    assert np.array_equal(got, np.arange(4, dtype="f8"))
+    assert r.ismultiused() is False
+    r.close()
