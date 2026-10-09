@@ -2558,6 +2558,25 @@ impl Table {
         Ok(())
     }
 
+    /// `rownumbers()` -- the base-table row answering each row of this
+    /// table, in this table's order (python-casacore's
+    /// `table.rownumbers()`).  casacore reference tables route writes
+    /// through it; a table that is its own source answers 0..nrows.
+    fn rownumbers(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let total = self.row_count();
+        let rows: Vec<u64> = {
+            let inner = self.inner.lock().unwrap();
+            match &*inner {
+                Inner::Read(t) => match t.row_numbers() {
+                    Some(r) => r.to_vec(),
+                    None => (0..total).collect(),
+                },
+                Inner::Write { .. } => (0..total).collect(),
+            }
+        };
+        Ok(numpy::PyArray1::from_slice(py, &rows).into_any().unbind())
+    }
+
     /// `putcol(column, value, startrow=0, nrow=0)` — ndarray or list.
     #[pyo3(signature = (column, value, startrow = 0, nrow = 0))]
     fn putcol(

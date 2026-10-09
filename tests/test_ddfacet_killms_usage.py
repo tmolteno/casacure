@@ -587,3 +587,21 @@ def test_measures_missing_frame_errors():
     d = me.direction("J2000", qa.quantity(0.3, "rad"), qa.quantity(-0.5, "rad"))
     with pytest.raises(Exception):
         me.measure(d, "AZELGEO")
+
+
+def test_rownumbers_maps_the_reference_table_onto_the_source(ms):
+    """casacore reference tables route writes through their row order, and
+    python-casacore exposes it as `table.rownumbers()`.  killMS's chunk
+    writers need exactly that to address the base table now that
+    query()/sort() results are row orders instead of copies (casacure#16
+    follow-up): `base.putcol(col, data, rownumbers[ROW0], nrow)`.  The pin:
+    rownumbers applied to the source's column reproduces the reference
+    table's own reads, for a plain table (identity) and a query+sort."""
+    t = table(ms, ack=False)
+    assert list(t.rownumbers()) == list(range(t.nrows()))
+    s = t.query("FIELD_ID==0 && DATA_DESC_ID==0").sort("TIME")
+    time_all = np.asarray(t.getcol("TIME"))
+    rn = np.asarray(s.rownumbers(), dtype=np.int64)
+    assert np.array_equal(time_all[rn], np.asarray(s.getcol("TIME"))), (
+        "rownumbers must map the source's TIME onto the reference table's "
+        "own TIME reads")

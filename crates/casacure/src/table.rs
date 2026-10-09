@@ -1365,6 +1365,13 @@ impl Table {
     ///
     /// Errors when `rows` indexes past the end of `source` (a malformed
     /// composed order; TaQL-produced orders cannot).
+    /// The reference table's row order: `rows[i]` is the source row that
+    /// answers this table's row `i` (see [`Table::row_order`]).  `None` when
+    /// the table is its own source.
+    pub fn row_numbers(&self) -> Option<&[u64]> {
+        self.view.as_ref().map(|v| v.rows.as_slice())
+    }
+
     pub fn row_order(
         source: std::sync::Arc<Table>,
         rows: Vec<u64>,
