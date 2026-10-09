@@ -23,6 +23,22 @@ subtasks are moved here.
   calls) and `crates/casacure/src/lockfile.rs` gains the matching unit
   tests.
 
+### Tests
+
+- **The write-scaling time bound is immune to host load.**
+  `test_new_table_write_time_is_linear_in_the_rows` compared wall time
+  only, and a loaded host — a co-tenant container, memory pressure, page
+  reclaim — inflates wall time arbitrarily: the release gate failed once
+  at 0.85 s -> 38.79 s for the same code whose own CPU cost scaled 4x, and
+  passed on an idle re-run. The writer child now reports its CPU seconds
+  (user+sys, every dask worker thread) next to wall, and the check fails
+  only when *both* signals say the cost grew superlinearly (a flush that
+  regrows the table re-encodes every buffered cell, so it inflates both),
+  warning instead when it passes on CPU alone; a pair that fails the bound
+  is re-measured with fresh tables and the per-signal minimum kept, since
+  load only ever adds to a run. Two deterministic tests pin the
+  loaded-wall-time verdict and the re-sample.
+
 ## [3.8.30] - 2026-10-09
 
 ## [3.8.29] - 2026-10-09
