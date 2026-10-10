@@ -9,32 +9,38 @@ Work areas are tracked as GitHub issues; subtasks live in `TODO.md`.
 
 | Suite | Command | Passing | Coverage |
 |---|---|---|---|
-| Rust unit + fixture tests | `cargo test` | 85/85 | type system, AipsIO read+write (both endians), `table.dat`, StandardStMan data file + `table.f0i` + string buckets, IncrementalStMan (interval index, multi-DM tables) — all read+write |
-| casacore comparison tests | `PYTHONPATH=/tmp/cpb:/tmp/shim .venv/bin/python -m pytest tests/` | 14/14 | type system + python-casacore `test_table.py` port (9 tests: datatypes, putdata, addcolumns, keywords, subset, subtables, tableascii, complete/required descs) |
-| write interop (manual) | `examples/create_sample_table.rs` + python-casacore | ✓ | casacure-write → casacore-read: SSM scalars, arrays, long strings, and ISM TIME/ANT1 in one 4-file table; 3-row and 100-row variants return exactly the written values |
+| Rust unit + fixture tests | `cargo test` | 308/308 | type system, AipsIO read+write (both endians), `table.dat`, StandardStMan data file + `table.f0i` + string buckets, IncrementalStMan (interval index, multi-DM tables), TiledColumnStMan/TiledShapeStMan incl. cell-splitting tiles — all read+write; dminfo honoured on every creation path; TaQL tier A+B; images |
+| casacore comparison tests | `PYTHONPATH=tests/shim .venv/bin/python -m pytest tests/` | 482 passed, 37 skipped, 3 xfailed | type system + python-casacore `test_table.py` port (9 tests: datatypes, putdata, addcolumns, keywords, subset, subtables, tableascii, complete/required descs), measures accuracy vs astropy, dask-ms chunked read/write parity |
+| write interop (manual) | `examples/create_sample_table.rs` + python-casacore | ✓ | casacure-write → casacore-read: SSM scalars, arrays, long strings, and ISM TIME/ANT1 in one 4-file table; 3-row and 100-row variants return exactly the written values; dask-ms-written tables (16k and 256k rows, SSM+ISM+TSM columns) verify cell-exact under real python-casacore |
 
-## Speed and memory relative to casacore (3.8.8)
+## Speed and memory relative to casacore (3.8.32)
 
-This is casacure / python-casacore 3.8.1 on the same machine and the same
-data, so **< 1 means casacure is faster or lighter**.  The method and raw
-numbers are in `BENCHMARK.md`.
+This is casacure / python-casacore 3.8.1 on the same machine (schmalzburg,
+idle) and the same data, so **< 1 means casacure is faster or lighter**.
+The method and raw numbers are in `BENCHMARK.md` (2026-10-11).
 
 | workload | time | peak RSS |
 |---|---|---|
-| dask-ms chunked read of a 977 MiB DATA column, 25 000-row chunks | 1.03 | 1.04 |
-| same, 1000-row chunks | **0.40** | 1.35 |
-| dask-ms write of a new MS (256k rows, 2000-row chunks) | **0.60** | **0.80** |
-| skarabina flag + 32x average + `--msout`, MeerKAT scan (11 GB) | **0.80** | **0.77** |
-| skarabina flag, `--write-changed-only`, same scan | **0.62** | **0.54** |
-| `casacure-bench`: whole-column putcol / getcol / taql on a 20k-row cached table | 3.0 / 3.5 / 4.8 | — |
+| dask-ms chunked read of a 977 MiB DATA column, 25 000-row chunks | 1.15 | 1.04 |
+| same, 1000-row chunks | **0.55–0.70** | 1.37 |
+| dask-ms write of a new MS (256k rows, 2000-row chunks) | 1.02 | **0.93** |
+| skarabina flag + 32x average + `--msout`, MeerKAT scan (11 GB) | **0.92** | 0.99 |
+| skarabina flag, `--write-changed-only`, same scan | **0.96** | **0.68** |
+| `casacure-bench`: whole-column putcol / getcol / taql on a 20k-row cached table | 1.3 / 1.7 / 16 | — |
 
 **On MS-shaped work through dask-ms, casacure is at parity or faster.**
-Chunked scans and new MS writes are I/O-bound, and both flagging pipelines
-measured run 20-40 % faster, in 23-46 % less memory.  **On small, fully
-cached tables it is 3-5x slower per call**: the Python bridging and cell
-packaging dominate there, not I/O.  Before 3.8.8, writing a new table was
-the exception: memory grew with the table and time grew quadratically (57.6 s
-and 1.9 GiB for 256k rows, against casacore's 2.4 s and 234 MiB).
+Chunked scans and new MS writes are I/O-bound and finish even with casacore,
+and both flagging pipelines measured run 4-8 % faster — the
+`--write-changed-only` one in 32 % less memory.  The averaged outputs of the
+two backends are identical in every readable column and the flagging
+reports match to the last digit.  **On small, fully cached
+tables it is 1.3-1.7x slower per call**: the Python bridging and cell
+packaging dominate there, not I/O.  The one wide gap is a whole-column taql
+`SELECT *` (16x): casacure materialises the result into a scratch table
+row-by-row while casacore keeps it in memory.  Before 3.8.8, writing a new
+table was the exception: memory grew with the table and time grew
+quadratically (57.6 s and 1.9 GiB for 256k rows, against casacore's 2.4 s
+and 234 MiB).
 
 Direct arrays: before 3.8.9, casacure could not read StandardStMan Direct
 fixed-shape array columns (column option 5, e.g. an MS's ANTENNA POSITION).

@@ -8,19 +8,28 @@ the same machine and in the same process.
 
 | | |
 |---|---|
-| casacure wheel / crate | **3.8.8** (A.B.P policy: 3.8 = casacore interface, P = casacure patch) |
+| casacure wheel / crate | **3.8.32** (A.B.P policy: 3.8 = casacore interface, P = casacure patch), plus the unreleased tile-shape-defer fix described below |
 | build profile | **release** (`maturin develop --release`) |
-| Python | 3.11.15 (CPython) |
-| numpy | 2.4.6 |
+| Python | 3.13.5 (CPython) |
+| numpy | 2.5.3 |
 | reference | python-casacore 3.8.1 |
-| machine | Intel Core Ultra 7 258V (laptop), 8 cores, 30 GB RAM, Linux 7.1, load < 1 |
-| date | 2026-09-26 |
+| dask-ms | the tmolteno fork, `origin/master` `a0d78e7` (`DASK_MS_BACKEND=casacure`, flush-once-per-column-write) |
+| machine | schmalzburg: 12 cores, 62 GB RAM, Linux, **idle** (load < 1 before each section) |
+| date | 2026-10-11 |
 
-The sections below were rerun on 2026-09-26 on this machine: the summary,
-reads, writes and `casacure-bench`.  The end-to-end section ran on
-schmalzburg.  The scaling micro-benchmark and the "before / after
-deferred-flush" table are historical records from earlier machines, labelled
-as such.
+Every section below ran on 2026-10-11 on schmalzburg, both engines on the
+same machine and (for `casacure-bench`) in the same process.  Only the
+"before / after deferred-flush" table is a historical record from an earlier
+machine, labelled as such.
+
+This rerun needed one casacure fix to be possible: the flag-version tables
+skarabina writes (`save:imported`) are variable-shape `TiledShapeStMan`
+columns created at 0 rows with a `SPEC.DEFAULTTILESHAPE` shorter than the
+cells that arrive later, and 3.8.32's dminfo-on-create validation (issue #20)
+rejected the create.  casacore defers the hypercube until the first
+`setShape`; the fix (unreleased, in `crates/casacure/src/tsm.rs`) defers the
+requested tile the same way and keeps it in the column descriptor.  Without
+it every skarabina run fails at its first stage-0 op.
 
 Run your own copy from the repo checkout:
 
@@ -35,24 +44,26 @@ measures both engines in the same process. The comparison table is only
 printed when real casacore is present; otherwise casacure-only times are
 shown with `n/a` ratios.
 
-## Summary: casacure vs python-casacore (3.8.8)
+## Summary: casacure vs python-casacore (3.8.32)
 
 Ratios are casacure / casacore, so **< 1 means casacure is faster or
 lighter**.
 
 | workload | time ratio | peak-RSS ratio |
 |---|---|---|
-| dask-ms chunked read, 977 MiB DATA, 25 000-row chunks | 1.03 | 1.04 |
-| dask-ms chunked read, 1000-row chunks | **0.40** (526 vs 1316 ms) | 1.35 (179 vs 133 MiB) |
-| dask-ms write of a new MS, 256k rows, 2000-row chunks | **0.60** (1.45 vs 2.4 s) | **0.80** (188 vs 234 MiB) |
-| skarabina flag + 32x average + `--msout`, MeerKAT scan (schmalzburg) | **0.80** (17.4 vs 21.9 s) | **0.77** (7.4 vs 9.5 GB) |
-| skarabina flag, `--write-changed-only`, same scan | **0.62** (7.6 vs 12.2 s) | **0.54** (2.4 vs 4.3 GB) |
-| `casacure-bench` small ops (20k rows, fully cached) | 3–5x | — |
+| dask-ms chunked read, 977 MiB DATA, 25 000-row chunks | 1.15 | 1.04 |
+| dask-ms chunked read, 1000-row chunks | **0.55–0.70** | 1.37 (178 vs 130 MiB) |
+| dask-ms write of a new MS, 256k rows, 2000-row chunks | 1.02 (3.89 vs 3.83 s) | **0.93** (250 vs 269 MiB) |
+| skarabina flag + 32x average + `--msout`, MeerKAT scan | **0.92** (11.6 vs 12.6 s) | 0.99 (8.0 vs 8.2 GB) |
+| skarabina flag, `--write-changed-only`, same scan | **0.96** | **0.68** (2.4 vs 3.6 GB) |
+| `casacure-bench` small ops (20k rows, fully cached) | 1.3–1.7x (taql: 16x, see below) | — |
 
-Where casacure is slower, it is per-call overhead on small, fully cached
-tables (`casacure-bench`): the Python bridging and `RecordValue` packaging,
-not I/O.  Where the work is I/O-shaped, as in dask-ms chunked scans and new
-MS writes, casacure is at parity or ahead.
+Where the work is I/O-shaped — dask-ms chunked scans, new-MS writes, the two
+skarabina flagging pipelines — casacure is at parity or ahead.  On small,
+fully cached tables the per-call bridging cost is 1.3x (putcol) and 1.7x
+(getcol); the one large gap is a whole-column taql `SELECT *`, whose result
+casacure materialises as a scratch table while casacore keeps it in memory
+(see the `casacure-bench` section).
 
 ## dask-ms chunked reads: time and memory
 
@@ -61,63 +72,86 @@ MS writes, casacure is at parity or ahead.
 python-casacore.  It then reads the MS through dask-ms (`xds_from_table` +
 `DATA.sum().compute()`, synchronous scheduler) at several row chunks.  Each
 read runs in a fresh subprocess, and its peak is that child's `/proc` VmHWM,
-polled by the parent.  (The child's `ru_maxrss` inherits the parent's
-build-time peak across fork+exec, which made every chunk report the same
-number; the script now polls VmHWM.)
+polled by the parent.  casacure medians are of 3 runs; casacore's of 2 (the
+first casacore pass, on a cold page cache, is discarded).
 
 | chunk (rows) | casacure peak | casacore peak | casacure read | casacore read |
 |---|---|---|---|---|
-| all (250k) | 2209 MiB | 2198 MiB | 483 ms | 466 ms |
-| 125 000 | 1170 MiB | 1160 MiB | 490 ms | 476 ms |
-| 25 000 | 340 MiB | 327 MiB | 501 ms | 486 ms |
-| 5 000 | 179 MiB | 162 MiB | 656 ms | 632–748 ms |
-| 1 000 | 179 MiB | 133 MiB | **526 ms** | 1316–1518 ms |
+| all (250k) | 2209 MiB | 2195 MiB | 693 ms | 602 ms |
+| 125 000 | 1170 MiB | 1156 MiB | 677 ms | 602 ms |
+| 25 000 | 339 MiB | 325 MiB | 709 ms | 617 ms |
+| 5 000 | 178 MiB | 159 MiB | 873 ms | 787 ms |
+| 1 000 | 178 MiB | 130 MiB | **625 ms** | 889–1133 ms |
 
-Both engines bound memory by the chunk.  casacure sits ~12–46 MiB above
+Both engines bound memory by the chunk.  casacure sits ~13–48 MiB above
 casacore: a larger import footprint and mapped-page slack.  At small chunks
-casacure is 2.5x faster, because casacore's per-call cost dominates there.
+casacore's per-call cost dominates and casacure is up to 1.8x faster; at
+large chunks the two are within 15 %.
 
 ## dask-ms writes of a new table (chunk-bounded since 3.8.8)
 
 `tests/test_write_scaling.py` writes a new MS through dask-ms in 2000-row
-chunks.  The columns are DATA (complex64 [32,4]), FLAG and WEIGHT_SPECTRUM
-(tiled), SIGMA/WEIGHT (StandardStMan arrays), TIME/FLAG_ROW/ANTENNA1
-(StandardStMan scalars) and SCAN_NUMBER/FIELD_ID (IncrementalStMan).  Peak
-RSS and write time:
+chunks (append mode).  The columns are DATA (complex64 [32,4]), FLAG and
+WEIGHT_SPECTRUM (tiled), SIGMA/WEIGHT (StandardStMan arrays),
+TIME/FLAG_ROW/ANTENNA1 (StandardStMan scalars) and SCAN_NUMBER/FIELD_ID
+(IncrementalStMan).  Peak RSS (the child's VmHWM) and wall time; casacure is
+the better of 2 samples (its CPU time is equal in both, the second sample's
+extra wall is host tail), casacore the median of 2:
 
-| rows (table) | casacure 3.8.7 | casacure 3.8.8 | python-casacore |
-|---|---|---|---|
-| 16 000 (23 MiB) | 242 MiB, 0.39 s | 137 MiB, 0.13 s | 188 MiB, 0.19 s |
-| 64 000 (94 MiB) | 633 MiB, 4.1 s | 169 MiB, 0.42 s | 219 MiB, 0.67 s |
-| 256 000 (375 MiB) | 1865 MiB, 57.6 s | 188 MiB, 1.45 s | 234 MiB, 2.4 s |
-| 1 024 000 (1.5 GiB) | — | 224 MiB, 6.5 s | — |
+| rows (table) | casacure 3.8.32 | python-casacore 3.8.1 |
+|---|---|---|
+| 16 000 (23 MiB) | 166 MiB, 0.27 s | 190 MiB, 0.32 s |
+| 64 000 (94 MiB) | 223 MiB, 0.95 s | 247 MiB, 1.03 s |
+| 256 000 (375 MiB) | 250 MiB, 3.89 s | 269 MiB, 3.83 s |
+| 1 024 000 (1.5 GiB) | 350 MiB, 19.1 s | 304 MiB, 16.2 s |
 
 The append pattern (`addrows` per chunk) and the update pattern (ROWID,
-`addrows(nrow)` up front) measure the same.  3.8.7 regenerated the whole table
-at every flush of a table larger than its files, so memory grew with the table
-and time grew quadratically.  3.8.8 grows the files in place (see `MEMORY.md`).
-Real python-casacore reads every written cell back, and extends the written
-tables itself.
+`addrows(nrow)` up front) measure the same (the suite pins both).  Real
+python-casacore reads every written cell back: it verified the
+casacure-written tables (16k and 256k rows) exactly, every column and row.
+
+*(Historical, laptop, casacure 3.8.8: 137/169/188/224 MiB and
+0.13/0.42/1.45/6.5 s against python-casacore's 188/219/234 MiB and
+0.19/0.67/2.4 s — casacure 0.60x casacore's time there.  On schmalzburg the
+fork dask-ms's flush-once-per-column-write lands on both engines and
+casacore's side gains, so the write race is now a dead heat.  3.8.7's
+quadratic flush — 1865 MiB and 57.6 s at 256k rows — is the reason this
+table exists; see `MEMORY.md`.)*
 
 ## End-to-end: skarabina on a MeerKAT scan
 
-Host schmalzburg (12 cores, 62 GB, **load 7-11**, shared, so the timings are
-load-dependent).  The input is a copy of scan 1 of a MeerKAT L-band MS:
+Host schmalzburg (12 cores, 62 GB, idle apart from the runs themselves).
+The input is `.bench/scan1.ms`, a copy of scan 1 of a MeerKAT L-band MS:
 143 716 rows x 2511 channels x 2 correlations, 11 GB.  The run is skarabina
-`9b6b97b` with its stage-0 flag list (`save:imported`, `autos`,
-`uv-above 2500`, `nan`, `clip 0 100`, `spectral-window`) and `--summary`.
-The two backends ran in alternating order, twice each:
+`edf30ee` (v1.0.19-1) with its stage-0 flag list (`save:imported`, `autos`,
+`uv-above 2500`, `nan`, `clip 0 100`, `spectral-window`) and `--summary`,
+via `/usr/bin/time -v`:
 
-| workload | casacure 3.8.8 | python-casacore 3.8.1 |
+```sh
+DASK_MS_BACKEND=casacure /usr/bin/time -v skarabina --ms scan1.ms --summary \
+  --clobber --time-average-factor 1 --frequency-average-factor 32 \
+  --flag save:imported --flag autos --flag "uv-above 2500" --flag nan \
+  --flag "clip 0 100" --flag "spectral-window ../bench/spectral-flags-L.yml" \
+  --field-of-view 3.3deg --msout OUT
+```
+
+The two backends ran in alternating order (the casacore side with
+`DASK_MS_BACKEND` set to a non-casacore value — skarabina selects casacure
+by default when the variable is unset or empty):
+
+| workload | casacure 3.8.32 | python-casacore 3.8.1 |
 |---|---|---|
-| + 32x frequency average, `--msout` | 17.3 s, 7.40 GB / 17.5 s, 7.41 GB | 21.3 s, 10.1 GB / 22.5 s, 8.99 GB |
-| + `--write-changed-only --msout` | 7.7 s, 2.51 GB / 7.6 s, 2.23 GB | 13.8 s, 4.16 GB / 10.6 s, 4.49 GB |
+| + 32x frequency average, `--msout` | 11.5 s, 8.05 GB / 11.7 s, 8.17 GB | 12.7 s, 7.60 GB / 12.6 s, 8.15 GB / 11.1 s, 8.36 GB |
+| + `--write-changed-only --msout` | 5.0 s, 2.43 GB / 5.1 s, 2.45 GB | 5.0 s, 3.54 GB / 5.5 s, 3.59 GB |
+
+(each cell one run: wall time, peak RSS.  casacure's very first averaged run
+of the session — 25.8 s, 5.0 GB — read the 11 GB input through a cold page
+cache and is not counted; every run after it is warm.)
 
 The averaged outputs of the two backends are identical in every readable
-main-table column and in SPECTRAL_WINDOW.  (FLAG_CATEGORY cannot be read by
-casacore in the input either.)  With casacure 3.8.7 the averaged run took
-74.4 s at 21.7 GB, because the flag-version backup's whole table was
-buffered.
+main-table column (all 23, DATA through UVW) and in SPECTRAL_WINDOW, ANTENNA,
+FIELD and POLARIZATION, and the printed flagging reports match to the last
+digit.  (FLAG_CATEGORY cannot be read by casacore in the input either.)
 
 ## Workload
 
@@ -130,19 +164,36 @@ and value-bridging cost**, not I/O: at this size the data is a memory-mapped
 `Vec<u8>` and the dominant cost is converting between numpy arrays and
 casacure cell values.
 
-## Results — `casacure-bench`, 2026-09-26 (5 runs, medians, release)
+## Results — `casacure-bench`, 2026-10-11 (5 runs, medians, release)
 
 Same workload as before (two double scalar columns, 20 000 rows).
 
 | op | casacure | real casacore | ratio (cure/core) |
 |---|---|---|---|
-| putcol | 1.20 ms | 0.39 ms | 3.0× |
-| getcol | 0.77 ms | 0.22 ms | 3.5× |
-| taql WHERE+ORDERBY | 8.56 ms | 1.79 ms | 4.8× |
+| putcol | 1.32 ms | 1.01 ms | 1.3× |
+| getcol | 0.79 ms | 0.47 ms | 1.7× |
+| taql WHERE+ORDERBY | 39.37 ms | 2.46 ms | 16.0× |
 
-Raw runs (ms, casacure / casacore): putcol 1.20/0.41, 1.15/0.39, 1.20/0.43,
-1.33/0.39, 1.17/0.39; getcol 0.77/0.22, 0.77/0.22, 0.81/0.22, 0.74/0.22,
-0.76/0.22; taql 8.62/2.66, 8.56/1.79, 8.58/1.78, 8.53/2.04, 8.51/1.77.
+Raw runs (ms, casacure / casacore): putcol 1.32/1.01, 1.32/1.01, 1.31/1.02,
+1.31/1.02, 1.32/1.00; getcol 0.79/0.48, 0.80/0.47, 0.79/0.47, 0.79/0.48,
+0.80/0.47; taql 39.20/4.98, 39.41/2.45, 39.30/2.45, 39.70/2.46, 39.37/2.46
+(casacore's first taql is a cold-table outlier; the rest sit at 2.45–2.46).
+
+The putcol/getcol gaps are the narrowest measured on any machine so far
+(3.0×/3.5× on the 2026-09-26 laptop record below).  The taql number is new:
+since 3.8.15 a TaQL result materialises as a real scratch table under the
+temp dir (deleted when the handle closes — casacore keeps it in memory), and
+on this op that materialisation dominates.  Measured separately on the same
+table: the WHERE scan itself costs ~3 ms, a warm whole-result `SELECT *`
+costs ~70 ms *before reading anything from it*, and writing the same rows
+back through two `putcol` calls costs ~11 ms — the scratch write is going
+row-by-row, not through the batch path.  On 3.8.8 (in-memory results) this
+op measured 8.56 ms on a faster single core; the gap to close is batching
+the scratch-table write, not the query engine.
+
+*Historical (2026-09-26, Intel Core Ultra 7 258V laptop, casacure 3.8.8):*
+putcol 1.20 vs 0.39 ms (3.0×), getcol 0.77 vs 0.22 ms (3.5×), taql 8.56 vs
+1.79 ms (4.8×).
 
 *Historical (2026-09-24, Ryzen 5 5600G):* putcol 1.47 vs
 1.08 ms (1.4×), getcol 1.47 vs 0.55 ms (2.7×), taql 12.03 vs 7.27 ms (1.7×).
@@ -170,57 +221,72 @@ an explicit `flush()` / `close()` / context exit, a mutating taql statement,
 buffered storage-manager behaviour; reads within a session always come from
 the shared store.
 
-The taql row above now includes the one full-table flush that the earlier
-(now deferred) putcol would have paid: the benchmark runs taql immediately
-after an unflushed putcol, so `taql` absorbs the deferred flush. On a
-workload with many writes between flushes, the amortised putcol cost stays
-at the 1.47 ms level and the flush happens once.
-
 ## Scaling — ns per cell vs row count (release, 1 double column)
 
-Measured with a separate micro-benchmark (`putcol` of `np.arange(n)`, then
-`getcol`), single DOUBLE scalar column, n rows, median of 7 repeats:
+Measured with a micro-benchmark (`putcol` of `np.arange(n)`, then `getcol`),
+single DOUBLE scalar column, n rows, median of 7 repeats, schmalzburg
+2026-10-11:
 
 | n | casacure putcol | casacore putcol | casacure getcol | casacore getcol |
 |---|---|---|---|---|
-| 1 000 | 38 | 53 | 49 | 29 |
-| 10 000 | 37 | 50 | 57 | 24 |
-| 100 000 | 37 | 50 | 69 | 23 |
+| 1 000 | 134 | 62 | 117 | 34 |
+| 10 000 | 120 | 50 | 90 | 24 |
+| 100 000 | 133 | 50 | 100 | 23 |
 
-(*Historical scaling on the original machine, 2026-09-21:* casacure putcol
-was 73/56/63, casacore putcol 32/32/29; casacure getcol 13/14/25, casacore
-getcol 18/16/16.) On this machine the deferred flush has closed the putcol
-gap entirely — casacure putcol is now slightly *faster* than casacore per
-cell (37–38 vs 50–53 ns/cell); getcol is the remaining gap at 2–2.5×.
+Unlike the 20k bench above, each repeat writes a *fresh* table, so putcol
+pays the cell store's first-touch allocation (the 20k bench times a rewrite
+of an already-stored column) — casacure ~2.5x and casacore ~1.2x above their
+20k-bench per-cell costs for that reason.  The scaling is flat in `n` for
+both engines on both ops.
+
+(*Historical scaling on the 2026-09-24 laptop, casacure 3.8.5:* casacure
+putcol 37/38/37, casacore putcol 50/50/50; casacure getcol 49/57/69,
+casacore getcol 29/24/23 ns/cell at 1k/10k/100k.)
+
+## Interpretation (2026-10-11, casacure 3.8.32, schmalzburg)
+
+- **I/O-shaped work is at parity or ahead.**  Chunked dask-ms reads track
+  casacore within 15 % on time at ≥ 25 000-row chunks and win up to 1.8x at
+  1000-row chunks; new-MS writes are a dead heat in time and ~7 % lighter at
+  256k rows; both skarabina pipelines finish 4–8 % faster, the
+  `--write-changed-only` one in 32 % less memory.
+- **The chunked-read footprint carries a fixed ~13–48 MiB premium** (import
+  footprint + mapped-page slack): invisible at large chunks (1.04x), 1.37x
+  at 1000-row chunks where the absolute numbers are small.
+- **Small-table per-call costs keep narrowing**: putcol 1.3x, getcol 1.7x
+  on the 20k bench.  The remaining cost is the per-cell `RecordValue`
+  packaging between numpy and the cell store; casacore does a single
+  memcpy.
+- **taql `SELECT *` is the one wide gap (16x)**, and it is the scratch
+  table: the query engine scans and filters at casacore-like speed (~3 ms
+  for this WHERE), but writing the ~20k-row result into the scratch table
+  goes row-by-row (~70 ms) where the batch write path costs ~11 ms.
+  Batching that materialisation is the next step; casacore's in-memory
+  result (1–2.8 ms) is the floor.
 
 ## Interpretation (historical, 2026-09-24, casacure 3.8.5)
 
-See the summary table at the top for the 3.8.8 ratios.
-
-- **putcol** is now at or below casacore on this machine: ~1.4× overall on
-  the 20k bench (1.47 vs 1.08 ms) and 37–38 ns/cell vs casacore's 50–53 in
-  the scaling micro-benchmark (flat with `n`). The deferred-flush write
+- **putcol** was at or below casacore on that machine: ~1.4× overall on the
+  20k bench (1.47 vs 1.08 ms) and 37–38 ns/cell vs casacore's 50–53 in the
+  scaling micro-benchmark (flat with `n`). The deferred-flush write
   buffering removed the per-write whole-table rewrite; the small remaining
   constant overhead on the bench is the one `RecordValue` packaging per cell
   on its way into the buffered store.
-- **getcol** is the remaining gap, ~2.7× overall on the 20k bench and 2–2.5×
-  per cell (49 → 69 ns/cell from 1k → 100k rows, superlinear growth; casacore
-  is flat at ~23–29). It is the per-cell `RecordValue` clone plus the
-  two-pass numpy conversion, amplified by allocator/working-set effects at
-  ~MB scale; casacore does a single memcpy. Not I/O (the data is
+- **getcol** was the remaining gap, ~2.7× overall on the 20k bench and
+  2–2.5× per cell (49 → 69 ns/cell from 1k → 100k rows, superlinear growth;
+  casacore is flat at ~23–29). It is the per-cell `RecordValue` clone plus
+  the two-pass numpy conversion, amplified by allocator/working-set effects
+  at ~MB scale; casacore does a single memcpy. Not I/O (the data is
   memory-mapped).
-- **taql** is ~1.7× (vs 4.7× on the original machine — casacore's taql is
-  comparatively slow here): the `SELECT *` result materialises through the
+- **taql** was ~1.7× (vs 4.7× on the original machine — casacore's taql is
+  comparatively slow there): the `SELECT *` result materialised through the
   same getcol path, plus (in this benchmark) the one flush charged to the
   op.
 
-### Where the remaining gap lives
+### Where the remaining gap lived (as of 3.8.5)
 
-getcol is dominated by the per-cell `RecordValue` round-trip between the
+getcol was dominated by the per-cell `RecordValue` round-trip between the
 numpy buffers and the storage/convert layers, not by disk or algorithm. The
-next step is a deeper **typed-buffer** read/write path — for a whole-column
-single-value-type numpy call, batch-convert directly between the numpy
-buffer and the column's typed storage, skipping per-element `RecordValue`
-boxing for scalar columns. That should flatten getcol's scaling and bring
-the getcol gap to ~1.5×; the ceiling is python-casacore's native C++ memcpy
-path.
+typed-buffer read/write path landed since (getcolnp decodes SSM numeric
+cells straight into the buffer), and the 2026-10-11 numbers above are the
+result; the ceiling is python-casacore's native C++ memcpy path.
