@@ -570,7 +570,18 @@ fn apply_dm_record(
                                 field: "DEFAULTTILESHAPE".into(),
                             });
                         }
-                        tile_shape = Some(dims);
+                        // DEFAULTTILESHAPE comes from the user in logical (C-order)
+                        // dimensions: cell dims + row count. The cell dims need to
+                        // be reversed to CASA order, but the row count (last element)
+                        // stays at the end. E.g., user [6,4,5] (chans,corr,rows) ->
+                        // CASA [4,6,5] (corr,chans,rows).
+                        let mut casa_shape: Vec<i64> = dims[..dims.len() - 1]
+                            .iter()
+                            .rev()
+                            .copied()
+                            .collect();
+                        casa_shape.push(dims[dims.len() - 1]); // append row count
+                        tile_shape = Some(casa_shape);
                     }
                     other => {
                         return Err(DmInfoError::BadSpecField {
