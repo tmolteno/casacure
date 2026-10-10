@@ -315,3 +315,32 @@ def test_tile_shape_deferred_on_a_zero_row_variable_shape_column(tmp_path):
     np.testing.assert_array_equal(r.getcol("FLAG"), flag)
     np.testing.assert_array_equal(r.getcol("FLAG_ROW"), np.arange(37) % 5 == 0)
     r.close()
+
+
+def test_addcols_cell_shaped_tile_without_row_axis(tmp_path):
+    """casacure#21: dask-ms's add-columns path asks `addcols` for a
+    TiledShapeStMan with `DEFAULTTILESHAPE` = the cell shape and no rows
+    axis.  casacore treats the request as a hint (`adjustTileShape`: missing
+    axes default to 1, each axis is clipped to the cube), so the write and the
+    flush must succeed and round-trip the data -- it used to fail at flush with
+    `unsupported tile shape [4, 2] for cells of shape [2, 4]`."""
+    p = str(tmp_path / "t.tab")
+    t = table(p, maketabdesc([
+        makearrcoldesc("DATA", 0j, valuetype="complex", shape=[4, 2]),
+    ]), 24, ack=False)
+    values = (np.arange(24 * 4 * 2, dtype=np.float32).reshape(24, 4, 2) + 1j).astype(np.complex64)
+    t.putcol("DATA", values)
+    cell = t.getcell("DATA", 0)
+    t.removecols("DATA")
+    t.addcols(
+        maketabdesc(makearrcoldesc("DATA", [], ndim=cell.ndim,
+                                   shape=list(cell.shape), valuetype="complex")),
+        {"TYPE": "TiledShapeStMan", "NAME": "TiledData",
+         "SPEC": {"DEFAULTTILESHAPE": np.array(cell.shape, dtype=np.int32)}},
+    )
+    t.putcol("DATA", values)
+    t.close()
+    r = table(p, readonly=True, ack=False)
+    assert list(r.getcoldesc("DATA")["shape"]) == [4, 2]
+    np.testing.assert_array_equal(r.getcol("DATA"), values)
+    r.close()

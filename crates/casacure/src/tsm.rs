@@ -1259,29 +1259,33 @@ pub(crate) fn tsm_layout_with_rows(
 /// Validate a caller-requested tile shape (a dminfo
 /// `SPEC.DEFAULTTILESHAPE`, CASA order: the cell dimensions plus the rows
 /// per tile) against the column's cell shape, returning
-/// `(cell part, rows per tile)`. The tile must have the cell's
-/// dimensionality with positive dimensions; its cell part may split the
-/// cell across tiles (dask-ms asks for this on wide rows) — the runs of
-/// the split are what [`tile_runs`] precomputes, for the writer below and
-/// for the reader's gather.
-pub(crate) fn requested_tile_shape<'a>(
+/// `(cell part, rows per tile)`.  Its cell part may split the cell across
+/// tiles (dask-ms asks for this on wide rows) — the runs of the split are
+/// what [`tile_runs`] precomputes, for the writer below and for the
+/// reader's gather.
+///
+/// Like casacore's `TiledStMan::adjustTileShape`, missing trailing axes
+/// (the rows, or cell axes) default to 1 and axes beyond the cube are
+/// dropped, so a bare cell-shaped request with no row axis — what dask-ms's
+/// add-columns path passes (casacure#21) — is accepted.  A cell axis longer
+/// than the cell is kept as requested (the tile grid already covers that).
+/// Non-positive dimensions are still an error.
+pub(crate) fn requested_tile_shape(
     cell_shape: &[i64],
-    tile: &'a [i64],
-) -> Result<(&'a [i64], u64), TsmError> {
-    let (rows, cell_part) = tile.split_last().ok_or_else(|| TsmError::BadTileShape {
+    tile: &[i64],
+) -> Result<(Vec<i64>, u64), TsmError> {
+    let bad = || TsmError::BadTileShape {
         cell_shape: cell_shape.to_vec(),
         tile_shape: tile.to_vec(),
-    })?;
-    let rows = u64::try_from(*rows).map_err(|_| TsmError::BadTileShape {
-        cell_shape: cell_shape.to_vec(),
-        tile_shape: tile.to_vec(),
-    })?;
-    if rows == 0 || cell_part.len() != cell_shape.len() || tile.iter().any(|&t| t <= 0) {
-        return Err(TsmError::BadTileShape {
-            cell_shape: cell_shape.to_vec(),
-            tile_shape: tile.to_vec(),
-        });
+    };
+    if tile.is_empty() || tile.iter().any(|&t| t <= 0) {
+        return Err(bad());
     }
+    let ndim = cell_shape.len();
+    let cell_part: Vec<i64> = (0..ndim)
+        .map(|i| tile.get(i).copied().unwrap_or(1))
+        .collect();
+    let rows = u64::try_from(tile.get(ndim).copied().unwrap_or(1)).map_err(|_| bad())?;
     Ok((cell_part, rows))
 }
 
@@ -1512,11 +1516,21 @@ pub(crate) fn tsm_grown_header(
     nrow: u64,
     tile_shape: Option<&[i64]>,
 ) -> Result<(Vec<u8>, u64, u32), TsmError> {
+    // casacure#21: normalise the request (missing axes default to 1) so the
+    // header's `t[..t.len() - 1]` cell part below sees the full shape.
+    let adjusted_tile = tile_shape
+        .map(|t| requested_tile_shape(cell_shape, t))
+        .transpose()?
+        .map(|(mut c, r)| {
+            c.push(r as i64);
+            c
+        });
+    let tile_shape = adjusted_tile.as_deref();
     let layout = match tile_shape {
         None => tsm_layout(cell_shape, data_type, nrow)?,
         Some(tile) => {
             let (cell_part, rows) = requested_tile_shape(cell_shape, tile)?;
-            tsm_layout_with_rows(cell_shape, cell_part, data_type, nrow, rows)?
+            tsm_layout_with_rows(cell_shape, &cell_part, data_type, nrow, rows)?
         }
     };
     let tile_file_len = layout.bucket_size * layout.n_tiles as usize;
@@ -1596,6 +1610,16 @@ pub fn write_tsm_file_bool(
     rows: &[&[bool]],
     tile_shape: Option<&[i64]>,
 ) -> Result<(Vec<u8>, Vec<u8>, u32), TsmError> {
+    // casacure#21: normalise the request (missing axes default to 1) so the
+    // header's `t[..t.len() - 1]` cell part below sees the full shape.
+    let adjusted_tile = tile_shape
+        .map(|t| requested_tile_shape(cell_shape, t))
+        .transpose()?
+        .map(|(mut c, r)| {
+            c.push(r as i64);
+            c
+        });
+    let tile_shape = adjusted_tile.as_deref();
     if stman_type != "TiledColumnStMan" && stman_type != "TiledShapeStMan" {
         return Err(TsmError::UnexpectedType {
             expected: "TiledColumnStMan".into(),
@@ -1631,7 +1655,7 @@ pub fn write_tsm_file_bool(
                 Some(rows),
                 cell_shape
                     .iter()
-                    .zip(cell_part)
+                    .zip(&cell_part)
                     .map(|(&c, &t)| (c as u64).div_ceil(t as u64))
                     .product(),
             )
@@ -1701,6 +1725,16 @@ pub fn write_tsm_file(
     cells: &[Vec<u8>],
     tile_shape: Option<&[i64]>,
 ) -> Result<(Vec<u8>, Vec<u8>, u32), TsmError> {
+    // casacure#21: normalise the request (missing axes default to 1) so the
+    // header's `t[..t.len() - 1]` cell part below sees the full shape.
+    let adjusted_tile = tile_shape
+        .map(|t| requested_tile_shape(cell_shape, t))
+        .transpose()?
+        .map(|(mut c, r)| {
+            c.push(r as i64);
+            c
+        });
+    let tile_shape = adjusted_tile.as_deref();
     if stman_type != "TiledColumnStMan" && stman_type != "TiledShapeStMan" {
         return Err(TsmError::UnexpectedType {
             expected: "TiledColumnStMan".into(),
@@ -1737,7 +1771,7 @@ pub fn write_tsm_file(
                 cell_part.to_vec(),
                 cell_shape
                     .iter()
-                    .zip(cell_part)
+                    .zip(&cell_part)
                     .map(|(&c, &t)| (c as u64).div_ceil(t as u64))
                     .product(),
             )
