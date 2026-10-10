@@ -17,6 +17,7 @@ from casacore.tables import (
     default_ms,
     default_ms_subtable,
     makearrcoldesc,
+    makecoldesc,
     maketabdesc,
     makedminfo,
     makescacoldesc,
@@ -279,3 +280,38 @@ def test_getcell_conforms_to_declared_ndim(tmp_path):
     # A conforming cell (its ndim already equals the declaration) is untouched.
     np.testing.assert_array_equal(t.getcell("NUM_CHAN", 0), 8)
     t.close()
+
+
+def test_tile_shape_deferred_on_a_zero_row_variable_shape_column(tmp_path):
+    """A DEFAULTTILESHAPE on a variable-shape column created at 0 rows
+    cannot be laid out against a cell shape that does not exist yet —
+    skarabina's flag-version tables are exactly this (a `TiledShapeStMan`
+    FLAG column declared `ndim: 2` with no shape, a dminfo whose tile
+    shape is shorter than the eventual cell's, `nrow=0`), and the create
+    used to fail. casacore defers the hypercube until the first
+    `setShape`; the create now writes the derived layout the same way and
+    the first write lands through it."""
+    d = str(tmp_path / "flagversion.tab")
+    nchan = 64
+    flag_desc = {"valueType": "boolean", "ndim": 2, "_c_order": True,
+                 "dataManagerType": "TiledShapeStMan",
+                 "dataManagerGroup": "TiledFlag"}
+    tabdesc = maketabdesc([makecoldesc("FLAG", flag_desc),
+                           makecoldesc("FLAG_ROW", {"valueType": "boolean"})])
+    dminfo = {"TiledFlag": {"TYPE": "TiledShapeStMan", "NAME": "TiledFlag",
+                            "SEQNR": 0,
+                            "SPEC": {"DEFAULTTILESHAPE": np.array([nchan, 1], dtype=np.int32)},
+                            "COLUMNS": ["FLAG"]}}
+    t = table(d, tabdesc, nrow=0, readonly=False, dminfo=dminfo, ack=False)
+    t.addrows(37)
+    flag = np.arange(37 * nchan * 2).reshape(37, nchan, 2) % 3 == 0
+    t.putcol("FLAG", flag)
+    t.putcol("FLAG_ROW", np.arange(37) % 5 == 0)
+    t.flush()
+    t.close()
+
+    r = table(d, readonly=True, ack=False)
+    assert r.nrows() == 37
+    np.testing.assert_array_equal(r.getcol("FLAG"), flag)
+    np.testing.assert_array_equal(r.getcol("FLAG_ROW"), np.arange(37) % 5 == 0)
+    r.close()

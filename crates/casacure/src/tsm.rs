@@ -1611,6 +1611,14 @@ pub fn write_tsm_file_bool(
         return Err(TsmError::UnsupportedType(DataType::Bool));
     }
     let nrow = rows.len() as u64;
+    // A requested tile shape is validated against the cell shape, so it
+    // cannot be laid out for cells whose shape is not known yet: a
+    // variable-shape TiledShapeStMan column created at 0 rows (skarabina's
+    // flag-version tables) has none. casacore defers the hypercube until
+    // the first `setShape`; here the derived whole-cell layout is written
+    // and the request stays in the column descriptor for the paths that
+    // have a shape.
+    let tile_shape = tile_shape.filter(|_| !cell_shape.is_empty());
     // The tile grid: whole-cell tiles place each row's bits contiguously;
     // cell-splitting tiles scatter the row over the planned runs (element
     // units), one bucket per grid position per row layer.
@@ -1711,6 +1719,11 @@ pub fn write_tsm_file(
         return Err(TsmError::UnsupportedType(data_type));
     }
     let nrow = cells.len() as u64;
+    // Same defer as `write_tsm_file_bool`: a tile shape needs the cell's
+    // dimensionality, and a column created before any cell exists has
+    // none — write the derived layout and keep the request in the
+    // descriptor.
+    let tile_shape = tile_shape.filter(|_| !cell_shape.is_empty());
     // The tile grid: without a requested tile shape the tiles are whole
     // cells (derived rows per tile); with one, the tile's cell part may
     // split the cell — each row then scatters over the runs [`tile_runs`]

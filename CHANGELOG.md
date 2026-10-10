@@ -5,6 +5,22 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A `SPEC.DEFAULTTILESHAPE` on a variable-shape column created at 0 rows
+  no longer fails the create.**  skarabina's flag-version tables
+  (`save:imported`) are a `TiledShapeStMan` FLAG column declared `ndim: 2`
+  with no shape, created at `nrow=0` with a dminfo whose tile shape is
+  shorter than the cells written later — and 3.8.32's dminfo-on-create
+  validation rejected the tile against the not-yet-existing cells
+  (`unsupported tile shape [2511, 1] for cells of shape []`), failing every
+  skarabina run at its first stage-0 op.  casacore defers the hypercube
+  until the first `setShape`; the TSM writers now defer the requested tile
+  the same way (the derived whole-cell layout is written and the request
+  stays in the column descriptor for the paths that have a shape).  Test:
+  `tests/test_dminfo.py::test_tile_shape_deferred_on_a_zero_row_variable_
+  shape_column`.
+
 ## [3.8.32] - 2026-10-10
 
 ### Fixed
