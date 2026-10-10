@@ -2427,13 +2427,30 @@ impl Table {
         self.auto_tick()?;
         let col_idx = self.col_index(column)?;
         let v = self.read_cell(col_idx, row)?;
-        if let RecordValue::Array(a) = &v {
+        if let RecordValue::Array(mut a) = v {
             // Array cells keep every stored dimension for `getcol` — casacore
             // returns (1, 79) for a 1-row 79-channel column; the leading-row
             // singleton trim is `getcell`/`getvarcol` semantics only, and
             // producing a bare (79,) here broke skarabina's CHAN_FREQ read
             // (`chan_freq[0]` collapsing to a scalar).
-            return convert::array_to_ndarray(py, a);
+            //
+            // python-casacore's `getcell` does conform the cell to the
+            // column's *declared* ndim by dropping leading length-1 axes: a
+            // (1, N) cell stored in an NDIM=1 column reads back as (N,)
+            // while `getvarcol` keeps the stored (1, N) shape (issue #19 —
+            // dask-ms's exemplar check compares `getcell` against the
+            // descriptor's ndim). ndim <= 0 is casacore's "no declared
+            // dimensionality" — nothing to conform to — and fixed-shape
+            // columns are unaffected: their stored shape already equals the
+            // declaration.
+            let ndim = {
+                let desc = self.desc();
+                desc.columns[col_idx].ndim
+            };
+            while ndim >= 1 && a.shape.len() as i32 > ndim && a.shape.first() == Some(&1) {
+                a.shape.remove(0);
+            }
+            return convert::array_to_ndarray(py, &a);
         }
         convert::cell_to_py(py, &v)
     }

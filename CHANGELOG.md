@@ -38,6 +38,22 @@ subtasks are moved here.
   `default_ms_subtable`/`tablecopy`/`copy`, `makedminfo` round trip,
   reopen-rewrite tiling stability, fail-loud).
 
+- **`getcell` conforms a stored cell to the column's declared ndim, as
+  python-casacore does** (issue #19). For a cell stored with extra leading
+  length-1 axes — a `(1, N)` array in an `NDIM=1` column, which dask-ms's
+  `SPECTRAL_WINDOW` fixture writes through `putvarcol` — python-casacore's
+  `getcell` reads back `(N,)` while `getvarcol` keeps the stored `(1, N)`
+  shape; casacure returned the stored shape from both, so dask-ms's
+  exemplar check (`'ndim=1' in column descriptor doesn't match shape of
+  exemplar=(1, 8)`) dropped `CHAN_FREQ` from every read of a
+  casacure-created table. `getcell` now strips leading length-1 axes down
+  to the declared ndim (declared `ndim <= 0` is casacore's "no declared
+  dimensionality": untouched). Both backends now answer the identical
+  table with identical `getcell` shapes, the dask-ms 0.2.32 suite passes
+  227/227 against the casacure shim including `test_row_grouping`, and
+  `tests/test_dminfo.py` pins the semantics (getcell conforms, getvarcol
+  keeps the stored shape).
+
 ## [3.8.31] - 2026-10-09
 
 ### Fixed

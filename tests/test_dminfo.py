@@ -244,3 +244,38 @@ def test_dminfo_fails_loudly(tmp_path):
         table(str(tmp_path / "e.tab"), desc, 0,
               dminfo={"*1": {"TYPE": "TiledShapeStMan", "COLUMNS": ["DATA"],
                              "SPEC": {"DEFAULTTILESHAPE": [0, 4, 5]}}}, ack=False)
+
+
+def test_getcell_conforms_to_declared_ndim(tmp_path):
+    """python-casacore's `getcell` conforms a cell to the column's declared
+    ndim by dropping leading length-1 axes: a (1, N) cell stored in an
+    NDIM=1 column reads back as (N,), while `getvarcol` keeps the stored
+    (1, N) shape. dask-ms's exemplar check compares `getcell` against the
+    descriptor's ndim — the mismatch dropped CHAN_FREQ from reads (issue
+    #19)."""
+    d = str(tmp_path / "sw.tab")
+    q = """
+    CREATE TABLE %s
+    [NUM_CHAN I4,
+     CHAN_FREQ R8 [NDIM=1]]
+    LIMIT 3
+    """ % d
+    from casacore.tables import taql
+
+    freqs = [np.arange(8, dtype=np.float64), np.arange(16, dtype=np.float64),
+             np.arange(32, dtype=np.float64)]
+    with taql(q) as spw:
+        spw.putvarcol("NUM_CHAN", {f"r{i}": s.shape[0] for i, s in enumerate(freqs)})
+        spw.putvarcol("CHAN_FREQ", {f"r{i}": s[None, :] for i, s in enumerate(freqs)})
+
+    t = table(d, readonly=True, ack=False)
+    for r, want in enumerate(freqs):
+        got = t.getcell("CHAN_FREQ", r)
+        assert got.shape == want.shape, f"getcell row {r}"
+        np.testing.assert_array_equal(got, want)
+        stored = t.getvarcol("CHAN_FREQ")[f"r{r + 1}"]
+        assert stored.shape == (1, want.shape[0]), f"getvarcol row {r}"
+        np.testing.assert_array_equal(stored[0], want)
+    # A conforming cell (its ndim already equals the declaration) is untouched.
+    np.testing.assert_array_equal(t.getcell("NUM_CHAN", 0), 8)
+    t.close()
