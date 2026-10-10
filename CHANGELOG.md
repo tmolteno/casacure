@@ -5,6 +5,8 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.33] - 2026-10-11
+
 ### Fixed
 
 - **A `SPEC.DEFAULTTILESHAPE` on a variable-shape column created at 0 rows
