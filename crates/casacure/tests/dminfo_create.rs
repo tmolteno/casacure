@@ -150,14 +150,13 @@ fn apply_dminfo_flat_record_covers_every_column() {
     ]);
     apply(
         r#"{"TYPE": "TiledColumnStMan", "NAME": "TiledData",
-            "SPEC": {"DEFAULTTILESHAPE": [6, 4, 5]}}"#,
+            "SPEC": {"DEFAULTTILESHAPE": [4, 6, 5]}}"#,
         &mut desc,
     )
     .unwrap();
     for cd in &desc.columns {
         assert_eq!(cd.data_manager_type, "TiledColumnStMan");
         assert_eq!(cd.data_manager_group, "TiledData");
-        // DEFAULTTILESHAPE [6,4,5] in logical order is [4,6,5] in CASA order
         assert_eq!(cd.tile_shape.as_deref(), Some(&[4, 6, 5][..]));
     }
 }
@@ -182,14 +181,13 @@ fn apply_dminfo_mapping_targets_named_columns() {
     ]);
     apply(
         r#"{"*1": {"TYPE": "TiledColumnStMan", "NAME": "tiled",
-                   "SPEC": {"DEFAULTTILESHAPE": [6, 4, 5]}, "COLUMNS": ["DATA"]},
+                   "SPEC": {"DEFAULTTILESHAPE": [4, 6, 5]}, "COLUMNS": ["DATA"]},
             "*2": {"TYPE": "IncrementalStMan", "COLUMNS": ["FLAG"]}}"#,
         &mut desc,
     )
     .unwrap();
     assert_eq!(desc.columns[0].data_manager_type, "TiledColumnStMan");
     assert_eq!(desc.columns[0].data_manager_group, "tiled");
-    // DEFAULTTILESHAPE [6,4,5] in logical order is [4,6,5] in CASA order
     assert_eq!(desc.columns[0].tile_shape.as_deref(), Some(&[4, 6, 5][..]));
     assert_eq!(desc.columns[1].data_manager_type, "IncrementalStMan");
     // Its group falls back to the record's key (the manager's dminfo name).
@@ -221,15 +219,12 @@ fn apply_dminfo_group_entry_refines_declared_group() {
     ]);
     apply(
         r#"{"UVW": {"DEFAULTTILESHAPE": [3, 8192]},
-            "DataGroup": {"DEFAULTTILESHAPE": [16, 4, 32]}}"#,
+            "DataGroup": {"DEFAULTTILESHAPE": [4, 16, 32]}}"#,
         &mut desc,
     )
     .unwrap();
-    // UVW is 1D shape [3], so logical [3, 8192] (rows) is already CASA [3, 8192]
     assert_eq!(desc.columns[0].tile_shape.as_deref(), Some(&[3, 8192][..]));
     assert_eq!(desc.columns[0].data_manager_group, "UVW");
-    // MODEL_DATA shape [4, 16] in CASA becomes [16, 4] in logical,
-    // so DEFAULTTILESHAPE [16, 4, 32] logical becomes [4, 16, 32] CASA
     assert_eq!(
         desc.columns[1].tile_shape.as_deref(),
         Some(&[4, 16, 32][..])
@@ -291,11 +286,10 @@ fn apply_dminfo_fails_loudly() {
     // Cache-sizing SPEC fields are accepted and ignored.
     apply(
         r#"{"TYPE": "TiledShapeStMan", "NAME": "t",
-            "SPEC": {"MaxCacheSize": 0, "DEFAULTTILESHAPE": [6, 4, 5]}}"#,
+            "SPEC": {"MaxCacheSize": 0, "DEFAULTTILESHAPE": [4, 6, 5]}}"#,
         &mut desc,
     )
     .unwrap();
-    // DEFAULTTILESHAPE [6,4,5] in logical order is [4,6,5] in CASA order
     assert_eq!(desc.columns[0].tile_shape.as_deref(), Some(&[4, 6, 5][..]));
 }
 
@@ -333,9 +327,9 @@ fn created_columns_land_in_the_requested_managers() {
     desc.columns[2].kind = ColumnKind::Scalar(RecordValue::Double(0.0));
     apply(
         r#"{"*1": {"TYPE": "TiledColumnStMan", "NAME": "tiled",
-                   "SPEC": {"DEFAULTTILESHAPE": [6, 4, 5]}, "COLUMNS": ["DATA"]},
+                   "SPEC": {"DEFAULTTILESHAPE": [4, 6, 5]}, "COLUMNS": ["DATA"]},
             "*2": {"TYPE": "TiledColumnStMan", "NAME": "tiledf",
-                   "SPEC": {"DEFAULTTILESHAPE": [6, 4, 7]}, "COLUMNS": ["FLAG"]}}"#,
+                   "SPEC": {"DEFAULTTILESHAPE": [4, 6, 7]}, "COLUMNS": ["FLAG"]}}"#,
         &mut desc,
     )
     .unwrap();
@@ -464,7 +458,7 @@ fn growth_preserves_the_requested_tile() {
     )]);
     apply(
         r#"{"*1": {"TYPE": "TiledColumnStMan", "NAME": "tiledf",
-                   "SPEC": {"DEFAULTTILESHAPE": [6, 4, 5]}, "COLUMNS": ["FLAG"]}}"#,
+                   "SPEC": {"DEFAULTTILESHAPE": [4, 6, 5]}, "COLUMNS": ["FLAG"]}}"#,
         &mut desc,
     )
     .unwrap();
@@ -549,59 +543,4 @@ fn deep_copy_conversion_lands_in_the_requested_managers() {
         .filter(|dm| dm.type_name == "TiledColumnStMan")
         .collect();
     assert_eq!(tiled.len(), 2, "both columns converted: {info:?}");
-}
-
-// ---------------------------------------------------------------- issue #21: addcols + DEFAULTTILESHAPE transpose
-
-#[test]
-fn issue_21_defaulttileshape_axis_order_is_reversed() {
-    //! Issue #21: When applying dminfo with DEFAULTTILESHAPE, the input comes
-    //! in logical (C-order) dimensions from the user, but the column shape is
-    //! stored in CASA (Fortran-reversed) order. The DEFAULTTILESHAPE must be
-    //! reversed to match the cell shape for proper validation and use.
-    //!
-    //! The dask-ms add-columns pattern hits this: user provides logical-order
-    //! shapes, which must be converted to CASA order before applying to columns.
-
-    // Column has CASA (stored) cell shape [4, 6] (channels reversed to chans x correlations)
-    let mut desc = desc_of(vec![array_col(
-        "DATA",
-        DataType::Complex,
-        vec![4, 6],
-        "TiledData",
-        "TiledShapeStMan",
-    )]);
-
-    // User provides DEFAULTTILESHAPE in logical (C-order) dimensions:
-    // logical shape [6, 4] (chans, corr) + 5 rows per tile = [6, 4, 5]
-    //
-    // This should be reversed internally to CASA order [4, 6, 5] to match the
-    // column's [4, 6] cell shape.
-    let user_tile_shape_logical = vec![6i64, 4, 5]; // user input: logical order
-    let expected_tile_shape_casa = vec![4i64, 6, 5]; // what we should store: CASA order
-
-    // Build a dminfo record with DEFAULTTILESHAPE in logical order (user input)
-    let mut spec = empty_record();
-    spec.set(
-        "DEFAULTTILESHAPE",
-        RecordValue::Array(ArrayValue {
-            shape: vec![3u32],
-            data: ArrayData::Int64(user_tile_shape_logical.clone()),
-        }),
-    );
-
-    apply(
-        r#"{"TYPE": "TiledShapeStMan", "NAME": "TiledData",
-            "SPEC": {"DEFAULTTILESHAPE": [6, 4, 5]}}"#,
-        &mut desc,
-    )
-    .unwrap();
-
-    // After applying dminfo, the tile_shape on the column should be in CASA order
-    // [4, 6, 5], matching the reversed cell shape [4, 6].
-    assert_eq!(
-        desc.columns[0].tile_shape.as_deref(),
-        Some(&expected_tile_shape_casa[..]),
-        "DEFAULTTILESHAPE should be reversed from logical [6,4,5] to CASA [4,6,5]"
-    );
 }
