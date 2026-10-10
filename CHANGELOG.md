@@ -5,6 +5,8 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.32] - 2026-10-10
+
 ### Fixed
 
 - **`table()`, `default_ms()`, `tablecopy()`/`copy()` and
