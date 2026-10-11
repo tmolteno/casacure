@@ -5,6 +5,8 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.34] - 2026-10-11
+
 ## [3.8.33] - 2026-10-11
 
 ### Fixed
