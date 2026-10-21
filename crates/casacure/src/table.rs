@@ -2779,6 +2779,11 @@ pub struct WritableTable {
     /// column added afterwards must start from its default, not inherit the
     /// removed column's data), so the flush regenerates the table.
     removed_cols: bool,
+    /// Names of the columns added since the last flush: they have no on-disk
+    /// twin, even when a column of the same name was removed this session
+    /// (the whole-table rewrite must give them their default, not the removed
+    /// column's data).
+    added_names: Vec<String>,
     /// Set by an in-place add-column flush: the table now has this many data
     /// managers, which the sync record written at the end of the flush must
     /// reflect (and the schema-change counter must advance).
@@ -2954,6 +2959,7 @@ impl WritableTable {
             meta_dirty: false,
             full_rewrites: 0,
             removed_cols: false,
+            added_names: Vec::new(),
             schema_changed_dms: None,
             lock_file,
             lock_options: effective,
@@ -3063,9 +3069,16 @@ impl WritableTable {
     /// Append a column (`Table::addcols`); existing rows default to the
     /// column's default value at flush.
     pub fn addcol(&mut self, cd: crate::tabledesc::ColumnDesc) {
+        self.added_names.push(cd.name.clone());
         self.desc.columns.push(cd);
         self.cells.push(std::collections::BTreeMap::new());
         self.touched.push(false);
+    }
+
+    /// Whether a column of this name was added since the last flush (it has
+    /// no on-disk twin, even if a column of that name was removed first).
+    pub fn added_since_flush(&self, name: &str) -> bool {
+        self.added_names.iter().any(|n| n == name)
     }
 
     /// How many flushes regenerated the whole table (a diagnostic: a chunked
@@ -3129,6 +3142,7 @@ impl WritableTable {
             meta_dirty: false,
             full_rewrites: 0,
             removed_cols: false,
+            added_names: Vec::new(),
             schema_changed_dms: None,
             lock_file,
             lock_options: effective,
@@ -3602,6 +3616,7 @@ impl WritableTable {
             self.touched.fill(false);
             self.meta_dirty = false;
             self.removed_cols = false;
+            self.added_names.clear();
             return Ok(dir);
         };
         // Columns added since the last flush get their data managers now,
@@ -3637,6 +3652,7 @@ impl WritableTable {
         // preserving path again.
         self.touched.fill(false);
         self.removed_cols = false;
+        self.added_names.clear();
         Ok(dir)
     }
 
@@ -3848,16 +3864,68 @@ impl WritableTable {
     /// Each new data manager's files are written first (names no reader of
     /// the old table looks at: the manager has a fresh sequence number),
     /// synced, and only then is `table.dat` replaced, atomically — so a flush
-    /// that dies part-way leaves the old table intact, with at most some
-    /// orphan files.  The superseded files of a rebuilt StandardStMan are
-    /// removed after the swap.  Memory is bounded by the new columns (plus,
-    /// for a manager a column joined, that manager's other columns) — never
-    /// the table.
+    /// that dies part-way leaves the old table intact.  The superseded files
+    /// of a rebuilt StandardStMan are removed after the swap.  Memory is
+    /// bounded by the new columns (plus, for a manager a column joined, that
+    /// manager's other columns) — never the table.
+    ///
+    /// Nothing the caller wrote is lost to a failure: the new columns' cells
+    /// are moved out of the write buffer into `values`, which lives until the
+    /// swap has succeeded and is handed back to the buffer on any error
+    /// (ENOSPC on a data file, on `table.dat`, ...), so a retried flush
+    /// writes the user's data, not the column default.  The files written so
+    /// far are removed again (best effort).
     fn add_columns_in_place(
         &mut self,
         dir: &std::path::Path,
         dat: &TableDat,
         plan: &AddPlan,
+    ) -> Result<(), WriteTableError> {
+        let ncols = self.desc.columns.len();
+        let mut values: Vec<Vec<RecordValue>> = vec![Vec::new(); ncols];
+        // Which new columns held written cells (only those need handing back).
+        let mut had_cells = vec![false; ncols];
+        let mut written: Vec<std::path::PathBuf> = Vec::new();
+        match self.write_new_managers(dir, dat, plan, &mut values, &mut had_cells, &mut written) {
+            Ok(()) => {
+                for nd in &plan.dms {
+                    for &c in &nd.cols {
+                        self.clear_pending(c);
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                for (c, vals) in values.into_iter().enumerate() {
+                    if had_cells[c] {
+                        for (r, v) in vals.into_iter().enumerate() {
+                            self.cells[c].insert(
+                                r as u64,
+                                BufferedCell {
+                                    value: v,
+                                    pending: true,
+                                },
+                            );
+                        }
+                    }
+                }
+                for path in written {
+                    let _ = std::fs::remove_file(path);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The fallible part of [`WritableTable::add_columns_in_place`].
+    fn write_new_managers(
+        &mut self,
+        dir: &std::path::Path,
+        dat: &TableDat,
+        plan: &AddPlan,
+        values: &mut [Vec<RecordValue>],
+        had_cells: &mut [bool],
+        written: &mut Vec<std::path::PathBuf>,
     ) -> Result<(), WriteTableError> {
         use crate::columnset::DmBlob;
         let nrow = self.rows;
@@ -3868,54 +3936,38 @@ impl WritableTable {
         };
         let storage = |e: TableCreateError| WriteTableError::Storage(e.to_string());
         let mut new_blobs: Vec<DmBlob> = Vec::new();
-        let mut written: Vec<std::path::PathBuf> = Vec::new();
         for nd in &plan.dms {
             // Values of this manager's columns, by schema index: the
             // existing columns come from disk (overlaid with this session's
-            // pending rows), the added ones from the write buffer.
-            let mut values: Vec<Vec<RecordValue>> = vec![Vec::new(); ncols];
-            let mut taken: Vec<(usize, bool)> = Vec::new();
-            let mut result: Result<(), WriteTableError> = Ok(());
+            // pending rows, which stay in the buffer), the added ones from
+            // the write buffer.
             for &c in &nd.cols {
                 if c < n_disk {
-                    match self.materialize_col_from_disk(c, nrow) {
-                        Ok(v) => values[c] = v,
-                        Err(e) => {
-                            result = Err(e);
-                            break;
-                        }
-                    }
+                    values[c] = self.materialize_col_from_disk(c, nrow)?;
                 } else {
-                    match self.take_new_column(c, nrow) {
-                        Ok((v, had_cells)) => {
-                            values[c] = v;
-                            taken.push((c, had_cells));
-                        }
-                        Err(e) => {
-                            result = Err(e);
-                            break;
-                        }
-                    }
+                    let (v, had) = self.take_new_column(c, nrow)?;
+                    values[c] = v;
+                    had_cells[c] = had;
                 }
             }
-            let built = result.and_then(|()| match nd.type_name.as_str() {
+            let (blob, files) = match nd.type_name.as_str() {
                 "StandardStMan" => {
                     let (f0, f0i, spec) =
-                        build_ssm_data(false, nrow, &nd.name, &self.desc, &values, &nd.cols)
+                        build_ssm_data(false, nrow, &nd.name, &self.desc, values, &nd.cols)
                             .map_err(storage)?;
                     let mut files = vec![(format!("table.f{}", nd.seq), f0)];
                     if let Some(i) = f0i {
                         files.push((format!("table.f{}i", nd.seq), i));
                     }
-                    Ok((crate::columnset::write_standard_stman(&spec), files))
+                    (crate::columnset::write_standard_stman(&spec), files)
                 }
                 "IncrementalStMan" => {
-                    let f0 = build_ism_data(false, nrow, &nd.name, &self.desc, &values, &nd.cols)
+                    let f0 = build_ism_data(false, nrow, &nd.name, &self.desc, values, &nd.cols)
                         .map_err(storage)?;
-                    Ok((
+                    (
                         crate::ism::write_ism_blob(&nd.name),
                         vec![(format!("table.f{}", nd.seq), f0)],
-                    ))
+                    )
                 }
                 _ => {
                     let (hdr, tile, file_seq) = build_tsm_data(
@@ -3924,61 +3976,47 @@ impl WritableTable {
                         nd.seq,
                         &nd.name,
                         &self.desc,
-                        &values,
+                        values,
                         &nd.cols,
                     )
                     .map_err(storage)?;
-                    Ok((
+                    (
                         Vec::new(), // TSM writes its spec to the header file
                         vec![
                             (format!("table.f{}", nd.seq), hdr),
                             (format!("table.f{}_TSM{file_seq}", nd.seq), tile),
                         ],
-                    ))
-                }
-            });
-            let (blob, files) = match built {
-                Ok(b) => b,
-                Err(e) => {
-                    // Hand the written cells back: the flush can be retried.
-                    for (c, had_cells) in taken {
-                        if had_cells {
-                            for (r, v) in std::mem::take(&mut values[c]).into_iter().enumerate() {
-                                self.cells[c].insert(
-                                    r as u64,
-                                    BufferedCell {
-                                        value: v,
-                                        pending: true,
-                                    },
-                                );
-                            }
-                        }
-                    }
-                    return Err(e);
+                    )
                 }
             };
-            drop(values);
             for (name, bytes) in files {
                 let path = dir.join(name);
+                // Recorded first: a half-written file is removed on failure too.
+                written.push(path.clone());
                 crate::datafile::write_atomic(&path, &bytes).map_err(|e| io(&path, e))?;
-                written.push(path);
             }
             new_blobs.push(DmBlob {
                 type_name: nd.type_name.clone(),
                 sequence_nr: nd.seq,
                 blob,
             });
+            // Values with nothing the caller wrote (defaults, columns read
+            // back from disk) are not needed again: free them now.  Written
+            // cells are kept until the swap succeeded.
             for &c in &nd.cols {
-                self.clear_pending(c);
+                if !had_cells[c] {
+                    values[c] = Vec::new();
+                }
             }
         }
         // Everything the new `table.dat` refers to is on disk before it
         // replaces the old one.
-        for path in &written {
+        for path in written.iter() {
             std::fs::File::open(path)
                 .and_then(|f| f.sync_all())
                 .map_err(|e| io(path, e))?;
         }
+        crate::datafile::sync_dir(dir).map_err(|e| io(dir, e))?;
 
         let superseded: Vec<u32> = plan.dms.iter().filter_map(|d| d.replaces).collect();
         let mut dms: Vec<DmBlob> = existing_dm_blobs(dat)
@@ -4018,6 +4056,8 @@ impl WritableTable {
                 }
             }
         }
+        // The swap is done; making it durable can no longer fail the flush.
+        let _ = crate::datafile::sync_dir(dir);
         self.schema_changed_dms = Some(dms.len());
         Ok(())
     }
@@ -4108,13 +4148,16 @@ impl WritableTable {
             })?;
             // The on-disk twin of this column, matched by name+type (indices
             // shift after removecols/addcols in this session).
-            let disk_idx = disk.as_ref().and_then(|t| {
-                t.dat
-                    .desc
-                    .columns
-                    .iter()
-                    .position(|c| c.name == cd.name && c.data_type == cd.data_type)
-            });
+            let disk_idx = disk
+                .as_ref()
+                .filter(|_| !self.added_names.contains(&cd.name))
+                .and_then(|t| {
+                    t.dat
+                        .desc
+                        .columns
+                        .iter()
+                        .position(|c| c.name == cd.name && c.data_type == cd.data_type)
+                });
             // Every row written this session (a whole-column write): the
             // buffer is the truth and the on-disk column — which may hold
             // never-written array cells — is irrelevant.
@@ -7861,6 +7904,170 @@ mod tests {
                 f.header.nr_index_buckets > 1,
                 "{mode}: the SSM index chain grew"
             );
+        }
+    }
+
+    // --- failures part-way through an in-place add-column flush ---
+
+    fn failure_base(tag: &str) -> crate::testdir::TestDir {
+        use crate::record::{ArrayData, ArrayValue};
+        let dir = temp_dir(tag);
+        let mut desc = typed_desc();
+        desc.columns = vec![scalar_col("A", DataType::Int, 0), tiled_f("W", "TW", 4)];
+        let mut wt = WritableTable::create(&dir, desc);
+        wt.addrows(300);
+        for r in 0..300u64 {
+            wt.putcell(0, r, RecordValue::Int(r as i32)).unwrap();
+            wt.putcell(
+                1,
+                r,
+                RecordValue::Array(ArrayValue {
+                    shape: vec![4],
+                    data: ArrayData::Float(vec![r as f32; 4]),
+                }),
+            )
+            .unwrap();
+        }
+        wt.flush().unwrap();
+        dir
+    }
+
+    fn tiled_f(name: &str, group: &str, n: i64) -> ColumnDesc {
+        ColumnDesc {
+            name: name.into(),
+            comment: String::new(),
+            data_type: DataType::Float,
+            data_manager_type: "TiledShapeStMan".into(),
+            data_manager_group: group.into(),
+            options: 4,
+            ndim: 1,
+            shape: Some(vec![n]),
+            max_length: 0,
+            keywords: empty_record(),
+            kind: ColumnKind::Array,
+            tile_shape: None,
+        }
+    }
+
+    fn f3(r: u64) -> RecordValue {
+        use crate::record::{ArrayData, ArrayValue};
+        RecordValue::Array(ArrayValue {
+            shape: vec![3],
+            data: ArrayData::Float(vec![r as f32 + 0.5; 3]),
+        })
+    }
+
+    fn dir_files(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// A write failure at any stage of the in-place add (each data file of
+    /// two new managers, then `table.dat`) leaves the old table untouched
+    /// and unreadable-free, removes the files written so far, and keeps the
+    /// user's cells: a retry writes them, not the column defaults.
+    #[test]
+    fn failed_add_columns_flush_keeps_old_table_and_cells_for_a_retry() {
+        for failing in ["table.f2", "table.f2_TSM1", "table.f3", "table.dat"] {
+            let dir = failure_base(&format!("failadd-{failing}"));
+            let dat_before = std::fs::read(dir.join("table.dat")).unwrap();
+            let files_before = dir_files(&dir);
+            let (_snap, mut wt) = WritableTable::open_for_update(&dir).unwrap();
+            wt.addcol(tiled_f("IW", "iw", 3));
+            wt.addcol(scalar_col("SC", DataType::Double, 0));
+            // (a distinct group for the scalar: its own manager, seq 3)
+            wt.desc.columns[3].data_manager_group = "scal".into();
+            for r in 0..300u64 {
+                wt.putcell(2, r, f3(r)).unwrap();
+                wt.putcell(3, r, RecordValue::Double(r as f64 * 2.0))
+                    .unwrap();
+            }
+            crate::datafile::FAIL_WRITE_OF.with(|f| *f.borrow_mut() = Some(failing.into()));
+            assert!(wt.flush().is_err(), "{failing}: flush must fail");
+            crate::datafile::FAIL_WRITE_OF.with(|f| *f.borrow_mut() = None);
+            assert!(
+                std::fs::read(dir.join("table.dat")).unwrap() == dat_before,
+                "{failing}: table.dat changed"
+            );
+            assert_eq!(dir_files(&dir), files_before, "{failing}: orphan files");
+            let t = Table::open(&dir, false).unwrap();
+            assert_eq!(t.dat.desc.columns.len(), 2);
+            for r in 0..300u64 {
+                assert_eq!(t.getcell(0, r).unwrap(), RecordValue::Int(r as i32));
+            }
+            drop(t);
+            // Retry: the user's values, not the defaults.
+            wt.flush().unwrap();
+            assert_eq!(wt.full_rewrites(), 0, "{failing}: rewrote the table");
+            let t = Table::open(&dir, false).unwrap();
+            assert_eq!(t.dat.desc.columns.len(), 4);
+            for r in 0..300u64 {
+                assert_eq!(t.getcell(2, r).unwrap(), f3(r), "{failing}: IW row {r}");
+                assert_eq!(
+                    t.getcell(3, r).unwrap(),
+                    RecordValue::Double(r as f64 * 2.0),
+                    "{failing}: SC row {r}"
+                );
+            }
+        }
+    }
+
+    /// The same for a column joining an existing StandardStMan group: the
+    /// manager is rebuilt, and the pending rows of the EXISTING column in it
+    /// survive a failed flush too.
+    #[test]
+    fn failed_rebuild_of_a_joined_manager_keeps_pending_rows_of_existing_columns() {
+        for failing in ["table.f2", "table.dat"] {
+            let dir = failure_base(&format!("failjoin-{failing}"));
+            let (_snap, mut wt) = WritableTable::open_for_update(&dir).unwrap();
+            wt.addcol(scalar_col("B", DataType::Int, 0)); // joins A's StandardStMan
+            wt.putcell(0, 5, RecordValue::Int(-5)).unwrap();
+            for r in 0..300u64 {
+                wt.putcell(2, r, RecordValue::Int(1000 + r as i32)).unwrap();
+            }
+            crate::datafile::FAIL_WRITE_OF.with(|f| *f.borrow_mut() = Some(failing.into()));
+            assert!(wt.flush().is_err());
+            crate::datafile::FAIL_WRITE_OF.with(|f| *f.borrow_mut() = None);
+            wt.flush().unwrap();
+            let t = Table::open(&dir, false).unwrap();
+            for r in 0..300u64 {
+                let a = if r == 5 { -5 } else { r as i32 };
+                assert_eq!(
+                    t.getcell(0, r).unwrap(),
+                    RecordValue::Int(a),
+                    "{failing}: A {r}"
+                );
+                assert_eq!(
+                    t.getcell(2, r).unwrap(),
+                    RecordValue::Int(1000 + r as i32),
+                    "{failing}: B {r}"
+                );
+            }
+        }
+    }
+
+    /// `removecol(X)` then `addcol(X)` starts X from its default: the
+    /// whole-table rewrite must not match the new column to the removed
+    /// column's on-disk data by name.
+    #[test]
+    fn removecol_then_addcol_of_the_same_name_starts_from_the_default() {
+        let dir = failure_base("readd-name");
+        let (_snap, mut wt) = WritableTable::open_for_update(&dir).unwrap();
+        wt.removecol(0);
+        wt.addcol(scalar_col("A", DataType::Int, 0));
+        wt.putcell(1, 7, RecordValue::Int(77)).unwrap();
+        wt.flush().unwrap();
+        let t = Table::open(&dir, false).unwrap();
+        let names: Vec<_> = t.dat.desc.columns.iter().map(|c| c.name.clone()).collect();
+        assert_eq!(names, ["W", "A"]);
+        for r in 0..300u64 {
+            let want = if r == 7 { 77 } else { 0 };
+            assert_eq!(t.getcell(1, r).unwrap(), RecordValue::Int(want), "A {r}");
         }
     }
 }

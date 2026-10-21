@@ -577,3 +577,34 @@ def test_uvwdt_addcols_peak_memory_is_independent_of_tiled_data(big_table, tmp_p
     growth = _peak_growth_mb(big_table, tmp_path, "uvwdt")
     limit = GROWTH_LIMIT_MB
     assert growth < limit, f"UVWDT addcols grew peak RSS by {growth:.0f} MB (limit {limit:.0f})"
+
+
+# --- removecols(X) then addcols(X) starts X from its default ---
+
+
+def test_removecols_then_addcols_same_name_does_not_inherit_old_data(tmp_path):
+    path = str(tmp_path / "t.ms")
+    n = 1000
+    _build_ms_like(path, n)
+    existing = _read_all(path, EXISTING)
+    assert existing["ANTENNA2"].any() and np.abs(existing["DATA"]).max() > 0
+
+    t = ct.table(path, readonly=False, ack=False)
+    t.removecols(["ANTENNA2", "DATA"])
+    t.addcols(ct.maketabdesc([ct.makescacoldesc("ANTENNA2", 0)]))
+    t.addcols(ct.maketabdesc([
+        ct.makearrcoldesc("DATA", 0j, 0, [NCHAN, NCORR], "TiledColumnStMan",
+                          "TiledData", 4, valuetype="complex")]))
+    # Before the flush the new columns already read as their defaults.
+    assert not t.getcol("ANTENNA2").any()
+    assert not np.abs(t.getcol("DATA")).any()
+    t.putcell("ANTENNA2", 3, 9)
+    t.close()
+
+    got = _read_all(path, ["TIME", "ANTENNA1", "ANTENNA2", "UVW", "FLAG", "DATA"])
+    want_a2 = np.zeros(n, np.int32)
+    want_a2[3] = 9
+    np.testing.assert_array_equal(got["ANTENNA2"], want_a2)
+    assert not np.abs(got["DATA"]).any()
+    for c in ["TIME", "ANTENNA1", "UVW", "FLAG"]:
+        np.testing.assert_array_equal(got[c], existing[c], err_msg=c)

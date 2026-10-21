@@ -135,6 +135,10 @@ static WRITE_ATOMIC_SEQ: AtomicU64 = AtomicU64::new(0);
 /// mapping keeps the replaced inode (and the snapshot it captured), and a
 /// concurrent opener sees either the whole old file or the whole new one.
 pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_WRITE_OF.with(|f| f.borrow().as_deref() == path.file_name().and_then(|n| n.to_str())) {
+        return Err(std::io::Error::other("injected write failure (ENOSPC)"));
+    }
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -147,6 +151,28 @@ pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Res
         return Err(e);
     }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test failpoint: the file name (no directory) `write_atomic` fails on,
+    /// on this thread.
+    pub(crate) static FAIL_WRITE_OF: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Flush a directory's entries (new files, a rename) to stable storage.  A
+/// no-op where directories cannot be opened for syncing (non-unix).
+pub(crate) fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 impl Deref for Buffer {

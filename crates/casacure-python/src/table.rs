@@ -543,6 +543,9 @@ fn column_cells(
 /// positional lookup would read the wrong column (or none).
 fn disk_col_index(s: &WriteData, col_idx: usize) -> Option<usize> {
     let cd = s.wt.desc().columns.get(col_idx)?;
+    if s.wt.added_since_flush(&cd.name) {
+        return None; // no on-disk twin, whatever a removed column of that name held
+    }
     let disk = &s.read.dat.desc.columns;
     if disk
         .get(col_idx)

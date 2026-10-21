@@ -25,7 +25,15 @@ subtasks are moved here.
   whole-table rewrite.  `WritableTable::full_rewrites()` is now public.
   Tests: `crates/casacure/tests/addcols_in_place.rs`,
   `tests/test_addcols_in_place.py` (incl. interop with python-casacore and a
-  peak-RSS bound).
+  peak-RSS bound).  A failure part-way through the in-place add (a full disk
+  on a data file or on `table.dat`) leaves the old table readable, removes
+  the files written so far, and keeps the caller's written cells so a retry
+  writes them; the new files and the `table.dat` rename are fsynced via the
+  directory too.
+- **`removecols(X)` then `addcols(X)` starts X from its default** instead of
+  inheriting the removed column's data (the whole-table rewrite matched the
+  new column to the old one by name, and a write handle read it back
+  before the flush).
 
 ## [3.8.34] - 2026-10-11
 
