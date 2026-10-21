@@ -101,9 +101,28 @@ def azel(me, ra_rad, dec_rad, refer="AZEL"):
     return m["m0"]["value"], m["m1"]["value"]
 
 
+# casacure's bundled finals2000A series ends here (`celestial-eop-data`,
+# MEASURES_ACCURACY.md); after it casacure holds UT1-UTC at this constant.
+CASACURE_EOP_END_MJD = 61547.0
+CASACURE_DUT1_AFTER_S = -0.147817
+
+
 def astropy_altaz(mjd, ra_deg, dec_deg, itrf_m):
+    """astropy's AltAz, the accuracy reference.
+
+    Past the end of casacure's bundled EOP series both libraries are
+    extrapolating UT1-UTC, and astropy's extrapolation is the last value of
+    whichever `astropy-iers-data` release is installed (updated weekly), so
+    comparing the two there measures the vintage of astropy's data, not
+    casacure (a 0.03 s difference is ~0.5" on the sky).  There astropy is
+    handed casacure's documented constant, so the contract compares the
+    transforms.  Polar motion needs no such care: past its table astropy
+    uses its 50-year mean, which is casacure's fallback too.
+    """
     loc = EarthLocation.from_geocentric(*itrf_m, unit=u.m)
     t = Time(mjd, format="mjd", scale="utc")
+    if mjd > CASACURE_EOP_END_MJD:
+        t.delta_ut1_utc = CASACURE_DUT1_AFTER_S
     c = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
     return c.transform_to(AltAz(obstime=t, location=loc))
 

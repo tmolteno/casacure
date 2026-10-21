@@ -30,6 +30,16 @@ subtasks are moved here.
   the files written so far, and keeps the caller's written cells so a retry
   writes them; the new files and the `table.dat` rename are fsynced via the
   directory too.
+- **The measures accuracy test no longer depends on the installed
+  `astropy-iers-data` release.**  Past the end of casacure's bundled EOP
+  series (2027-05-22) both libraries extrapolate UT1−UTC, and astropy's
+  extrapolation is its newest IERS file's last value, refreshed weekly: from
+  `astropy-iers-data` 0.2026.10.12 on, `test_azel_matches_astropy_over_a_century`
+  failed its 0.2″ check at 2096 (0.23″, then 0.47″) with casacure unchanged.
+  There astropy is now given casacure's documented constant
+  (`delta_ut1_utc = −0.147817 s`), so the test compares the transforms: the
+  worst separation over 1926–2126 is 0.026″ with the 10-05, 10-12 and 10-19
+  data alike.  `MEASURES_ACCURACY.md` notes why.
 - **`removecols(X)` then `addcols(X)` starts X from its default** instead of
   inheriting the removed column's data (the whole-table rewrite matched the
   new column to the old one by name, and a write handle read it back

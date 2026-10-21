@@ -62,6 +62,13 @@ casacure compiles its data in:
   span casacure uses the same constants astropy falls back to:
   `UT1−UTC = +0.807841 s` before the series, `−0.147817 s` after it, and a
   polar motion of `(0.035″, 0.29″)` (astropy's 50-year-mean `_DEFAULT_PM`).
+  astropy's own post-table UT1−UTC is the last value of the installed
+  `astropy-iers-data` release, which is refreshed weekly, so it drifts
+  away from `−0.147817 s` (by 0.03 s, ~0.5″ on the sky, between the
+  2026-10-05 and 2026-10-19 releases).  Past the series end (MJD 61547) the
+  contract test therefore hands astropy casacure's constant
+  (`Time.delta_ut1_utc`), so it compares the transforms rather than two
+  extrapolations of the Earth's rotation.
   Note that UTC itself only exists from 1960 and no `UT1−UTC` observation
   reaches back to 1926; the pre-1973 constants keep casacure and astropy in
   agreement where neither has data.
