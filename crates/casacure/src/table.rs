@@ -2774,6 +2774,15 @@ pub struct WritableTable {
     /// Flushes that regenerated the whole table (tests assert a chunked
     /// write stream never needs one after the first).
     full_rewrites: u64,
+    /// A column was removed since the last flush: the on-disk columns are no
+    /// longer a prefix of this schema in any meaningful sense (a same-named
+    /// column added afterwards must start from its default, not inherit the
+    /// removed column's data), so the flush regenerates the table.
+    removed_cols: bool,
+    /// Set by an in-place add-column flush: the table now has this many data
+    /// managers, which the sync record written at the end of the flush must
+    /// reflect (and the schema-change counter must advance).
+    schema_changed_dms: Option<usize>,
     /// The directory's shared `table.lock`, when locking is in effect.
     lock_file: Option<crate::lockfile::SharedLockFile>,
     lock_options: crate::lockfile::EffectiveLockOptions,
@@ -2944,6 +2953,8 @@ impl WritableTable {
             touched,
             meta_dirty: false,
             full_rewrites: 0,
+            removed_cols: false,
+            schema_changed_dms: None,
             lock_file,
             lock_options: effective,
             write_held,
@@ -3057,6 +3068,13 @@ impl WritableTable {
         self.touched.push(false);
     }
 
+    /// How many flushes regenerated the whole table (a diagnostic: a chunked
+    /// write stream or an add-column flush on a table casacure can extend in
+    /// place must keep this at 0 after the table is created).
+    pub fn full_rewrites(&self) -> u64 {
+        self.full_rewrites
+    }
+
     /// Remove a column by index (`Table::removecols`); the data is discarded
     /// at the next flush.
     pub fn removecol(&mut self, col_idx: usize) {
@@ -3069,6 +3087,7 @@ impl WritableTable {
         if col_idx < self.touched.len() {
             self.touched.remove(col_idx);
         }
+        self.removed_cols = true;
     }
 
     /// Open an existing table for in-place editing WITHOUT materialising its
@@ -3109,6 +3128,8 @@ impl WritableTable {
             touched: vec![false; read.dat.desc.columns.len()],
             meta_dirty: false,
             full_rewrites: 0,
+            removed_cols: false,
+            schema_changed_dms: None,
             lock_file,
             lock_options: effective,
             write_held,
@@ -3464,6 +3485,15 @@ impl WritableTable {
                 d.nrrow = self.rows;
                 d.nrcolumn = ncols;
                 d.modify_counter = d.modify_counter.wrapping_add(1);
+                if let Some(ndm) = self.schema_changed_dms.take() {
+                    // The table gained data managers: a casacore reader
+                    // re-reads `table.dat` when the table-change counter
+                    // moves, and wants one counter per manager.
+                    d.table_change_counter = d.table_change_counter.wrapping_add(1);
+                    if d.dm_counters.len() < ndm {
+                        d.dm_counters.resize(ndm, 1);
+                    }
+                }
                 d
             }
             None => {
@@ -3502,25 +3532,38 @@ impl WritableTable {
         // In place needs the on-disk table to share this schema and hold
         // at most this many rows.  `table.dat` is read and parsed once here
         // and handed to the preserving path.
-        let on_disk = (self.touched.len() == self.desc.columns.len())
-            .then(|| std::fs::read(dir.join("table.dat")).ok())
-            .flatten()
-            .and_then(|b| parse_table_dat(&b).ok())
-            .filter(|dat| {
-                dat.desc.columns.len() == self.desc.columns.len()
-                    && dat.column_set.columns.len() == self.desc.columns.len()
-                    && dat
-                        .desc
-                        .columns
-                        .iter()
-                        .zip(self.desc.columns.iter())
-                        .all(|(a, b)| {
-                            a.name == b.name
-                                && a.data_type == b.data_type
-                                && a.data_manager_type == b.data_manager_type
-                                && a.data_manager_group == b.data_manager_group
-                        })
-            });
+        let mut plan: Option<AddPlan> = None;
+        let on_disk =
+            (self.touched.len() == self.desc.columns.len() && !self.removed_cols)
+                .then(|| std::fs::read(dir.join("table.dat")).ok())
+                .flatten()
+                .and_then(|b| parse_table_dat(&b).ok())
+                .filter(|dat| {
+                    let n_disk = dat.desc.columns.len();
+                    // The on-disk columns are this schema's first `n_disk`
+                    // columns, unchanged; whatever follows was added since.
+                    let prefix =
+                        n_disk <= self.desc.columns.len()
+                            && dat.column_set.columns.len() == n_disk
+                            && dat.desc.columns.iter().zip(self.desc.columns.iter()).all(
+                                |(a, b)| {
+                                    a.name == b.name
+                                        && a.data_type == b.data_type
+                                        && a.data_manager_type == b.data_manager_type
+                                        && a.data_manager_group == b.data_manager_group
+                                },
+                            );
+                    if !prefix {
+                        return false;
+                    }
+                    if n_disk == self.desc.columns.len() {
+                        return true;
+                    }
+                    // Added columns: extend in place when every one of them
+                    // lands in a layout `add_columns_in_place` can write.
+                    plan = self.plan_add_columns(&dir, dat);
+                    plan.is_some()
+                });
         // The row count the files hold: casacore's (the lock file's sync
         // record first, then the header -- see `Table::open`).
         let in_place = match &on_disk {
@@ -3558,7 +3601,23 @@ impl WritableTable {
             self.clear_all_pending();
             self.touched.fill(false);
             self.meta_dirty = false;
+            self.removed_cols = false;
             return Ok(dir);
+        };
+        // Columns added since the last flush get their data managers now,
+        // beside the existing ones (whose files stay untouched); `table.dat`
+        // is replaced last, so the old table stays readable until the very
+        // end.  The rest of the flush then sees the extended table.
+        let dat = match plan {
+            Some(plan) => {
+                self.add_columns_in_place(&dir, &dat, &plan)?;
+                let path = dir.join("table.dat");
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
+                parse_table_dat(&bytes)
+                    .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?
+            }
+            None => dat,
         };
         self.flush_preserving(&dir, &dat)?;
         // Keywords (and any other descriptor change) live in table.dat:
@@ -3577,6 +3636,7 @@ impl WritableTable {
         // all been written at least once could never take the incremental
         // preserving path again.
         self.touched.fill(false);
+        self.removed_cols = false;
         Ok(dir)
     }
 
@@ -3597,7 +3657,7 @@ impl WritableTable {
         for dry_run in [true, false] {
             for dm in &dat.column_set.data_managers {
                 let seq = dm.sequence_nr;
-                let cols: Vec<usize> = (0..self.desc.columns.len())
+                let cols: Vec<usize> = (0..dat.desc.columns.len())
                     .filter(|&c| dat.column_set.columns[c].data_manager_seq == seq)
                     .collect();
                 if cols.is_empty() {
@@ -3663,6 +3723,330 @@ impl WritableTable {
         Ok(true)
     }
 
+    /// Decide how the columns added since the last flush (`n_disk..`) can be
+    /// stored beside the existing data managers, or `None` when some layout
+    /// is not handled (the caller then regenerates the whole table, as it
+    /// always did).  Handled: any number of columns in StandardStMan,
+    /// IncrementalStMan (scalars) or Tiled{Column,Shape}StMan (one array
+    /// column per manager) groups that do not exist yet — each group becomes
+    /// one new manager — and columns joining an existing StandardStMan group
+    /// (killMS's `UVWDT`, a copy of UVW's descriptor), which rebuild that one
+    /// manager.
+    fn plan_add_columns(&self, dir: &std::path::Path, dat: &TableDat) -> Option<AddPlan> {
+        use crate::columnset::DataManagerBlob;
+        if dat.header.big_endian {
+            return None;
+        }
+        let n_disk = dat.desc.columns.len();
+        let max_seq = dat
+            .column_set
+            .data_managers
+            .iter()
+            .map(|d| d.sequence_nr + 1)
+            .max()
+            .unwrap_or(0);
+        let mut next_seq = dat.column_set.seq_count.max(max_seq);
+        let seq_count_start = next_seq;
+        let mut names: std::collections::HashSet<String> = get_dminfo(dir, dat)
+            .ok()?
+            .into_values()
+            .map(|d| d.name)
+            .collect();
+        let mut dms: Vec<NewDm> = Vec::new();
+        for c in n_disk..self.desc.columns.len() {
+            let cd = &self.desc.columns[c];
+            let supported = match cd.data_manager_type.as_str() {
+                "StandardStMan" | "TiledColumnStMan" | "TiledShapeStMan" => {
+                    matches!(
+                        cd.kind,
+                        crate::tabledesc::ColumnKind::Scalar(_)
+                            | crate::tabledesc::ColumnKind::Array
+                    )
+                }
+                "IncrementalStMan" => {
+                    matches!(cd.kind, crate::tabledesc::ColumnKind::Scalar(_))
+                        && cd.data_type != crate::record::DataType::String
+                }
+                _ => false,
+            };
+            if !supported {
+                return None;
+            }
+            let tiled = cd.data_manager_type.starts_with("Tiled");
+            let key = dm_key(cd);
+            // A group of an existing manager?
+            if let Some(i) = (0..n_disk).find(|&i| dm_key(&self.desc.columns[i]) == key) {
+                let seq = dat.column_set.columns[i].data_manager_seq;
+                let dm = dat
+                    .column_set
+                    .data_managers
+                    .iter()
+                    .find(|d| d.sequence_nr == seq)?;
+                let DataManagerBlob::StandardStMan(spec) = &dm.blob else {
+                    return None;
+                };
+                if cd.data_manager_type != "StandardStMan" {
+                    return None;
+                }
+                if let Some(nd) = dms.iter_mut().find(|d| d.replaces == Some(seq)) {
+                    nd.cols.push(c);
+                } else {
+                    let mut cols: Vec<usize> = (0..n_disk)
+                        .filter(|&j| dat.column_set.columns[j].data_manager_seq == seq)
+                        .collect();
+                    cols.push(c);
+                    dms.push(NewDm {
+                        type_name: "StandardStMan".into(),
+                        name: spec.data_manager_name.clone(),
+                        seq: next_seq,
+                        cols,
+                        replaces: Some(seq),
+                    });
+                    next_seq += 1;
+                }
+                continue;
+            }
+            // A group an earlier added column opened?
+            if let Some(nd) = dms
+                .iter_mut()
+                .find(|d| d.replaces.is_none() && dm_key(&self.desc.columns[d.cols[0]]) == key)
+            {
+                if tiled {
+                    return None; // one array column per tiled manager
+                }
+                nd.cols.push(c);
+                continue;
+            }
+            // A new manager, named by its group (casacore's `_N` suffix
+            // keeps names unique).
+            let mut name = key.1.to_string();
+            let mut n = 0;
+            while names.contains(&name) {
+                n += 1;
+                name = format!("{}_{n}", key.1);
+            }
+            names.insert(name.clone());
+            dms.push(NewDm {
+                type_name: cd.data_manager_type.clone(),
+                name,
+                seq: next_seq,
+                cols: vec![c],
+                replaces: None,
+            });
+            next_seq += 1;
+        }
+        debug_assert!(next_seq >= seq_count_start);
+        Some(AddPlan {
+            dms,
+            seq_count: next_seq,
+        })
+    }
+
+    /// Store the columns added since the last flush without touching the
+    /// existing columns' data files.
+    ///
+    /// Each new data manager's files are written first (names no reader of
+    /// the old table looks at: the manager has a fresh sequence number),
+    /// synced, and only then is `table.dat` replaced, atomically — so a flush
+    /// that dies part-way leaves the old table intact, with at most some
+    /// orphan files.  The superseded files of a rebuilt StandardStMan are
+    /// removed after the swap.  Memory is bounded by the new columns (plus,
+    /// for a manager a column joined, that manager's other columns) — never
+    /// the table.
+    fn add_columns_in_place(
+        &mut self,
+        dir: &std::path::Path,
+        dat: &TableDat,
+        plan: &AddPlan,
+    ) -> Result<(), WriteTableError> {
+        use crate::columnset::DmBlob;
+        let nrow = self.rows;
+        let n_disk = dat.desc.columns.len();
+        let ncols = self.desc.columns.len();
+        let io = |path: &std::path::Path, e: std::io::Error| {
+            WriteTableError::Storage(storage_error(path, e))
+        };
+        let storage = |e: TableCreateError| WriteTableError::Storage(e.to_string());
+        let mut new_blobs: Vec<DmBlob> = Vec::new();
+        let mut written: Vec<std::path::PathBuf> = Vec::new();
+        for nd in &plan.dms {
+            // Values of this manager's columns, by schema index: the
+            // existing columns come from disk (overlaid with this session's
+            // pending rows), the added ones from the write buffer.
+            let mut values: Vec<Vec<RecordValue>> = vec![Vec::new(); ncols];
+            let mut taken: Vec<(usize, bool)> = Vec::new();
+            let mut result: Result<(), WriteTableError> = Ok(());
+            for &c in &nd.cols {
+                if c < n_disk {
+                    match self.materialize_col_from_disk(c, nrow) {
+                        Ok(v) => values[c] = v,
+                        Err(e) => {
+                            result = Err(e);
+                            break;
+                        }
+                    }
+                } else {
+                    match self.take_new_column(c, nrow) {
+                        Ok((v, had_cells)) => {
+                            values[c] = v;
+                            taken.push((c, had_cells));
+                        }
+                        Err(e) => {
+                            result = Err(e);
+                            break;
+                        }
+                    }
+                }
+            }
+            let built = result.and_then(|()| match nd.type_name.as_str() {
+                "StandardStMan" => {
+                    let (f0, f0i, spec) =
+                        build_ssm_data(false, nrow, &nd.name, &self.desc, &values, &nd.cols)
+                            .map_err(storage)?;
+                    let mut files = vec![(format!("table.f{}", nd.seq), f0)];
+                    if let Some(i) = f0i {
+                        files.push((format!("table.f{}i", nd.seq), i));
+                    }
+                    Ok((crate::columnset::write_standard_stman(&spec), files))
+                }
+                "IncrementalStMan" => {
+                    let f0 = build_ism_data(false, nrow, &nd.name, &self.desc, &values, &nd.cols)
+                        .map_err(storage)?;
+                    Ok((
+                        crate::ism::write_ism_blob(&nd.name),
+                        vec![(format!("table.f{}", nd.seq), f0)],
+                    ))
+                }
+                _ => {
+                    let (hdr, tile, file_seq) = build_tsm_data(
+                        &nd.type_name,
+                        false,
+                        nd.seq,
+                        &nd.name,
+                        &self.desc,
+                        &values,
+                        &nd.cols,
+                    )
+                    .map_err(storage)?;
+                    Ok((
+                        Vec::new(), // TSM writes its spec to the header file
+                        vec![
+                            (format!("table.f{}", nd.seq), hdr),
+                            (format!("table.f{}_TSM{file_seq}", nd.seq), tile),
+                        ],
+                    ))
+                }
+            });
+            let (blob, files) = match built {
+                Ok(b) => b,
+                Err(e) => {
+                    // Hand the written cells back: the flush can be retried.
+                    for (c, had_cells) in taken {
+                        if had_cells {
+                            for (r, v) in std::mem::take(&mut values[c]).into_iter().enumerate() {
+                                self.cells[c].insert(
+                                    r as u64,
+                                    BufferedCell {
+                                        value: v,
+                                        pending: true,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    return Err(e);
+                }
+            };
+            drop(values);
+            for (name, bytes) in files {
+                let path = dir.join(name);
+                crate::datafile::write_atomic(&path, &bytes).map_err(|e| io(&path, e))?;
+                written.push(path);
+            }
+            new_blobs.push(DmBlob {
+                type_name: nd.type_name.clone(),
+                sequence_nr: nd.seq,
+                blob,
+            });
+            for &c in &nd.cols {
+                self.clear_pending(c);
+            }
+        }
+        // Everything the new `table.dat` refers to is on disk before it
+        // replaces the old one.
+        for path in &written {
+            std::fs::File::open(path)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| io(path, e))?;
+        }
+
+        let superseded: Vec<u32> = plan.dms.iter().filter_map(|d| d.replaces).collect();
+        let mut dms: Vec<DmBlob> = existing_dm_blobs(dat)
+            .into_iter()
+            .filter(|d| !superseded.contains(&d.sequence_nr))
+            .collect();
+        dms.extend(new_blobs);
+        let mut col_dm_seq: Vec<u32> = Vec::with_capacity(ncols);
+        for c in 0..ncols {
+            let seq = plan
+                .dms
+                .iter()
+                .find(|d| d.cols.contains(&c))
+                .map(|d| d.seq)
+                .unwrap_or_else(|| dat.column_set.columns[c].data_manager_seq);
+            col_dm_seq.push(seq);
+        }
+        let bytes = build_table_dat_with_seq_count(
+            dat.header.big_endian,
+            nrow,
+            &self.desc,
+            &dms,
+            &col_dm_seq,
+            plan.seq_count,
+        )
+        .map_err(storage)?;
+        let path = dir.join("table.dat");
+        {
+            // An opener must not pair the new `table.dat` with the old
+            // files (or the reverse) while they are swapped.
+            let gate = crate::flushgate::gate(dir);
+            let _gate_w = gate.write().unwrap();
+            crate::datafile::write_atomic(&path, &bytes).map_err(|e| io(&path, e))?;
+            for seq in superseded {
+                for name in [format!("table.f{seq}"), format!("table.f{seq}i")] {
+                    let _ = std::fs::remove_file(dir.join(name));
+                }
+            }
+        }
+        self.schema_changed_dms = Some(dms.len());
+        Ok(())
+    }
+
+    /// The `nrow` values of a column added since the last flush — its
+    /// written cells, the column default elsewhere — MOVED out of the write
+    /// buffer (no copy of a column-sized buffer).  The flag says whether the
+    /// buffer held any cell (so a failed flush knows to give them back).
+    fn take_new_column(
+        &mut self,
+        col: usize,
+        nrow: u64,
+    ) -> Result<(Vec<RecordValue>, bool), WriteTableError> {
+        let cd = &self.desc.columns[col];
+        let default = default_cell_value(cd).ok_or_else(|| WriteTableError::NoDefault {
+            name: cd.name.clone(),
+        })?;
+        let mut cells = std::mem::take(&mut self.cells[col]);
+        let had_cells = !cells.is_empty();
+        let list = (0..nrow)
+            .map(|r| {
+                cells
+                    .remove(&r)
+                    .map_or_else(|| default.clone(), |c| c.value)
+            })
+            .collect();
+        Ok((list, had_cells))
+    }
+
     /// Regenerate `table.dat` from this descriptor around the data managers
     /// already on disk (their spec blobs and sequence numbers kept).
     fn rewrite_table_dat(
@@ -3670,22 +4054,7 @@ impl WritableTable {
         dir: &std::path::Path,
         dat: &TableDat,
     ) -> Result<(), WriteTableError> {
-        use crate::columnset::{DataManagerBlob, DmBlob};
-        let dms: Vec<DmBlob> = dat
-            .column_set
-            .data_managers
-            .iter()
-            .map(|dm| DmBlob {
-                type_name: dm.type_name.clone(),
-                sequence_nr: dm.sequence_nr,
-                blob: match &dm.blob {
-                    DataManagerBlob::StandardStMan(spec) => {
-                        crate::columnset::write_standard_stman(spec)
-                    }
-                    DataManagerBlob::Unsupported(raw) => raw.clone(),
-                },
-            })
-            .collect();
+        let dms = existing_dm_blobs(dat);
         let col_dm_seq: Vec<u32> = dat
             .column_set
             .columns
@@ -3863,7 +4232,9 @@ impl WritableTable {
         dat: &TableDat,
     ) -> Result<(), WriteTableError> {
         let nrow = self.rows;
-        let dm_of: Vec<u32> = (0..self.desc.columns.len())
+        // The columns on disk (a prefix of the schema: columns added since
+        // have no data manager until `add_columns_in_place`).
+        let dm_of: Vec<u32> = (0..dat.desc.columns.len())
             .map(|c| {
                 dat.column_set
                     .columns
@@ -4592,6 +4963,60 @@ impl WritableTable {
         }
         Ok(Some(()))
     }
+}
+
+/// The data managers of an on-disk table as `DmBlob`s (spec blobs and
+/// sequence numbers kept), for regenerating `table.dat` around them.
+fn existing_dm_blobs(dat: &TableDat) -> Vec<crate::columnset::DmBlob> {
+    use crate::columnset::{DataManagerBlob, DmBlob};
+    dat.column_set
+        .data_managers
+        .iter()
+        .map(|dm| DmBlob {
+            type_name: dm.type_name.clone(),
+            sequence_nr: dm.sequence_nr,
+            blob: match &dm.blob {
+                DataManagerBlob::StandardStMan(spec) => {
+                    crate::columnset::write_standard_stman(spec)
+                }
+                DataManagerBlob::Unsupported(raw) => raw.clone(),
+            },
+        })
+        .collect()
+}
+
+/// The data manager a column asks for: its type and its group name (the
+/// type when no group is given), the key casacore matches managers on.
+fn dm_key(cd: &crate::tabledesc::ColumnDesc) -> (&str, &str) {
+    let group = if cd.data_manager_group.is_empty() {
+        cd.data_manager_type.as_str()
+    } else {
+        cd.data_manager_group.as_str()
+    };
+    (cd.data_manager_type.as_str(), group)
+}
+
+/// One data manager written by an in-place add-column flush.
+struct NewDm {
+    type_name: String,
+    name: String,
+    seq: u32,
+    /// The columns of the schema it stores, ascending.  When `replaces` is
+    /// set, the existing columns of the replaced manager come first.
+    cols: Vec<usize>,
+    /// A column added to a StandardStMan group that already exists cannot
+    /// grow that manager's file in place (casacore reorganises it too), so
+    /// the whole manager is rebuilt — under a fresh sequence number, so the
+    /// old files stay valid until `table.dat` swaps — and this is the
+    /// sequence number of the manager it supersedes.
+    replaces: Option<u32>,
+}
+
+/// What an add-column flush writes: the new data managers and the sequence
+/// counter after them.
+struct AddPlan {
+    dms: Vec<NewDm>,
+    seq_count: u32,
 }
 
 /// Whether a StandardStMan data manager of the table holds a Direct array
