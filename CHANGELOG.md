@@ -5,6 +5,8 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.35] - 2026-10-21
+
 ### Fixed
 
 - **`addcols` + `flush`/`close` extends the table in place instead of
