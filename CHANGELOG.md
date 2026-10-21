@@ -5,6 +5,28 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`addcols` + `flush`/`close` extends the table in place instead of
+  rewriting it** (issue #22).  Adding a column made the flush regenerate the
+  whole table (`materialize_all` + `create_table`): every cell of every
+  column in memory and every data file rewritten.  On a real MeerKAT MS
+  (682651 rows x 314 chan, 15 GB) adding killMS's `IMAGING_WEIGHT` took
+  21.5 s and 31.7 GB peak RSS (UVWDT + putcol: 19.4 s, 31.0 GB); python-casacore
+  needs ~0.2 s.  The flush now writes each new column's data manager beside the
+  existing ones (fresh sequence number, casacore naming), syncs the files, and
+  replaces `table.dat` last and atomically, so an interrupted flush leaves the
+  old table readable and no existing column's file is touched: 1.5 s / 2.6 GB
+  for `IMAGING_WEIGHT`, 0.24 s / 0.22 GB for UVWDT.  A column joining an
+  existing StandardStMan group rebuilds only that manager (under a new
+  sequence number, the old files removed after the swap).  Layouts not handled
+  (a column joining an IncrementalStMan group, a tiled group that exists
+  already, a big-endian table, any flush after `removecols`) keep the
+  whole-table rewrite.  `WritableTable::full_rewrites()` is now public.
+  Tests: `crates/casacure/tests/addcols_in_place.rs`,
+  `tests/test_addcols_in_place.py` (incl. interop with python-casacore and a
+  peak-RSS bound).
+
 ## [3.8.34] - 2026-10-11
 
 ## [3.8.33] - 2026-10-11

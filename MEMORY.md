@@ -161,6 +161,7 @@ grown in place keeps the whole-table rewrite. Such layouts are:
 | **+ growth in place** | a flush on a table with more rows than its files appends default rows to each storage manager instead of regenerating the table, so writing a NEW table through dask-ms is chunk-bounded: 1865 → 188 MiB and 57.6 → 1.45 s for 256k rows, below casacore |
 | **+ `malloc_trim` after SELECT/sort** (3.8.27) | freed glibc arena pages from a materialising TaQL result go back to the OS, so 5 threads × 1 sort each retain 0.12 GiB instead of 10.2 GiB — the arena half of the "memory balloon" |
 | **+ reference-table `query()`/`sort()`** (issue #16) | a selection is a row order over the source, never a copy of its cells: the issue's repro drops 2.48 → 0.046 GiB peak and writes no scratch directory; the trim above is now only a safety net for `taql()` and computed projections |
+| **+ add-column in place** (issue #22) | `addcols` + flush writes only the new column's data manager and swaps `table.dat` last, instead of regenerating the table: on a 15 GB MeerKAT MS adding a `[314]` float `IMAGING_WEIGHT` 31.7 GB / 21.5 s → 2.6 GB / 1.5 s peak, a UVWDT copy of UVW + putcol 31.0 GB / 19.4 s → 0.22 GB / 0.24 s; synthetic 737 MB table + 31 MB column: 1.8 GB → 0.11 GB |
 
 ## How it works
 
