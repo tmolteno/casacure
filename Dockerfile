@@ -22,8 +22,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # rustup for the cargo test / fmt / clippy gate (CI's dtolnay/rust-toolchain@stable).
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --component rustfmt,clippy
-ENV PATH="/root/.cargo/bin:$PATH"
+# Installed under /opt, not /root: the image ends as the non-root `tester`
+# (below), and `invoke test --sanitizers` / `--freethreaded` run cargo and
+# rustup (a nightly toolchain, `maturin develop`) as that user.  With the
+# toolchain in /root/.cargo those jobs died with exit 127.
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain stable --component rustfmt,clippy
+ENV PATH="/opt/cargo/bin:$PATH"
 
 RUN pip install --no-cache-dir \
         maturin numpy pytest python-casacore dask-ms xarray astropy
@@ -58,8 +63,10 @@ RUN cargo test --workspace \
 
 # A non-root user: the permission tests (a_read_only_block_is_named_in_the
 #_storage_error, ...rely on chmod 0444 denying writes, which root ignores.
+# `tester` also owns the toolchain, so the opt-in jobs can install nightly
+# (rust-src) and write cargo's registry cache.
 RUN useradd --create-home --uid 1000 tester \
-    && chown -R tester:tester /src
+    && chown -R tester:tester /src /opt/rustup /opt/cargo
 USER tester
 
 # Default command: the Python comparison suite (CI's final step).

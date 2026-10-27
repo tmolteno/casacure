@@ -181,8 +181,9 @@ def _wait_for_ci(ref: str, timeout_s: int = 3600) -> None:
 # ---------------------------------------------------------------------------
 
 def _build_image() -> None:
-    """Build the pre-release test image (rust:1.90 + python-casacore + the
-    whole suite).  The .dockerignore excludes target/, .venv/, tests/fixtures/.
+    """Build the pre-release test image (python 3.12 + stable Rust under /opt
+    + python-casacore + the whole suite; it ends as the non-root `tester`).
+    The .dockerignore excludes target/, .venv/, tests/fixtures/.
     """
     with local.cwd(str(REPO)):
         local["docker"]["build", "-t", IMAGE, "."] & FG
@@ -249,20 +250,25 @@ def test(c,
         local["docker"]["run", "--rm", IMAGE, "bash", "-c",
                "rustup toolchain install nightly --component rust-src && "
                "RUSTFLAGS='-Zsanitizer=thread' cargo +nightly -Zbuild-std test "
-               "-p casacure --tests --target x86_64-unknown-linux-gnu"] & FG
+               "-p casacure --tests --target \"$(rustc -vV | sed -n 's/^host: //p')\""] & FG
         print("=== tsan job PASS")
 
     if freethreaded:
         # CI's `freethreaded` job: no-GIL CPython 3.14t + maturin develop +
         # the suite with the GIL off.
         local["docker"]["run", "--rm", IMAGE, "bash", "-c",
-               "pip install uv && uv python install 3.14t && "
-               "uv venv --python 3.14t /opt/venv-ft && "
-               "uv pip install --python /opt/venv-ft/bin/python numpy pytest maturin && "
-               "/opt/venv-ft/bin/maturin develop && "
-               "/opt/venv-ft/bin/python -c \"import casacure, casacure.tables, "
+               # as `tester`: uv in the user site (on PATH, since maturin
+               # installs into the pip-less uv venv with `--uv`), the venv
+               # under $HOME
+               "export PATH=$HOME/.local/bin:$PATH && "
+               "python3 -m pip install --user -q uv && "
+               "uv python install 3.14t && "
+               "uv venv --python 3.14t $HOME/venv-ft && "
+               "uv pip install --python $HOME/venv-ft/bin/python numpy pytest maturin && "
+               "VIRTUAL_ENV=$HOME/venv-ft $HOME/venv-ft/bin/maturin develop --uv && "
+               "$HOME/venv-ft/bin/python -c \"import casacure, casacure.tables, "
                "casacure.quanta, sys; assert not sys._is_gil_enabled()\" && "
-               "PYTHONPATH=tests/shim /opt/venv-ft/bin/python -m pytest tests/ -q"] & FG
+               "PYTHONPATH=tests/shim $HOME/venv-ft/bin/python -m pytest tests/ -q -p no:cacheprovider"] & FG
         print("=== freethreaded job PASS")
 
 
