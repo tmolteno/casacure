@@ -2074,6 +2074,56 @@ impl Table {
         Ok(v.rows[startrow as usize..end as usize].to_vec())
     }
 
+    /// Whether the cell of `col_idx` at `row` holds a value (casacore's
+    /// `TableColumn::isDefined`, the engine under python-casacore's
+    /// `iscelldefined`): a scalar column is defined in every row (the
+    /// `Undefined` option is not modelled — cells read as their default,
+    /// issue #8), a fixed-shape array column likewise (`ColumnDesc::
+    /// isFixedShape` implies a value per row), and a variable-shape array
+    /// cell is defined only when the storage manager holds an array for
+    /// the row (`isShapeDefined`).
+    pub fn is_cell_defined(&self, col_idx: usize, row: u64) -> Result<bool, TableReadError> {
+        if let Some(v) = &self.view {
+            let src = self.view_row(v, col_idx, row)?;
+            return v.source.is_cell_defined(col_idx, src);
+        }
+        // Under the flush gate for reading, like `getcell`.
+        let flush_gate = crate::flushgate::gate(&self.path);
+        let _gate_r = flush_gate.read().unwrap();
+        let src = self.column_source(col_idx)?;
+        let desc = &self.dat.desc.columns[col_idx];
+        self.cell_defined_from(&src, desc, row)
+    }
+
+    /// The storage-level definedness of one cell ([`Table::is_cell_defined`]).
+    fn cell_defined_from(
+        &self,
+        src: &ColumnSource<'_>,
+        desc: &crate::tabledesc::ColumnDesc,
+        row: u64,
+    ) -> Result<bool, TableReadError> {
+        match desc.kind {
+            crate::tabledesc::ColumnKind::Scalar(_) | crate::tabledesc::ColumnKind::Record => {
+                return Ok(true);
+            }
+            crate::tabledesc::ColumnKind::Array => {}
+        }
+        let fixed = desc.shape.as_deref().is_some_and(|s| !s.is_empty());
+        if fixed {
+            return Ok(true);
+        }
+        match *src {
+            ColumnSource::Ssm { file, spec, within } => {
+                crate::ssm::is_array_cell_defined(file, spec, within, desc, row).map_err(Into::into)
+            }
+            // casacure reads IncrementalStMan scalars only (an ISM array
+            // column is not supported on read at all), so every ISM cell
+            // casacure can serve is defined.
+            ColumnSource::Ism { .. } => Ok(true),
+            ColumnSource::Tsm { file } => file.is_cell_defined(desc, row).map_err(Into::into),
+        }
+    }
+
     /// Drop the data files' mapped pages (`MADV_DONTNEED`) after a bulk read
     /// has copied the cell data out, so a long streaming scan (dask-ms
     /// chunked full-column reads) stays resident at ~the current chunk

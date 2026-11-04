@@ -2882,6 +2882,50 @@ impl Table {
         convert::cell_to_py(py, &v)
     }
 
+    /// `iscelldefined(column, rownr)` — whether the cell holds a value
+    /// (issue #32). A scalar or fixed-shape-array cell is defined in every
+    /// row; a variable-shape array cell is defined only when an array was
+    /// written to it (an undefined one reads as its default per issue #8,
+    /// and this is the only way to tell the two apart). A pending buffered
+    /// write counts as defined; a row added but never written reads as the
+    /// schema default, which for a variable-shape column is "no array".
+    fn iscelldefined(&self, column: &str, row: u64) -> PyResult<bool> {
+        self.auto_tick()?;
+        let col_idx = self.col_index(column)?;
+        let inner = self.inner.lock().unwrap();
+        match &*inner {
+            Inner::Read(t) => {
+                let n = t.nrows();
+                if row >= n {
+                    return Err(row_out_of_range(row, n));
+                }
+                t.is_cell_defined(col_idx, row).map_err(err)
+            }
+            Inner::Write { shared, .. } => {
+                let s = shared.lock().unwrap();
+                let n = s.wt.col_len(col_idx) as u64;
+                if row >= n {
+                    return Err(row_out_of_range(row, n));
+                }
+                if s.wt.pending_cell(col_idx, row).is_some() {
+                    return Ok(true);
+                }
+                let desc = &s.wt.desc().columns[col_idx];
+                let variable_array = matches!(desc.kind, core::tabledesc::ColumnKind::Array)
+                    && !desc.shape.as_deref().is_some_and(|sh| !sh.is_empty());
+                if row < s.read.nrows() {
+                    if let Some(di) = disk_col_index(&s, col_idx) {
+                        return s.read.is_cell_defined(di, row).map_err(err);
+                    }
+                }
+                // Not on disk and not pending: the schema default — a real
+                // value for a scalar or fixed-shape column, "no array" for
+                // a variable-shape one.
+                Ok(!variable_array)
+            }
+        }
+    }
+
     /// `getcellslice(column, rownr, blc, trc, inc=[])` — python-casacore's
     /// signature, `inc` included (issue #36: the 5th argument existed only
     /// in python-casacore until now). `blc`/`trc`/`inc` may be bare ints,

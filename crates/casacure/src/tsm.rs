@@ -539,6 +539,13 @@ impl TsmFile {
         }
     }
 
+    /// Whether the cell of `desc` at `row` has a tile (casacore's
+    /// `TiledStMan::isShapeDefined`): a row no cube covers reads as the
+    /// default cell, i.e. "no array".
+    pub fn is_cell_defined(&self, desc: &ColumnDesc, row: u64) -> Result<bool, TsmError> {
+        Ok(self.cell_place(desc, row)?.is_some())
+    }
+
     /// Read the array cell of `desc` (an array column of the hypercolumn)
     /// at `row`, returning the logical shape and values.
     pub fn read_cell(&self, desc: &ColumnDesc, row: u64) -> Result<RecordValue, TsmError> {

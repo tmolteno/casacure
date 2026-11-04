@@ -771,6 +771,54 @@ pub fn direct_cell_bits(desc: &ColumnDesc) -> u64 {
 /// there the record is `[ndim][CASA-order dims][element data]` (with a
 /// reference count in front when the file version > 0) — see
 /// `SSMIndColumn::getShape`/`StIndArray`, `StManArrayFile::getShape`.
+/// Whether a variable-shape array cell holds an array (casacore's storage
+/// `isShapeDefined`, which `ArrayColumnData::isDefined` consults): the cell
+/// reference must be non-empty. A non-string cell is an 8-byte array-index
+/// offset that is 0 (null) when no array was ever written; a string cell a
+/// 12-byte (bucket, offset, len) reference whose len is 0 for "no array".
+/// Fixed-shape columns never reach this probe — casacore reports them
+/// defined in every row.
+pub fn is_array_cell_defined(
+    file: &StandardStManFile,
+    spec: &crate::columnset::StandardStMan,
+    col_idx: usize,
+    desc: &ColumnDesc,
+    row: u64,
+) -> Result<bool, SsmError> {
+    let index_nr = spec
+        .col_index_map
+        .get(col_idx)
+        .copied()
+        .ok_or(SsmError::IndexMissing {
+            index: col_idx,
+            count: spec.col_index_map.len(),
+        })? as usize;
+    let column_offset = spec
+        .column_offset
+        .get(col_idx)
+        .ok_or(SsmError::IndexMissing {
+            index: col_idx,
+            count: spec.column_offset.len(),
+        })?;
+    if desc.data_type == DataType::String {
+        let (cell, _) = file.cell_bytes(index_nr, *column_offset, row, 12)?;
+        let len = if file.header.big_endian {
+            i32::from_be_bytes(cell[8..12].try_into().unwrap())
+        } else {
+            i32::from_le_bytes(cell[8..12].try_into().unwrap())
+        };
+        Ok(len != 0)
+    } else {
+        let (cell, _) = file.cell_bytes(index_nr, *column_offset, row, ARRAY_REF_SIZE)?;
+        let offset = if file.header.big_endian {
+            i64::from_be_bytes(cell[..8].try_into().unwrap())
+        } else {
+            i64::from_le_bytes(cell[..8].try_into().unwrap())
+        };
+        Ok(offset != 0)
+    }
+}
+
 pub fn read_array_cell(
     file: &StandardStManFile,
     spec: &crate::columnset::StandardStMan,

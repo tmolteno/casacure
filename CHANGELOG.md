@@ -7,6 +7,18 @@ subtasks are moved here.
 
 ### Added
 
+- **`iscelldefined(columnname, rownr)`** (issue #32), python-casacore's
+  `table.iscelldefined` — whether a cell holds a value. A scalar or
+  fixed-shape-array cell is defined in every row (matching
+  `ColumnDesc::isFixedShape`); a variable-shape array cell is defined
+  only when the storage manager holds an array for the row
+  (`isShapeDefined`: SSM probes the null/zero-length cell reference,
+  TSM the tile presence). This is the only way a caller can tell an
+  undefined cell from one holding its default value (#8's
+  read-as-defaults convention keeps the read paths uniform). Pending
+  buffered writes count as defined; a row added but never written reads
+  as the schema default — "no array" for a variable-shape column.
+
 - **`table` grows `getcellslicenp` and `putcellslice`** (issue #37) —
   python-casacore's per-cell slice methods, absent from casacure until now,
   so code ported from casacore died with
