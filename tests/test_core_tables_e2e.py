@@ -676,3 +676,37 @@ def test_removerows_errors(tmp_path):
         rw.removerows([5])
     assert rw.nrows() == 2
     rw.close()
+
+
+def test_getcol_refuses_cells_of_different_shapes(tmp_path):
+    """getcol of a variable-shape column whose rows differ raises, as casacore
+    does; it must not cut every row to the first row's shape (issue #25)."""
+    p = str(tmp_path / "ragged.tab")
+    t = table(p, maketabdesc([makearrcoldesc("V", 0.0, ndim=1)]), nrow=3, ack=False)
+    for row in range(3):
+        t.putcell("V", row, np.arange(1.0, row + 2.0))
+    t.close()
+
+    r = table(p, ack=False)
+    with pytest.raises(RuntimeError):
+        r.getcol("V")
+    with pytest.raises(RuntimeError):
+        r.getcol("V", 1, 2)
+    # One row still stacks, and getvarcol keeps every row.
+    np.testing.assert_array_equal(r.getcol("V", 2, 1), [[1.0, 2.0, 3.0]])
+    assert [np.size(v) for v in r.getvarcol("V").values()] == [1, 2, 3]
+    r.close()
+
+
+def test_getcol_stacks_defined_cells_past_an_undefined_one(tmp_path):
+    """An empty (undefined) cell stays exempt from the shape check: it reads as
+    a default (issue #8), it does not make the column ragged."""
+    p = str(tmp_path / "gap.tab")
+    t = table(p, maketabdesc([makearrcoldesc("V", 0.0, ndim=1)]), nrow=3, ack=False)
+    t.putcell("V", 0, np.array([1.0, 2.0]))
+    t.putcell("V", 2, np.array([3.0, 4.0]))
+    t.close()
+
+    r = table(p, ack=False)
+    np.testing.assert_array_equal(r.getcol("V"), [[1.0, 2.0], [0.0, 0.0], [3.0, 4.0]])
+    r.close()

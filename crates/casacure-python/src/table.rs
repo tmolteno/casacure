@@ -739,6 +739,33 @@ fn cell_shape_of(cells: &[RecordValue]) -> Vec<usize> {
         .unwrap_or_default()
 }
 
+/// One stacked array can only hold cells of one shape: refuse a variable-shape
+/// column whose rows differ, as casacore does, rather than cut every row to the
+/// first row's shape. Empty (undefined) cells stay exempt: they read as defaults.
+fn check_cells_conform(cells: &[RecordValue]) -> PyResult<()> {
+    let mut first: Option<&[u32]> = None;
+    for cell in cells {
+        let RecordValue::Array(a) = cell else {
+            continue;
+        };
+        if a.shape.is_empty() || a.shape.contains(&0) {
+            continue;
+        }
+        match first {
+            None => first = Some(&a.shape),
+            Some(shape) if shape != a.shape.as_slice() => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "getcol: cells of shape {shape:?} and {:?} cannot be stacked; \
+                     use getvarcol for a column whose rows differ in shape",
+                    a.shape
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// A short human name for a `RecordValue` variant (for error messages).
 fn value_name(v: &RecordValue) -> &'static str {
     match v {
@@ -3720,6 +3747,7 @@ impl Table {
             }
             return convert::scalars_cells_to_array(py, cells);
         }
+        check_cells_conform(cells)?;
         let cell_shape = cell_shape_of(cells);
         convert::arrays_to_ndarray_getcol(py, cells, &cell_shape)
     }

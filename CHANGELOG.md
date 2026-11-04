@@ -5,6 +5,13 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`getcol` of a variable-shape column whose rows differ in shape raises**
+  (issue #25), as casacore does. It used to cut every row to the first row's
+  shape without a message. Empty (undefined) cells stay exempt and read as
+  defaults (issue #8).
+
 ## [3.8.37] - 2026-11-03
 
 ### Fixed
