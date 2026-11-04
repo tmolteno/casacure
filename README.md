@@ -275,14 +275,18 @@ wheels** for the following matrix:
 | Platform | Architectures | CPython versions |
 |---|---|---|
 | Linux (manylinux) | `x86_64`, `aarch64` | 3.9 – 3.14 |
-| macOS | `aarch64` (Apple Silicon) | 3.10 – 3.14 |
-| Windows (MSVC) | `x86_64` | 3.10 – 3.14 |
+| macOS | `aarch64` (Apple Silicon) | 3.9 – 3.14 |
+| Windows (MSVC) | `x86_64` | 3.9 – 3.14 |
 
 Notes:
 
-- Linux wheels are built from the manylinux image, whose `--find-interpreter`
-  pass covers every supported CPython (3.9–3.14) in a single build per
-  target; the source distribution is produced from the `x86_64` Linux job.
+- One **abi3 wheel per platform** (the CPython limited API, targeting 3.9):
+  `casacure-<version>-cp39-abi3-...` installs on every CPython from 3.9
+  upward, on every platform — there is no per-CPython-version matrix to
+  drift out of sync with this table. Linux additionally ships a
+  free-threaded (`cp314t`) wheel. PyPy is not built (PyPy does not
+  implement the stable ABI); the source distribution covers it, and is
+  produced from the `x86_64` Linux job.
 - Intel-macOS (`x86_64`) wheels are deliberately not built: GitHub no longer
   hosts Intel-mac runners. Intel Mac users install the source distribution,
   which still needs only Rust + maturin — no C++.

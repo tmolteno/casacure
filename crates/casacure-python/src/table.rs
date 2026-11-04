@@ -4929,7 +4929,7 @@ impl Table {
             }
             return Err(PyTypeError::new_err(format!(
                 "putcol: unsupported array data {}",
-                value.getattr("dtype")?.str()?.to_str()?
+                value.getattr("dtype")?.str()?.to_cow()?
             )));
         }
         // Scalar column: 1-D array (or list/tuple) of scalars. Each element

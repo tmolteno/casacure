@@ -16,5 +16,12 @@ crate-type = ["cdylib"]
 
 [dependencies]
 casacure = { workspace = true }
+# The PyPI wheels are abi3 (one limited-API wheel per platform covers every
+# CPython >= 3.9, issue #39) — but the abi3-py39 feature is passed by
+# .github/workflows/publish-python.yml (`--features pyo3/abi3-py39`) rather
+# than set here: with the feature on, maturin tags a free-threaded (3.14t)
+# build cp39-abi3 instead of cp314-cp314t, so the cp314t wheel build must
+# not carry it. Dev builds stay full-ABI. The NumPy C-API is resolved at
+# runtime by rust-numpy either way, so the abi3 wheel runs on numpy 1.x/2.x.
 pyo3 = { version = "0.27", features = ["extension-module"] }
 numpy = "0.27"

@@ -169,7 +169,7 @@ pub(crate) fn fill_buffer_by_dtype(
     fill_num!(Complex32, c32_of, scalar_c32);
     Err(PyTypeError::new_err(format!(
         "getcolnp: unsupported buffer dtype {}",
-        buf.getattr("dtype")?.str()?.to_str()?
+        buf.getattr("dtype")?.str()?.to_cow()?
     )))
 }
 
@@ -732,7 +732,7 @@ pub(crate) fn pyobject_to_record(py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResu
         return Ok(RecordValue::Bool(v.is_truthy()?));
     }
     if let Ok(s) = v.cast::<PyString>() {
-        return Ok(RecordValue::String(s.to_str()?.to_string()));
+        return Ok(RecordValue::String(s.to_cow()?.into_owned()));
     }
     // Integers (python ints and numpy integer scalars, which expose
     // `__index__`).
@@ -880,7 +880,7 @@ pub(crate) fn pyobject_to_record(py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResu
             data: ArrayData::String(s),
         }));
     }
-    Ok(RecordValue::String(v.str()?.to_str()?.to_string()))
+    Ok(RecordValue::String(v.str()?.to_cow()?.into_owned()))
 }
 
 fn list_to_array(py: Python<'_>, list: &Bound<'_, PyList>) -> PyResult<RecordValue> {

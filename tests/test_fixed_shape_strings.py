@@ -174,6 +174,7 @@ def _casacure_write(path, options, shape, nrow=3):
 
 @pytest.mark.parametrize("options", [0, 1, 4, 5])
 @pytest.mark.parametrize("shape", [[2], [4], [2, 3]])
+@needs_casacore
 def test_casacore_written_fixed_shape_strings_read(tmp_path, options, shape):
     """#24: a fixed-shape string column written by casacore reads."""
     path = str(tmp_path / f"c{options}_{'x'.join(map(str, shape))}.tab")
@@ -184,6 +185,7 @@ def test_casacore_written_fixed_shape_strings_read(tmp_path, options, shape):
 
 @pytest.mark.parametrize("options", [0, 1, 4, 5])
 @pytest.mark.parametrize("shape", [[2], [4], [2, 3]])
+@needs_casacore
 def test_casacure_written_fixed_shape_strings_read_by_casacore(tmp_path,
                                                                options,
                                                                shape):
@@ -205,6 +207,7 @@ def test_casacure_written_fixed_shape_strings_read_by_casacore(tmp_path,
     )
 
 
+@needs_casacore
 def test_unwritten_fixed_shape_string_row_reads_as_defaults(tmp_path):
     """A never-written cell reads as the column shape filled with "" in
     both libraries (casacore: filled flag 0 -> emptyString per element)."""

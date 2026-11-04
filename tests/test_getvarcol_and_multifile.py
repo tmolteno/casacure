@@ -35,8 +35,11 @@ def _real_casacore_env(home):
 
 
 def _real_casacore_available():
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)  # drop tests/shim: the shim would stand in
     r = subprocess.run(
         [sys.executable, "-c", "import casacore.tables"],
+        env=env,
         capture_output=True,
     )
     return r.returncode == 0

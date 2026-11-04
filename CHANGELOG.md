@@ -5,6 +5,24 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Changed
+
+- **One abi3 wheel per platform** (issue #39): the PyPI wheels are now
+  built against CPython's stable ABI (`pyo3/abi3-py39`), tagged
+  `cp39-abi3` — a single wheel per platform installs on every CPython
+  from 3.9 upward, replacing the per-CPython-version matrix (and with it
+  the per-version drift class that produced issue #35). macOS and
+  Windows now cover 3.9 too. The publish workflow shrinks from twelve
+  build jobs to six. Linux additionally ships the free-threaded
+  `cp314-cp314t` wheel (built without the abi3 feature: with it on,
+  maturin tags the 3.14t build cp39-abi3 — the feature is passed per
+  build in `publish-python.yml`, never set in Cargo.toml, and
+  `tests/test_publish_workflow.py` pins both halves). PyPy wheels are no
+  longer built — PyPy does not implement the stable ABI; the sdist
+  covers it. The NumPy C-API is resolved at runtime by rust-numpy, so
+  the abi3 wheel runs on numpy 1.x and 2.x alike (verified on 3.10 with
+  numpy 1.26 and 2.2).
+
 ## [3.8.38] - 2026-11-05
 
 ### Added

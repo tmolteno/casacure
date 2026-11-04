@@ -8,9 +8,9 @@
 #   * Workflow:    Publish Python package   (this workflow's `name:`)
 #   * Environment: pypi                    (this workflow's environment)
 #
-# After that, every `v*` tag push (or manual dispatch) builds wheels for all
-# supported platforms and CPython versions (3.9 through 3.14) and uploads
-# them to the `casacure` project.
+# After that, every `v*` tag push (or manual dispatch) builds one abi3 wheel
+# per platform (covering every CPython >= 3.9) plus the Linux-only
+# free-threaded wheel, and uploads them to the `casacure` project.
 name: Publish Python package
 
 on:
@@ -24,16 +24,26 @@ permissions:
 jobs:
   # Cross-compile a wheel per platform/ABI.
   #
-  # Linux: the manylinux image bundles every supported CPython (3.9-3.14), so
-  # `--find-interpreter` covers all ABIs in one job per target; the sdist is
-  # produced exactly once (the x86_64 Linux job).
+  # One abi3 wheel per platform (issue #39): the `pyo3/abi3-py39` feature
+  # targets the 3.9 limited API, so the wheel is tagged cp39-abi3 and covers
+  # every CPython >= 3.9 — no per-version matrix, and the per-version gaps
+  # that produced issue #35 are structurally impossible. The feature is
+  # passed per build, NOT set in Cargo.toml: with it on, maturin tags a
+  # free-threaded (3.14t) build cp39-abi3 instead of cp314-cp314t (pyo3
+  # compiles a correct version-specific artifact but the wheel tag is
+  # wrong), so the cp314t build must not carry it. PyPy does not support
+  # abi3 and is not built (sdist fallback; interpreters are explicit so the
+  # manylinux image's PyPy is never picked up).
   #
-  # macOS: one job per CPython version on arm64 runners (3.10-3.14; 3.9 is
-  # provided on Linux via manylinux). Intel-macOS (x86_64) wheels are not
-  # built: GitHub no longer hosts Intel-mac runners; Intel Mac users install
-  # the source distribution instead.
+  # Linux: the manylinux image's python3.14 builds the abi3 wheel (one per
+  # architecture) and python3.14t the free-threaded one; the sdist is
+  # produced exactly once (the x86_64 abi3 job).
+  #
+  # macOS: one abi3 job on an arm64 runner. Intel-macOS (x86_64) wheels are
+  # not built: GitHub no longer hosts Intel-mac runners; Intel Mac users
+  # install the source distribution instead.
   build:
-    name: Build wheels (${{ matrix.target }} ${{ matrix.python || 'manylinux' }})
+    name: Build wheels (${{ matrix.target }} ${{ matrix.interpreters || matrix.python || 'manylinux' }})
     strategy:
       fail-fast: false
       matrix:
@@ -41,57 +51,50 @@ jobs:
           - platform: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             manylinux: auto
+            interpreters: "python3.14"
+            abi3: true
             sdist: true
+          - platform: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: auto
+            interpreters: "python3.14t"
           - platform: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             manylinux: auto
-            sdist: false
+            interpreters: "python3.14"
+            abi3: true
+          - platform: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            manylinux: auto
+            interpreters: "python3.14t"
           - platform: macos-14
             target: aarch64-apple-darwin
-            python: "3.10"
-          - platform: macos-14
-            target: aarch64-apple-darwin
-            python: "3.11"
-          - platform: macos-14
-            target: aarch64-apple-darwin
-            python: "3.12"
-          - platform: macos-14
-            target: aarch64-apple-darwin
-            python: "3.13"
-          - platform: macos-14
-            target: aarch64-apple-darwin
-            python: "3.14"
+            abi3: true
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
-            python: "3.10"
-          - platform: windows-latest
-            target: x86_64-pc-windows-msvc
-            python: "3.11"
-          - platform: windows-latest
-            target: x86_64-pc-windows-msvc
-            python: "3.12"
-          - platform: windows-latest
-            target: x86_64-pc-windows-msvc
-            python: "3.13"
-          - platform: windows-latest
-            target: x86_64-pc-windows-msvc
-            python: "3.14"
+            abi3: true
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          # Linux uses the full interpreter set inside the manylinux image;
-          # macOS/Windows select one per matrix entry.
+          # Linux uses the interpreters inside the manylinux image
+          # (`--interpreter`); macOS/Windows build against this 3.12 — the
+          # abi3 wheel still targets the 3.9 limited API.
           python-version: ${{ matrix.python || '3.12' }}
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
-          # --sdist on the x86_64 manylinux job produces the source
+          # --sdist on the x86_64 manylinux abi3 job produces the source
           # distribution (maturin-action has no 'sdist' input).
-          args: --release --out dist --find-interpreter ${{ matrix.sdist && '--sdist' || '' }}
+          args: >-
+            --release
+            --out dist
+            ${{ matrix.sdist && '--sdist' || '' }}
+            ${{ matrix.interpreters && format('--interpreter {0}', matrix.interpreters) || '--find-interpreter' }}
+            ${{ matrix.abi3 && '--features pyo3/abi3-py39' || '' }}
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -99,7 +102,7 @@ jobs:
           # are unreliable (only one job's files survive), and the download
           # 'merge-multiple' merge corrupts wheels on twine upload — so keep
           # artifact files byte-identical and flatten them in the publish job.
-          name: dist-${{ matrix.target }}-${{ matrix.python || 'ml' }}
+          name: dist-${{ matrix.target }}-${{ matrix.interpreters || matrix.python || 'ml' }}
           path: dist
           if-no-files-found: error
 
