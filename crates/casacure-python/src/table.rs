@@ -2548,20 +2548,25 @@ impl Table {
     /// `getcolslice(column, blc, trc, inc=[], startrow=0, nrow=-1, rowincr=1)`
     /// (python-casacore's signature). The legacy 5-argument casacure form
     /// `(column, blc, trc, startrow, nrow)` is also accepted (a positional
-    /// `inc` that is an integer means `startrow`).
+    /// `inc` that is an integer means `startrow`). `blc`/`trc` may be a
+    /// bare int, as in python-casacore: a length-1 `IPosition`, which
+    /// selects a whole 1-D cell and fails in the slicer (a `RuntimeError`)
+    /// on any other rank (issue #36).
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (column, blc, trc, inc = None, startrow = 0, nrow = -1, rowincr = 1))]
     fn getcolslice(
         &self,
         py: Python<'_>,
         column: &str,
-        blc: Vec<i64>,
-        trc: Vec<i64>,
+        blc: &Bound<'_, PyAny>,
+        trc: &Bound<'_, PyAny>,
         inc: Option<Bound<'_, PyAny>>,
         mut startrow: i64,
         mut nrow: i64,
         rowincr: i64,
     ) -> PyResult<Py<PyAny>> {
+        let blc = slice_arg(blc, "getcolslice blc")?;
+        let trc = slice_arg(trc, "getcolslice trc")?;
         let inc_v = split_inc_startrow_nrow(inc, &mut startrow, &mut nrow)?;
         let _ = rowincr;
         self.auto_tick()?;
@@ -2582,6 +2587,7 @@ impl Table {
     /// rowincr=1)` (python-casacore's signature). The legacy 5-argument
     /// casacure form `(column, buf, blc, trc, startrow, nrow)` is also
     /// accepted (a positional `inc` that is an integer means `startrow`).
+    /// `blc`/`trc` may be a bare int, as in python-casacore (issue #36).
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (column, buf, blc, trc, inc = None, startrow = 0, nrow = -1, rowincr = 1))]
     fn getcolslicenp(
@@ -2589,13 +2595,15 @@ impl Table {
         py: Python<'_>,
         column: &str,
         buf: &Bound<'_, PyAny>,
-        blc: Vec<i64>,
-        trc: Vec<i64>,
+        blc: &Bound<'_, PyAny>,
+        trc: &Bound<'_, PyAny>,
         inc: Option<Bound<'_, PyAny>>,
         mut startrow: i64,
         mut nrow: i64,
         rowincr: i64,
     ) -> PyResult<()> {
+        let blc = slice_arg(blc, "getcolslicenp blc")?;
+        let trc = slice_arg(trc, "getcolslicenp trc")?;
         let inc_v = split_inc_startrow_nrow(inc, &mut startrow, &mut nrow)?;
         let _ = rowincr;
         self.auto_tick()?;
@@ -2669,17 +2677,32 @@ impl Table {
         convert::cell_to_py(py, &v)
     }
 
+    /// `getcellslice(column, rownr, blc, trc, inc=[])` — python-casacore's
+    /// signature, `inc` included (issue #36: the 5th argument existed only
+    /// in python-casacore until now). `blc`/`trc`/`inc` may be bare ints,
+    /// as in python-casacore: length-1 `IPosition`s that work on a 1-D
+    /// cell and fail in the slicer (a `RuntimeError`) on any other rank.
+    /// There is no legacy form to disambiguate here, so an integer `inc`
+    /// is the stride, like casacore's.
+    #[pyo3(signature = (column, row, blc, trc, inc = None))]
     fn getcellslice(
         &self,
         py: Python<'_>,
         column: &str,
         row: u64,
-        blc: Vec<i64>,
-        trc: Vec<i64>,
+        blc: &Bound<'_, PyAny>,
+        trc: &Bound<'_, PyAny>,
+        inc: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
+        let blc = slice_arg(blc, "getcellslice blc")?;
+        let trc = slice_arg(trc, "getcellslice trc")?;
+        let inc_v = match inc {
+            Some(v) => slice_arg(&v, "getcellslice inc")?,
+            None => Vec::new(),
+        };
         self.auto_tick()?;
         let col_idx = self.col_index(column)?;
-        let v = self.read_cellslice(col_idx, row, &blc, &trc, &[])?;
+        let v = self.read_cellslice(col_idx, row, &blc, &trc, &inc_v)?;
         convert::cell_to_py(py, &v)
     }
 
@@ -2967,20 +2990,32 @@ impl Table {
         Ok(())
     }
 
-    /// `putcolslice(column, value, blc, trc, startrow, nrow)`.
+    /// `putcolslice(column, value, blc, trc, inc=[], startrow=0, nrow=-1,
+    /// rowincr=1)` — python-casacore's signature, `inc` and `rowincr`
+    /// included (issue #36). The legacy 6-argument casacure form
+    /// `(column, value, blc, trc, startrow, nrow)` keeps working: a
+    /// positional integer in the `inc` slot means `startrow`, exactly as
+    /// in `getcolslice` (`tests/test_subcell_tiles.py` uses it).
+    /// `blc`/`trc` may be bare ints, as in python-casacore. `rowincr` is
+    /// accepted but not honoured, like casacure's other slice methods.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (column, value, blc, trc, startrow = 0, nrow = 0))]
+    #[pyo3(signature = (column, value, blc, trc, inc = None, startrow = 0, nrow = 0, rowincr = 1))]
     fn putcolslice(
         &self,
         py: Python<'_>,
         column: &str,
         value: &Bound<'_, PyAny>,
-        blc: Vec<i64>,
-        trc: Vec<i64>,
-        startrow: i64,
-        nrow: i64,
+        blc: &Bound<'_, PyAny>,
+        trc: &Bound<'_, PyAny>,
+        inc: Option<Bound<'_, PyAny>>,
+        mut startrow: i64,
+        mut nrow: i64,
+        rowincr: i64,
     ) -> PyResult<()> {
-        let _ = py;
+        let blc = slice_arg(blc, "putcolslice blc")?;
+        let trc = slice_arg(trc, "putcolslice trc")?;
+        let inc_v = split_inc_startrow_nrow(inc, &mut startrow, &mut nrow)?;
+        let _ = rowincr;
         let col_idx = self.col_index(column)?;
         let startrow = startrow.max(0) as u64;
         let nrow = if nrow <= 0 {
@@ -2988,14 +3023,17 @@ impl Table {
         } else {
             nrow as u64
         };
-        // Full-cell slice (blc=0.., trc=-1) -> plain putcol.
-        let full =
-            blc.iter().all(|&b| b <= 0) && trc.len() == blc.len() && trc.iter().all(|&t| t < 0);
+        // Full-cell slice (blc=0.., trc=-1, unit stride) -> plain putcol.
+        let full = blc.iter().all(|&b| b <= 0)
+            && trc.len() == blc.len()
+            && trc.iter().all(|&t| t < 0)
+            && (inc_v.is_empty() || inc_v.iter().all(|&s| s == 1));
         if full {
             return self.putcol(py, column, value, startrow as i64, nrow as i64);
         }
         // Overlay `value[nrow, sub...]` into each fixed cell at logical
-        // blc..trc. The numpy array is `(nrow, s0, s1, ...)` in C order.
+        // blc..trc stepping inc. The numpy array is `(nrow, s0, s1, ...)` in
+        // C order.
         let flat = convert::numpy_to_record_flat(value)
             .ok_or_else(|| PyTypeError::new_err("putcolslice: unsupported element type"))??;
         let shape_obj = value.getattr("shape")?;
@@ -3004,16 +3042,50 @@ impl Table {
             return Err(PyValueError::new_err("putcolslice: empty value"));
         }
         let sub: Vec<usize> = shape[1..].to_vec();
+        // casacore's Slicer refuses corners whose ranks differ from each
+        // other or from the cell ("Shape IPosition-lengths differ from
+        // ndim()").  Without this the starts[k]/ends[k] indexing below
+        // panics across the FFI boundary when the value carries more
+        // dimensions than the corners — a wrong-rank putcolslice was a
+        // `PanicException`, not an error (issue #36).
+        if blc.len() != trc.len() {
+            return Err(PyRuntimeError::new_err(format!(
+                "putcolslice: blc {blc:?} and trc {trc:?} lengths differ \
+                 (casacore: Slicer error: IPosition-lengths differ)"
+            )));
+        }
+        if sub.len() > blc.len() {
+            return Err(PyRuntimeError::new_err(format!(
+                "putcolslice: value slice rank {} does not fit the corner rank {} \
+                 (casacore: Slicer error: Shape IPosition-lengths differ from ndim())",
+                sub.len(),
+                blc.len()
+            )));
+        }
+        if !inc_v.is_empty() && inc_v.len() != blc.len() {
+            return Err(PyRuntimeError::new_err(format!(
+                "putcolslice: inc {inc_v:?} and blc {blc:?} lengths differ \
+                 (casacore: Slicer error: IPosition-lengths differ)"
+            )));
+        }
+        // Per-dimension stride: empty inc means 1 everywhere, as in
+        // python-casacore.  Indexed by the value's sub-rank, which the
+        // checks above bound by the corner rank.
+        let steps: Vec<usize> = (0..sub.len())
+            .map(|k| inc_v.get(k).map(|&s| s.max(1) as usize).unwrap_or(1))
+            .collect();
         let sub_cell = sub.iter().product::<usize>().max(1);
         let starts: Vec<usize> = blc.iter().map(|&b| b.max(0) as usize).collect();
-        // inclusive full-cell ends; -1 means "to the end of the sub-slice".
+        // inclusive ends reached by stepping from the start; -1 means "to
+        // the end of the sub-slice".
         let ends: Vec<usize> = trc
             .iter()
             .zip(starts.iter())
             .zip(sub.iter())
-            .map(|((&t, &s), &subd)| {
+            .zip(steps.iter())
+            .map(|(((&t, &s), &subd), &step)| {
                 if t < 0 {
-                    s + subd - 1
+                    s + (subd - 1) * step
                 } else {
                     t.max(0) as usize
                 }
@@ -3054,11 +3126,12 @@ impl Table {
                 let mut loc = vec![0usize; coords.len()];
                 for k in 0..coords.len() {
                     let s = starts[k];
-                    let span = ends[k].saturating_sub(s) + 1;
+                    let step = steps[k];
+                    let span = ends[k].saturating_sub(s) / step + 1;
                     if coords[k] >= span {
                         continue;
                     }
-                    loc[k] = s + coords[k];
+                    loc[k] = s + coords[k] * step;
                 }
                 let lf = convert::flatten_coords(&loc, &cshape);
                 if lf < grid.len() && base + idx < flat.len() {
@@ -3763,9 +3836,32 @@ impl Table {
     }
 }
 
-/// Interpret the `inc` argument of `getcolslice`/`getcolslicenp`, which is
-/// either python-casacore's per-dimension step (`inc=[]`, a sequence of
-/// ints) or — in the legacy 5-argument casacure form
+/// One corner (`blc`, `trc`) or stride (`inc`) argument of the slice APIs.
+/// python-casacore's binding takes an `IPosition` and converts a bare
+/// integer to a length-1 one — which selects a whole 1-D cell and, on any
+/// other rank, fails inside the `Slicer` with a `RuntimeError`
+/// (`Shape IPosition-lengths differ from ndim()`), never a `TypeError`
+/// (issue #36: casacore used to reject the scalar before any slicing
+/// happened, which casacore callers catching `RuntimeError` never see).  A
+/// sequence is taken as-is; anything that is neither (float, str, None) is
+/// an argument error, as in casacore — whose `ArgumentError` subclasses
+/// `TypeError`.
+fn slice_arg(arg: &Bound<'_, PyAny>, name: &str) -> PyResult<Vec<i64>> {
+    if let Ok(seq) = arg.extract::<Vec<i64>>() {
+        return Ok(seq);
+    }
+    if let Ok(n) = arg.extract::<i64>() {
+        return Ok(vec![n]);
+    }
+    Err(PyTypeError::new_err(format!(
+        "{name} must be a sequence of ints or an int \
+         (python-casacore converts a bare int to a length-1 IPosition)"
+    )))
+}
+
+/// Interpret the `inc` argument of `getcolslice`/`getcolslicenp`/
+/// `putcolslice`, which is either python-casacore's per-dimension step
+/// (`inc=[]`, a sequence of ints) or — in the legacy casacure form
 /// `(column, blc, trc, startrow, nrow)` — an integer that is really
 /// `startrow`. Returns the step sequence and, for the legacy form, shifts
 /// `startrow`/`nrow` into their python-casacore positions.
@@ -3790,7 +3886,7 @@ fn split_inc_startrow_nrow(
         return Ok(Vec::new());
     }
     Err(PyTypeError::new_err(
-        "getcolslice/getcolslicenp inc must be a sequence of ints (python-casacore) or an int (legacy casacure startrow)",
+        "slice inc must be a sequence of ints (python-casacore) or an int (legacy casacure startrow)",
     ))
 }
 

@@ -11,6 +11,28 @@ subtasks are moved here.
   (issue #25), as casacore does. It used to cut every row to the first row's
   shape without a message. Empty (undefined) cells stay exempt and read as
   defaults (issue #8).
+- **The slice APIs take python-casacore's scalar `blc`/`trc`/`inc`;
+  `getcellslice` grows `inc`, `putcolslice` grows `inc`/`rowincr` and
+  refuses wrong-rank slices instead of panicking** (issue #36).  A bare int
+  becomes a length-1 `IPosition` like casacore's — `int`, `bool`, numpy
+  integers and 0-d integer arrays, all verified against python-casacore
+  3.8.1 — selecting a whole 1-D cell, and failing *in the slicer*: a
+  `RuntimeError` on any other rank, where casacure used to raise `TypeError`
+  before slicing started, invisible to the callers that catch `RuntimeError`
+  (casacore's idiom).  `float`/`str`/`None` keep raising `TypeError`, which
+  matches casacore's `ArgumentError` (a `TypeError` subclass).  `getcellslice`
+  had no `inc` parameter and `putcolslice` neither `inc` nor `rowincr`, so
+  python-casacore's documented forms failed on arity alone; casacure's
+  documented legacy positional form (an integer in the `inc` slot means
+  `startrow`) keeps working through the shared `split_inc_startrow_nrow`, so
+  `tests/test_subcell_tiles.py`'s `putcolslice(col, val, blc, trc, startrow,
+  nrow)` is unaffected.  `putcolslice` now checks the corner/value ranks
+  before its overlay loop — a wrong-rank slice used to panic across the FFI
+  boundary (`PanicException: index out of bounds`) where casacore raises
+  `Slicer error:Shape IPosition-lengths differ from ndim()` — and honours
+  `inc` as the per-dimension stride of the write, reproducing casacore's
+  strided result (`[[9, 2, 9, 4], ...]`) exactly.  Tests:
+  `tests/test_slice_arguments.py` (10).
 
 ### Tests
 
