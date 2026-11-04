@@ -1414,6 +1414,43 @@ user,usernoread,permanent,permanentwait"
         }
     }
 
+    /// Validate a normalized slice request against casacore's rules
+    /// (issue #38): the column must be an array column — every casacore
+    /// slice entry point refuses a scalar one, with any corners — and the
+    /// corners must not be empty: an `IPosition` of length 0 never matches
+    /// a cell's `ndim()`, so casacore raises its `Slicer` rank error where
+    /// casacure's core would read the empty slice as "the whole cell".
+    /// The whole-cell reading stays an *internal* idiom — the `-1` corner
+    /// conversion in `read_cellslice` feeds it and dask-ms's `(-1, ..)`
+    /// whole-cell idiom relies on it — only the Python-visible empty
+    /// corners are refused here.
+    fn check_slice_request(
+        &self,
+        name: &str,
+        column: &str,
+        col_idx: usize,
+        blc: &[i64],
+        trc: &[i64],
+    ) -> PyResult<()> {
+        let desc = self.desc();
+        if !matches!(
+            desc.columns[col_idx].kind,
+            core::tabledesc::ColumnKind::Array
+        ) {
+            return Err(PyRuntimeError::new_err(format!(
+                "{name}: column {column} is not an array column \
+                 (casacore: TableProxy::getColumnSlice: column {column} is not an array column)"
+            )));
+        }
+        if blc.is_empty() || trc.is_empty() {
+            return Err(PyRuntimeError::new_err(format!(
+                "{name}: empty blc/trc do not match the cell rank \
+                 (casacore: Slicer error: Shape IPosition-lengths differ from ndim())"
+            )));
+        }
+        Ok(())
+    }
+
     fn row_count(&self) -> u64 {
         let inner = self.inner.lock().unwrap();
         match &*inner {
@@ -1477,6 +1514,157 @@ fn zero_elements(dt: DataType, n: usize) -> core::record::ArrayData {
 
 #[pymethods]
 impl Table {
+    /// `putkeyword(name, value)`.
+    fn putkeyword(&self, py: Python<'_>, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let rec = keyword_value(py, value)?;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            match &mut *inner {
+                Inner::Write { shared, .. } => {
+                    let mut s = shared.lock().unwrap();
+                    s.wt.putkeyword(name, rec);
+                    s.dirty = true;
+                }
+                _ => return Err(not_writable(self.view)),
+            }
+        }
+        Ok(())
+    }
+
+    /// `putkeywords(dict)`.
+    fn putkeywords(&self, py: Python<'_>, dict: &Bound<'_, PyDict>) -> PyResult<()> {
+        for (k, v) in dict.iter() {
+            let name = k.extract::<String>()?;
+            self.putkeyword(py, &name, &v)?;
+        }
+        Ok(())
+    }
+
+    /// `removekeyword(name)`.
+    fn removekeyword(&self, name: &str) -> PyResult<()> {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            match &mut *inner {
+                Inner::Write { shared, .. } => {
+                    let mut s = shared.lock().unwrap();
+                    s.wt.removekeyword(name);
+                    s.dirty = true;
+                }
+                _ => return Err(not_writable(self.view)),
+            }
+        }
+        Ok(())
+    }
+
+    /// `putcolkeyword(column, name, value)`.
+    fn putcolkeyword(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        name: &str,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let col_idx = self.col_index(column)?;
+        let rec = convert::pyobject_to_record(py, value)?;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            match &mut *inner {
+                Inner::Write { shared, .. } => {
+                    let mut s = shared.lock().unwrap();
+                    s.wt.putcolkeyword(col_idx, name, rec).map_err(err)?;
+                    s.dirty = true;
+                }
+                _ => return Err(not_writable(self.view)),
+            }
+        }
+        Ok(())
+    }
+
+    /// `putcolkeywords(column, dict)`.
+    fn putcolkeywords(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        dict: &Bound<'_, PyDict>,
+    ) -> PyResult<()> {
+        for (k, v) in dict.iter() {
+            let name = k.extract::<String>()?;
+            self.putcolkeyword(py, column, &name, &v)?;
+        }
+        Ok(())
+    }
+
+    /// `removecolkeyword(column, name)`.
+    fn removecolkeyword(&self, column: &str, name: &str) -> PyResult<()> {
+        let col_idx = self.col_index(column)?;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            match &mut *inner {
+                Inner::Write { shared, .. } => {
+                    let mut s = shared.lock().unwrap();
+                    s.wt.removecolkeyword(col_idx, name).map_err(err)?;
+                    s.dirty = true;
+                }
+                _ => return Err(not_writable(self.view)),
+            }
+        }
+        Ok(())
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __exit__(
+        &self,
+        _ty: Option<Py<PyAny>>,
+        _value: Option<Py<PyAny>>,
+        _tb: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        // python-casacore's `with table(...)` closes (flushing) on exit.
+        self.flush()?;
+        Ok(())
+    }
+
+    /// Private python-casacore `table._getdesc(actual=True)` — the full
+    /// table-description dict. dask-ms calls it for keyword reads.
+    #[pyo3(signature = (actual = true))]
+    fn _getdesc(&self, py: Python<'_>, actual: bool) -> PyResult<Py<PyAny>> {
+        let _ = actual;
+        let desc = self.desc();
+        let base = self.dir_of();
+        Ok(desc_to_pydict(py, &desc, Some(&base))?.into_any().unbind())
+    }
+
+    /// `t[key]` — python-casacore's `table.__getitem__`: an integer key is a
+    /// row number (returns the row's values as a dict `{colname: value}`);
+    /// a string key is a column name (returns the column as an array).
+    fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        // Column-name form: t["DATA"].
+        if let Ok(name) = key.extract::<String>() {
+            return self.getcol(py, &name, 0, -1, 1);
+        }
+        // Row form: t[0] -> {colname: value} for that row.
+        let row: i64 = key.extract().map_err(|_| {
+            PyTypeError::new_err("table key must be a column name (str) or a row number (int)")
+        })?;
+        let desc = self.desc();
+        let d = PyDict::new(py);
+        for (i, cd) in desc.columns.iter().enumerate() {
+            let v = self.read_cell(i, row.max(0) as u64)?;
+            let base = self.dir_of();
+            let v = convert::cell_to_py(py, &v)?;
+            let _ = &base;
+            d.set_item(&cd.name, v)?;
+        }
+        Ok(d.into_any().unbind())
+    }
+
+    /// `len(t)` — the number of rows (python-casacore's `table.__len__`).
+    fn __len__(&self) -> PyResult<usize> {
+        Ok(self.nrows()? as usize)
+    }
+
     #[getter]
     fn get_name(&self) -> PyResult<String> {
         Ok(self.path.clone())
@@ -2578,6 +2766,7 @@ impl Table {
             nrow as u64
         };
         let col_idx = self.col_index(column)?;
+        self.check_slice_request("getcolslice", column, col_idx, &blc, &trc)?;
         let cells =
             py.detach(|| self.read_colslice(col_idx, &blc, &trc, &inc_v, startrow, nrow))?;
         self.column_to_python(py, col_idx, &cells)
@@ -2615,6 +2804,7 @@ impl Table {
             nrow as u64
         };
         let col_idx = self.col_index(column)?;
+        self.check_slice_request("getcolslicenp", column, col_idx, &blc, &trc)?;
         // Whole-cell fast path (DDFacet's chunk reader lives here): a slice
         // that covers the fixed cell on a raw-supported column fills the
         // buffer straight from the data files, one memcpy per row.  The
@@ -2631,15 +2821,30 @@ impl Table {
         };
         if let Some(t) = &read_table {
             let desc = &t.dat.desc.columns[col_idx];
-            if slice_is_whole_cell(&blc, &trc, &inc_v, desc)
-                && t.raw_column_supported(col_idx)
-                && fill_numpy_raw(py, t, col_idx, startrow, nrow, buf)?
-            {
-                return Ok(());
+            if slice_is_whole_cell(&blc, &trc, &inc_v, desc) {
+                // A whole-cell slice fills (nrow, cell...) logical: pin the
+                // buffer to exactly that shape before the raw write
+                // (casacore's conformance, issue #38 — it raises for a
+                // buffer too big, too small, or with the wrong row count,
+                // where casacure used to fill whatever overlapped).
+                if let Some(s) = &desc.shape {
+                    let mut expected = vec![nrow as usize];
+                    expected.extend(s.iter().rev().map(|&d| d.max(0) as usize));
+                    check_buf_shape(buf, &expected, "getcolslicenp", column)?;
+                }
+                if t.raw_column_supported(col_idx)
+                    && fill_numpy_raw(py, t, col_idx, startrow, nrow, buf)?
+                {
+                    return Ok(());
+                }
             }
         }
         let cells =
             py.detach(|| self.read_colslice(col_idx, &blc, &trc, &inc_v, startrow, nrow))?;
+        // The same conformance for the per-cell path (issue #38).
+        let mut expected = vec![nrow as usize];
+        expected.extend(cell_shape_of(&cells));
+        check_buf_shape(buf, &expected, "getcolslicenp", column)?;
         let cell = cell_shape_of(&cells).iter().product::<usize>().max(1);
         convert::fill_buffer_by_dtype(py, buf, &cells, cell)
     }
@@ -2702,8 +2907,104 @@ impl Table {
         };
         self.auto_tick()?;
         let col_idx = self.col_index(column)?;
+        self.check_slice_request("getcellslice", column, col_idx, &blc, &trc)?;
         let v = self.read_cellslice(col_idx, row, &blc, &trc, &inc_v)?;
         convert::cell_to_py(py, &v)
+    }
+
+    /// `getcellslicenp(column, buf, rownr, blc, trc, inc=[])` —
+    /// python-casacore's signature (issue #37: it did not exist at all
+    /// until now): fill `buf` from one cell's slice and return `None`.
+    /// The buffer carries the *slice's* shape — no leading row axis, unlike
+    /// `getcolslicenp` — and must match it exactly (casacore's
+    /// `ArrayColumn::getSlice` conformance, issue #38) and be C-contiguous
+    /// (`ValueError`, as `getcolslicenp` already raises).  `blc`/`trc`/
+    /// `inc` take the scalar-corner rules of issue #36.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (column, buf, row, blc, trc, inc = None))]
+    fn getcellslicenp(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        buf: &Bound<'_, PyAny>,
+        row: u64,
+        blc: &Bound<'_, PyAny>,
+        trc: &Bound<'_, PyAny>,
+        inc: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let blc = slice_arg(blc, "getcellslicenp blc")?;
+        let trc = slice_arg(trc, "getcellslicenp trc")?;
+        let inc_v = match inc {
+            Some(v) => slice_arg(&v, "getcellslicenp inc")?,
+            None => Vec::new(),
+        };
+        self.auto_tick()?;
+        let col_idx = self.col_index(column)?;
+        self.check_slice_request("getcellslicenp", column, col_idx, &blc, &trc)?;
+        // One cell's slice: the same read as getcellslice, so every corner
+        // rank/range refusal (and the -1 whole-cell idiom) comes with it.
+        let v = py.detach(|| self.read_cellslice(col_idx, row, &blc, &trc, &inc_v))?;
+        let expected: Vec<usize> = match &v {
+            // An array column always yields an array cell (even an
+            // undefined one reads as the default, issue #8); the shape is
+            // exactly what `getcellslice` would return, so the buffer
+            // contract and that method's output agree by construction.
+            RecordValue::Array(a) => a.shape.iter().map(|&d| d as usize).collect(),
+            _ => Vec::new(),
+        };
+        check_buf_shape(buf, &expected, "getcellslicenp", column)?;
+        let cell = expected.iter().product::<usize>().max(1);
+        convert::fill_buffer_by_dtype(py, buf, std::slice::from_ref(&v), cell)
+    }
+
+    /// `putcellslice(column, rownr, value, blc, trc, inc=[])` —
+    /// python-casacore's signature (issue #37: it did not exist at all
+    /// until now).  `value` must be exactly the cell's slice shape — no
+    /// leading row axis and no broadcast, which casacore's conformance
+    /// check enforces (issue #38) — and lands in one cell; an integer
+    /// `inc` is the stride, as in casacore (there is no legacy form to
+    /// disambiguate here, unlike `putcolslice`).
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (column, row, value, blc, trc, inc = None))]
+    fn putcellslice(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        row: u64,
+        value: &Bound<'_, PyAny>,
+        blc: &Bound<'_, PyAny>,
+        trc: &Bound<'_, PyAny>,
+        inc: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let blc = slice_arg(blc, "putcellslice blc")?;
+        let trc = slice_arg(trc, "putcellslice trc")?;
+        let inc_v = match inc {
+            Some(v) => slice_arg(&v, "putcellslice inc")?,
+            None => Vec::new(),
+        };
+        let col_idx = self.col_index(column)?;
+        self.check_slice_request("putcellslice", column, col_idx, &blc, &trc)?;
+        // Promote to the `putcolslice` value layout — a leading axis of 1
+        // for this one row — the same trick `putcell` uses for `putcol`, so
+        // the shared overlay below is the single implementation of both.
+        let np = py.import("numpy")?;
+        let arr = np.getattr("asanyarray")?.call1((value,))?;
+        let shape: Vec<i64> = arr.getattr("shape")?.extract()?;
+        let mut promoted = vec![1i64];
+        promoted.extend(shape.iter().copied());
+        let promoted = arr.call_method1("reshape", (promoted,))?;
+        self.put_slice_overlay(
+            py,
+            column,
+            col_idx,
+            &promoted,
+            &blc,
+            &trc,
+            &inc_v,
+            row,
+            1,
+            "putcellslice",
+        )
     }
 
     /// `getvarcol(column, startrow=0, nrow=-1)` -> {"rN": array} dict.
@@ -2998,6 +3299,9 @@ impl Table {
     /// in `getcolslice` (`tests/test_subcell_tiles.py` uses it).
     /// `blc`/`trc` may be bare ints, as in python-casacore. `rowincr` is
     /// accepted but not honoured, like casacure's other slice methods.
+    /// Everything casacore refuses — a non-array column, empty corners, a
+    /// value whose rows or slice extent differ from what would be written
+    /// — is refused before a single cell changes (issues #37, #38).
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (column, value, blc, trc, inc = None, startrow = 0, nrow = 0, rowincr = 1))]
     fn putcolslice(
@@ -3017,822 +3321,20 @@ impl Table {
         let inc_v = split_inc_startrow_nrow(inc, &mut startrow, &mut nrow)?;
         let _ = rowincr;
         let col_idx = self.col_index(column)?;
+        self.check_slice_request("putcolslice", column, col_idx, &blc, &trc)?;
         let startrow = startrow.max(0) as u64;
-        let nrow = if nrow <= 0 {
-            value.len()? as u64
-        } else {
-            nrow as u64
-        };
-        // Full-cell slice (blc=0.., trc=-1, unit stride) -> plain putcol.
-        let full = blc.iter().all(|&b| b <= 0)
-            && trc.len() == blc.len()
-            && trc.iter().all(|&t| t < 0)
-            && (inc_v.is_empty() || inc_v.iter().all(|&s| s == 1));
-        if full {
-            return self.putcol(py, column, value, startrow as i64, nrow as i64);
-        }
-        // Overlay `value[nrow, sub...]` into each fixed cell at logical
-        // blc..trc stepping inc. The numpy array is `(nrow, s0, s1, ...)` in
-        // C order.
-        let flat = convert::numpy_to_record_flat(value)
-            .ok_or_else(|| PyTypeError::new_err("putcolslice: unsupported element type"))??;
-        let shape_obj = value.getattr("shape")?;
-        let shape: Vec<usize> = shape_obj.extract()?;
-        if shape.is_empty() {
-            return Err(PyValueError::new_err("putcolslice: empty value"));
-        }
-        let sub: Vec<usize> = shape[1..].to_vec();
-        // casacore's Slicer refuses corners whose ranks differ from each
-        // other or from the cell ("Shape IPosition-lengths differ from
-        // ndim()").  Without this the starts[k]/ends[k] indexing below
-        // panics across the FFI boundary when the value carries more
-        // dimensions than the corners — a wrong-rank putcolslice was a
-        // `PanicException`, not an error (issue #36).
-        if blc.len() != trc.len() {
-            return Err(PyRuntimeError::new_err(format!(
-                "putcolslice: blc {blc:?} and trc {trc:?} lengths differ \
-                 (casacore: Slicer error: IPosition-lengths differ)"
-            )));
-        }
-        if sub.len() > blc.len() {
-            return Err(PyRuntimeError::new_err(format!(
-                "putcolslice: value slice rank {} does not fit the corner rank {} \
-                 (casacore: Slicer error: Shape IPosition-lengths differ from ndim())",
-                sub.len(),
-                blc.len()
-            )));
-        }
-        if !inc_v.is_empty() && inc_v.len() != blc.len() {
-            return Err(PyRuntimeError::new_err(format!(
-                "putcolslice: inc {inc_v:?} and blc {blc:?} lengths differ \
-                 (casacore: Slicer error: IPosition-lengths differ)"
-            )));
-        }
-        // Per-dimension stride: empty inc means 1 everywhere, as in
-        // python-casacore.  Indexed by the value's sub-rank, which the
-        // checks above bound by the corner rank.
-        let steps: Vec<usize> = (0..sub.len())
-            .map(|k| inc_v.get(k).map(|&s| s.max(1) as usize).unwrap_or(1))
-            .collect();
-        let sub_cell = sub.iter().product::<usize>().max(1);
-        let starts: Vec<usize> = blc.iter().map(|&b| b.max(0) as usize).collect();
-        // inclusive ends reached by stepping from the start; -1 means "to
-        // the end of the sub-slice".
-        let ends: Vec<usize> = trc
-            .iter()
-            .zip(starts.iter())
-            .zip(sub.iter())
-            .zip(steps.iter())
-            .map(|(((&t, &s), &subd), &step)| {
-                if t < 0 {
-                    s + (subd - 1) * step
-                } else {
-                    t.max(0) as usize
-                }
-            })
-            .collect();
-
-        for r in 0..nrow as usize {
-            let row = startrow + r as u64;
-            let mut cell = match self.read_cell(col_idx, row) {
-                Ok(c) => c,
-                Err(_) => RecordValue::Int(0),
-            };
-            // Cell's stored (as-given) shape; default for a missing cell.
-            let cshape: Vec<usize> = match &cell {
-                RecordValue::Array(a) => a.shape.iter().map(|&d| d as usize).collect(),
-                _ => {
-                    // Build a zero default of the fixed shape when present.
-                    let desc = self.desc();
-                    let fixed: Vec<usize> = desc.columns[col_idx]
-                        .shape
-                        .clone()
-                        .map(|s| s.iter().rev().map(|&d| d.max(0) as usize).collect())
-                        .unwrap_or_default();
-                    let n = fixed.iter().product::<usize>().max(1);
-                    let dt = desc.columns[col_idx].data_type;
-                    cell = RecordValue::Array(core::record::ArrayValue {
-                        shape: fixed.iter().map(|&d| d as u32).collect(),
-                        data: zero_elements(dt, n),
-                    });
-                    let _ = n;
-                    fixed
-                }
-            };
-            let mut grid = convert::cell_logical_flat(&cell);
-            let base = r * sub_cell;
-            for idx in 0..sub_cell {
-                let coords = convert::unflatten(idx, &sub);
-                let mut loc = vec![0usize; coords.len()];
-                for k in 0..coords.len() {
-                    let s = starts[k];
-                    let step = steps[k];
-                    let span = ends[k].saturating_sub(s) / step + 1;
-                    if coords[k] >= span {
-                        continue;
-                    }
-                    loc[k] = s + coords[k] * step;
-                }
-                let lf = convert::flatten_coords(&loc, &cshape);
-                if lf < grid.len() && base + idx < flat.len() {
-                    grid[lf] = flat[base + idx].clone();
-                }
-            }
-            let stored = convert::cell_from_logical(grid, &cshape);
-            self.put_cell(col_idx, row, stored)?;
-        }
-        Ok(())
-    }
-
-    /// `putkeyword(name, value)`.
-    fn putkeyword(&self, py: Python<'_>, name: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        let rec = keyword_value(py, value)?;
-        {
-            let mut inner = self.inner.lock().unwrap();
-            match &mut *inner {
-                Inner::Write { shared, .. } => {
-                    let mut s = shared.lock().unwrap();
-                    s.wt.putkeyword(name, rec);
-                    s.dirty = true;
-                }
-                _ => return Err(not_writable(self.view)),
-            }
-        }
-        Ok(())
-    }
-
-    /// `putkeywords(dict)`.
-    fn putkeywords(&self, py: Python<'_>, dict: &Bound<'_, PyDict>) -> PyResult<()> {
-        for (k, v) in dict.iter() {
-            let name = k.extract::<String>()?;
-            self.putkeyword(py, &name, &v)?;
-        }
-        Ok(())
-    }
-
-    /// `removekeyword(name)`.
-    fn removekeyword(&self, name: &str) -> PyResult<()> {
-        {
-            let mut inner = self.inner.lock().unwrap();
-            match &mut *inner {
-                Inner::Write { shared, .. } => {
-                    let mut s = shared.lock().unwrap();
-                    s.wt.removekeyword(name);
-                    s.dirty = true;
-                }
-                _ => return Err(not_writable(self.view)),
-            }
-        }
-        Ok(())
-    }
-
-    /// `putcolkeyword(column, name, value)`.
-    fn putcolkeyword(
-        &self,
-        py: Python<'_>,
-        column: &str,
-        name: &str,
-        value: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        let col_idx = self.col_index(column)?;
-        let rec = convert::pyobject_to_record(py, value)?;
-        {
-            let mut inner = self.inner.lock().unwrap();
-            match &mut *inner {
-                Inner::Write { shared, .. } => {
-                    let mut s = shared.lock().unwrap();
-                    s.wt.putcolkeyword(col_idx, name, rec).map_err(err)?;
-                    s.dirty = true;
-                }
-                _ => return Err(not_writable(self.view)),
-            }
-        }
-        Ok(())
-    }
-
-    /// `putcolkeywords(column, dict)`.
-    fn putcolkeywords(
-        &self,
-        py: Python<'_>,
-        column: &str,
-        dict: &Bound<'_, PyDict>,
-    ) -> PyResult<()> {
-        for (k, v) in dict.iter() {
-            let name = k.extract::<String>()?;
-            self.putcolkeyword(py, column, &name, &v)?;
-        }
-        Ok(())
-    }
-
-    /// `removecolkeyword(column, name)`.
-    fn removecolkeyword(&self, column: &str, name: &str) -> PyResult<()> {
-        let col_idx = self.col_index(column)?;
-        {
-            let mut inner = self.inner.lock().unwrap();
-            match &mut *inner {
-                Inner::Write { shared, .. } => {
-                    let mut s = shared.lock().unwrap();
-                    s.wt.removecolkeyword(col_idx, name).map_err(err)?;
-                    s.dirty = true;
-                }
-                _ => return Err(not_writable(self.view)),
-            }
-        }
-        Ok(())
-    }
-
-    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __exit__(
-        &self,
-        _ty: Option<Py<PyAny>>,
-        _value: Option<Py<PyAny>>,
-        _tb: Option<Py<PyAny>>,
-    ) -> PyResult<()> {
-        // python-casacore's `with table(...)` closes (flushing) on exit.
-        self.flush()?;
-        Ok(())
-    }
-
-    /// Private python-casacore `table._getdesc(actual=True)` — the full
-    /// table-description dict. dask-ms calls it for keyword reads.
-    #[pyo3(signature = (actual = true))]
-    fn _getdesc(&self, py: Python<'_>, actual: bool) -> PyResult<Py<PyAny>> {
-        let _ = actual;
-        let desc = self.desc();
-        let base = self.dir_of();
-        Ok(desc_to_pydict(py, &desc, Some(&base))?.into_any().unbind())
-    }
-
-    /// `t[key]` — python-casacore's `table.__getitem__`: an integer key is a
-    /// row number (returns the row's values as a dict `{colname: value}`);
-    /// a string key is a column name (returns the column as an array).
-    fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        // Column-name form: t["DATA"].
-        if let Ok(name) = key.extract::<String>() {
-            return self.getcol(py, &name, 0, -1, 1);
-        }
-        // Row form: t[0] -> {colname: value} for that row.
-        let row: i64 = key.extract().map_err(|_| {
-            PyTypeError::new_err("table key must be a column name (str) or a row number (int)")
-        })?;
-        let desc = self.desc();
-        let d = PyDict::new(py);
-        for (i, cd) in desc.columns.iter().enumerate() {
-            let v = self.read_cell(i, row.max(0) as u64)?;
-            let base = self.dir_of();
-            let v = convert::cell_to_py(py, &v)?;
-            let _ = &base;
-            d.set_item(&cd.name, v)?;
-        }
-        Ok(d.into_any().unbind())
-    }
-
-    /// `len(t)` — the number of rows (python-casacore's `table.__len__`).
-    fn __len__(&self) -> PyResult<usize> {
-        Ok(self.nrows()? as usize)
-    }
-}
-
-impl Table {
-    fn col_index(&self, name: &str) -> PyResult<usize> {
-        let desc = self.desc();
-        desc.columns
-            .iter()
-            .position(|c| c.name == name)
-            .ok_or_else(|| PyKeyError::new_err(format!("no such column: {name}")))
-    }
-
-    fn read_cell(&self, col_idx: usize, row: u64) -> PyResult<RecordValue> {
-        let inner = self.inner.lock().unwrap();
-        match &*inner {
-            Inner::Read(t) => {
-                let n = t.nrows();
-                // Row bounds are checked here so an out-of-range row is the
-                // documented ValueError, not whatever the storage manager
-                // happens to raise (python-casacore raises "no such row";
-                // casacure's contract is ValueError for read violations).
-                if row >= n {
-                    return Err(row_out_of_range(row, n));
-                }
-                t.getcell(col_idx, row).map_err(err)
-            }
-            Inner::Write { shared, .. } => {
-                let s = shared.lock().unwrap();
-                let n = s.wt.col_len(col_idx) as u64;
-                if row >= n {
-                    return Err(row_out_of_range(row, n));
-                }
-                merged_cell(&s, col_idx, row)
-            }
-        }
-    }
-
-    fn read_cellslice(
-        &self,
-        col_idx: usize,
-        row: u64,
-        blc: &[i64],
-        trc: &[i64],
-        inc: &[i64],
-    ) -> PyResult<RecordValue> {
-        // python-casacore's getcellslice blc/trc are 1-based inclusive with
-        // -1 meaning the last element; dask-ms uses the (-1,..) idiom for
-        // "the whole cell", which the core 0-based slicer rejects.  Any -1
-        // corner means "take the whole cell" (equivalent to the core's
-        // empty-slice form).
-        if blc.iter().any(|&b| b < 0) || trc.iter().any(|&t| t < 0) {
-            return self.read_cell(col_idx, row);
-        }
-        let inner = self.inner.lock().unwrap();
-        match &*inner {
-            Inner::Read(t) => t.getcellslice_inc(col_idx, row, blc, trc, inc).map_err(err),
-            Inner::Write { shared, .. } => {
-                let s = shared.lock().unwrap();
-                let n = s.wt.col_len(col_idx) as u64;
-                if row >= n {
-                    return Err(row_out_of_range(row, n));
-                }
-                let cell = merged_cell(&s, col_idx, row)?;
-                slice_cell(cell, blc, trc, inc)
-            }
-        }
-    }
-
-    fn read_colslice(
-        &self,
-        col_idx: usize,
-        blc: &[i64],
-        trc: &[i64],
-        inc: &[i64],
-        startrow: u64,
-        nrow: u64,
-    ) -> PyResult<Vec<RecordValue>> {
-        // Same 1-based/-1 "whole cell" idiom as getcellslice.
-        if blc.iter().any(|&b| b < 0) || trc.iter().any(|&t| t < 0) {
-            return self.read_col(col_idx, startrow, nrow);
-        }
-        let inner = self.inner.lock().unwrap();
-        match &*inner {
-            Inner::Read(t) => t
-                .getcolslice_inc(col_idx, blc, trc, inc, startrow, nrow)
-                .map_err(err),
-            Inner::Write { shared, .. } => {
-                // Per-row merged read (the on-disk snapshot does not have the
-                // rows added since the last flush), then the sub-array slice.
-                let s = shared.lock().unwrap();
-                let total = s.wt.col_len(col_idx) as u64;
-                let end = startrow.saturating_add(nrow);
-                if end > total {
-                    return Err(range_out_of_range(startrow, end, total));
-                }
-                let mut out = Vec::with_capacity(nrow as usize);
-                for r in startrow..end {
-                    let cell = merged_cell(&s, col_idx, r)?;
-                    out.push(slice_cell(cell, blc, trc, inc)?);
-                }
-                Ok(out)
-            }
-        }
-    }
-
-    fn put_cell(&self, col_idx: usize, row: u64, value: RecordValue) -> PyResult<()> {
-        self.put_cells(col_idx, row, std::iter::once(value))
-    }
-
-    /// Write consecutive cells from `startrow`, taking the handle and store
-    /// locks once for the whole batch (a `putcol` chunk), not per cell.
-    fn put_cells(
-        &self,
-        col_idx: usize,
-        startrow: u64,
-        values: impl IntoIterator<Item = RecordValue>,
-    ) -> PyResult<()> {
-        let mut inner = self.inner.lock().unwrap();
-        let Inner::Write { shared, .. } = &mut *inner else {
-            return Err(not_writable(self.view));
-        };
-        let mut s = shared.lock().unwrap();
-        for (row, value) in (startrow..).zip(values) {
-            // Validate before writing: the putcol coercion has already
-            // produced the column's exact type, so a mismatch here is an
-            // incompatible write (e.g. a string into a double column) that
-            // casacore rejects rather than silently storing — and a
-            // fixed-shape array column must receive exactly its declared
-            // cell shape. The desc is borrowed inside the shared lock (no
-            // per-cell clone on the hot putcol path).
-            if let Some(col) = s.wt.desc().columns.get(col_idx) {
-                if !record_fits_column(col, &value) {
-                    return Err(PyTypeError::new_err(format!(
-                        "putcol/putcell: {} cannot be stored in column {} (valueType {})",
-                        value_name(&value),
-                        col.name,
-                        ::casacure::casa_value_type(col.data_type)
-                    )));
-                }
-                if let (Some(fixed), RecordValue::Array(a)) = (&col.shape, &value) {
-                    // Logical cell shape = the reversed stored shape.
-                    let matches = a.shape.len() == fixed.len()
-                        && a.shape
-                            .iter()
-                            .zip(fixed.iter().rev())
-                            .all(|(&got, &want)| got == want.max(0) as u32);
-                    if !fixed.is_empty() && !matches {
-                        let logical: Vec<u32> =
-                            fixed.iter().rev().map(|&d| d.max(0) as u32).collect();
-                        return Err(PyValueError::new_err(format!(
-                            "putcol: cell shape {:?} does not match column {} fixed shape {:?}",
-                            a.shape, col.name, logical
-                        )));
-                    }
-                }
-            }
-            s.wt.putcell(col_idx, row, value).map_err(err)?;
-            s.dirty = true;
-        }
-        Ok(())
-    }
-
-    /// Store a whole `putcol` batch of cells (one `RecordValue` per row).
-    ///
-    /// Like [`Table::put_cells`]: the shared-store lock is taken once for the
-    /// whole batch and per-cell type/shape validation is kept, but the store
-    /// loop runs with the GIL released so the dask scheduler can overlap
-    /// independent writes.
-    ///
-    /// NO Rust lock may be held across the detach: re-attaching the GIL at
-    /// its end while holding the store lock deadlocks against any thread
-    /// that holds the GIL and wants the store (`col_index` -> `desc`, a
-    /// concurrent `flush`, another handle's `open`).  The backing is cloned
-    /// out and locked inside the detach instead.
-    fn put_cells_batch(
-        &self,
-        py: Python<'_>,
-        col_idx: usize,
-        startrow: u64,
-        values: Vec<RecordValue>,
-    ) -> PyResult<()> {
-        let shared = {
-            let inner = self.inner.lock().unwrap();
-            let Inner::Write { shared, .. } = &*inner else {
-                return Err(not_writable(self.view));
-            };
-            std::sync::Arc::clone(shared)
-        };
-        py.detach(|| -> PyResult<()> {
-            let mut s = shared.lock().unwrap();
-            // Validate against the column's declared type and fixed shape
-            // before writing (parity with the per-cell `put_cell` checks).
-            let desc = s.wt.desc().clone();
-            for (row, value) in (startrow..).zip(values) {
-                if let Some(col) = desc.columns.get(col_idx) {
-                    if !record_fits_column(col, &value) {
-                        return Err(PyTypeError::new_err(format!(
-                            "putcol/putcell: {} cannot be stored in column {} (valueType {})",
-                            value_name(&value),
-                            col.name,
-                            ::casacure::casa_value_type(col.data_type)
-                        )));
-                    }
-                    if let (Some(fixed), RecordValue::Array(a)) = (&col.shape, &value) {
-                        // Logical cell shape = the reversed stored shape.
-                        let matches = a.shape.len() == fixed.len()
-                            && a.shape
-                                .iter()
-                                .zip(fixed.iter().rev())
-                                .all(|(&got, &want)| got == want.max(0) as u32);
-                        if !fixed.is_empty() && !matches {
-                            let logical: Vec<u32> =
-                                fixed.iter().rev().map(|&d| d.max(0) as u32).collect();
-                            return Err(PyValueError::new_err(format!(
-                                "putcol: cell shape {:?} does not match column {} fixed shape {:?}",
-                                a.shape, col.name, logical
-                            )));
-                        }
-                    }
-                }
-                s.wt.putcell(col_idx, row, value).map_err(err)?;
-                // Mark the store dirty per stored cell: a batch that fails
-                // mid-way keeps the cells it already wrote pending for the
-                // next flush instead of silently dropping them.
-                s.dirty = true;
-            }
-            Ok(())
-        })
-    }
-
-    /// Convert user `putcol` data into one `RecordValue` per row.
-    fn value_to_cells(
-        &self,
-        py: Python<'_>,
-        col_idx: usize,
-        value: &Bound<'_, PyAny>,
-        nrow: u64,
-        is_array_col: bool,
-        varcol: bool,
-    ) -> PyResult<Vec<RecordValue>> {
-        // The column's declared element type, for scalar (list/tuple) values:
-        // casacore casts every element to it on putcol.
-        let col_dt = self.desc().columns.get(col_idx).map(|c| c.data_type);
-        // Normalize numpy unicode/byte string arrays to nested Python lists
-        // so the string handling paths (the scalar list branch and the array
-        // list->typed-ndarray normalization) see them.
-        let stringified: Option<Bound<'_, PyAny>> = if value.getattr("dtype").is_ok() {
-            let kind: String = value.getattr("dtype")?.getattr("kind")?.extract()?;
-            if kind == "U" || kind == "S" {
-                Some(value.call_method0("tolist")?)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let value = match &stringified {
-            Some(s) => s,
-            None => value,
-        };
-        // Coerce numeric ndarrays (scalar AND array columns) to the column's
-        // element type (casacore casts, e.g. complex64 -> dcomplex when the
-        // column is C8, int64/int16 -> int32 for an Int column). String
-        // arrays are already handled by `stringified` above, so skip them.
-        let mut coerced: Option<Bound<'_, PyAny>> = None;
-        if stringified.is_none() {
-            if let Some(npd) = core::record::data_type_to_np(
-                self.desc().columns.get(col_idx).map(|c| &c.data_type),
-            ) {
-                // Any ndarray (typed ndarrays don't all downcast to the
-                // `PyArrayDyn<PyAny>` form, e.g. complex64).
-                if value.getattr("dtype").is_ok()
-                    && value.cast::<PyList>().is_err()
-                    && value.cast::<PyDict>().is_err()
-                {
-                    let dtype = value.getattr("dtype")?;
-                    let kind: String = dtype.getattr("kind")?.extract()?;
-                    let itemsize: i64 = dtype.getattr("itemsize")?.extract()?;
-                    let have = core::record::np_kind_itemsize(&kind, itemsize);
-                    if have != Some(npd) {
-                        coerced = Some(value.call_method1("astype", (npd,))?);
-                    }
-                }
-            }
-        }
-        let value = match &coerced {
-            Some(c) => c,
-            None => value,
-        };
-        if is_array_col {
-            // Accept a 2-D+ ndarray or a list of row-arrays.
-            if value.cast::<PyDict>().is_ok() {
-                let rec = convert::py_to_string_array(py, value)?;
-                return Ok(vec![rec]);
-            }
-            // Plain Python list/tuple (putvarcol row values, or putcol with
-            // lists-of-rows): normalize to a typed ndarray of the column's
-            // element type and fall through to the ndarray handling below.
-            let mut normalized: Vec<Bound<'_, PyAny>> = Vec::new();
-            let mut value = value;
-            if value.cast::<PyList>().is_ok() || value.cast::<PyTuple>().is_ok() {
-                let mut arr = py.import("numpy")?.getattr("asarray")?.call1((value,))?;
-                // String columns have no numpy mapping in `data_type_to_np`;
-                // unicode/byte arrays must become object arrays for the
-                // string-cell handler to see them.
-                let npd = core::record::data_type_to_np(
-                    self.desc().columns.get(col_idx).map(|c| &c.data_type),
-                )
-                .or_else(|| {
-                    matches!(
-                        self.desc().columns.get(col_idx).map(|c| c.data_type),
-                        Some(core::record::DataType::String)
-                    )
-                    .then_some("object")
-                });
-                if let Some(npd) = npd {
-                    let dt = arr.getattr("dtype")?;
-                    let kind: String = dt.getattr("kind")?.extract()?;
-                    let itemsize: i64 = dt.getattr("itemsize")?.extract()?;
-                    if core::record::np_kind_itemsize(&kind, itemsize) != Some(npd) {
-                        arr = arr.call_method1("astype", (npd,))?;
-                    }
-                }
-                normalized.push(arr);
-                value = normalized.last().unwrap();
-            }
-            // Complex arrays (the coercion above has already matched the
-            // array to the column precision); numpy 0.26 names: Complex32 =
-            // c64 (float32 complex), Complex64 = c128 (float64 complex).
-            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<numpy::Complex32>>() {
-                let readonly = arr.readonly();
-                return ndarray_cells_typed(&readonly, nrow, varcol, |v| {
-                    core::record::ArrayData::Complex(v.into_iter().map(|c| (c.re, c.im)).collect())
-                });
-            }
-            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<numpy::Complex64>>() {
-                let readonly = arr.readonly();
-                return ndarray_cells_typed(&readonly, nrow, varcol, |v| {
-                    core::record::ArrayData::DComplex(v.into_iter().map(|c| (c.re, c.im)).collect())
-                });
-            }
-            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<Py<PyAny>>>() {
-                let readonly = arr.readonly();
-                let shape: Vec<usize> = readonly.as_array().shape().to_vec();
-                let cell = reshape_cell(&shape);
-                let mut out = Vec::with_capacity(nrow as usize);
-                for r in 0..nrow as usize {
-                    let start = r * cell;
-                    let stop = ((r + 1) * cell).min(readonly.as_array().len());
-                    let mut elems: Vec<String> = Vec::with_capacity(stop - start);
-                    for e in readonly.as_array().iter().skip(start).take(stop - start) {
-                        elems.push(e.bind(py).extract::<String>().unwrap_or_default());
-                    }
-                    let casa_shape: Vec<u32> = shape[1..].iter().map(|&s| s as u32).collect();
-                    out.push(RecordValue::Array(core::record::ArrayValue {
-                        shape: casa_shape,
-                        data: core::record::ArrayData::String(elems),
-                    }));
-                }
-                return Ok(out);
-            }
-            for key in ["i32", "u16", "bool", "f32", "f64", "i64", "u8", "c8", "c16"] {
-                let _ = key;
-            }
-            // Numeric ndarray.
-            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<f64>>() {
-                let readonly = arr.readonly();
-                return ndarray_cells_typed(
-                    &readonly,
-                    nrow,
-                    varcol,
-                    core::record::ArrayData::Double,
-                );
-            }
-            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<f32>>() {
-                let readonly = arr.readonly();
-                return ndarray_cells_typed(
-                    &readonly,
-                    nrow,
-                    varcol,
-                    core::record::ArrayData::Float,
-                );
-            }
-            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<u8>>() {
-                let readonly = arr.readonly();
-                return ndarray_cells_typed(
-                    &readonly,
-                    nrow,
-                    varcol,
-                    core::record::ArrayData::UChar,
-                );
-            }
-            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<i16>>() {
-                let readonly = arr.readonly();
-                return ndarray_cells_typed(
-                    &readonly,
-                    nrow,
-                    varcol,
-                    core::record::ArrayData::Short,
-                );
-            }
-            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<u32>>() {
-                let readonly = arr.readonly();
-                return ndarray_cells_typed(&readonly, nrow, varcol, core::record::ArrayData::UInt);
-            }
-            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<u16>>() {
-                let readonly = arr.readonly();
-                return ndarray_cells_typed(
-                    &readonly,
-                    nrow,
-                    varcol,
-                    core::record::ArrayData::UShort,
-                );
-            }
-            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<i64>>() {
-                let readonly = arr.readonly();
-                return ndarray_cells_typed(
-                    &readonly,
-                    nrow,
-                    varcol,
-                    core::record::ArrayData::Int64,
-                );
-            }
-            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<i32>>() {
-                let readonly = arr.readonly();
-                return ndarray_cells_typed(&readonly, nrow, varcol, core::record::ArrayData::Int);
-            }
-            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<bool>>() {
-                let readonly = arr.readonly();
-                return ndarray_cells_typed(&readonly, nrow, varcol, core::record::ArrayData::Bool);
-            }
-            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<Complex32>>() {
-                let readonly = arr.readonly();
-                return ndarray_cells_typed(&readonly, nrow, varcol, |v| {
-                    core::record::ArrayData::Complex(v.into_iter().map(|c| (c.re, c.im)).collect())
-                });
-            }
-            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<Complex64>>() {
-                let readonly = arr.readonly();
-                return ndarray_cells_typed(&readonly, nrow, varcol, |v| {
-                    core::record::ArrayData::DComplex(v.into_iter().map(|c| (c.re, c.im)).collect())
-                });
-            }
-            return Err(PyTypeError::new_err(format!(
-                "putcol: unsupported array data {}",
-                value.getattr("dtype")?.str()?.to_str()?
-            )));
-        }
-        // Scalar column: 1-D array (or list/tuple) of scalars. Each element
-        // is cast to the column's declared type (byte-identical semantics).
-        if let Ok(list) = value.cast::<PyList>() {
-            let mut out = Vec::with_capacity(list.len());
-            for item in list.iter() {
-                let rec = convert::pyobject_to_record(py, &item)?;
-                out.push(match col_dt.as_ref() {
-                    Some(dt) => convert::cast_scalar_to(dt, &rec),
-                    None => rec,
-                });
-            }
-            return Ok(out);
-        }
-        if let Ok(tup) = value.cast::<PyTuple>() {
-            let mut out = Vec::with_capacity(tup.len());
-            for item in tup.iter() {
-                let rec = convert::pyobject_to_record(py, &item)?;
-                out.push(match col_dt.as_ref() {
-                    Some(dt) => convert::cast_scalar_to(dt, &rec),
-                    None => rec,
-                });
-            }
-            return Ok(out);
-        }
-        if let Ok(arr) = value.cast::<numpy::PyArrayDyn<Py<PyAny>>>() {
-            let readonly = arr.readonly();
-            let mut out = Vec::with_capacity(readonly.as_array().len());
-            for e in readonly.as_array().iter() {
-                out.push(convert::pyobject_to_record(py, e.bind(py))?);
-            }
-            return Ok(out);
-        }
-        macro_rules! scalar_num {
-            ($ty:ty, $f:expr) => {{
-                if let Ok(arr) = value.cast::<numpy::PyArrayDyn<$ty>>() {
-                    let readonly = arr.readonly();
-                    let mut out = Vec::with_capacity(readonly.as_array().len());
-                    for e in readonly.as_array().iter() {
-                        out.push($f(e));
-                    }
-                    return Ok(out);
-                }
-            }};
-        }
-        scalar_num!(f64, |e: &f64| RecordValue::Double(*e));
-        scalar_num!(f32, |e: &f32| RecordValue::Float(*e));
-        scalar_num!(i64, |e: &i64| RecordValue::Int64(*e));
-        scalar_num!(i32, |e: &i32| RecordValue::Int(*e));
-        scalar_num!(i16, |e: &i16| RecordValue::Short(*e));
-        scalar_num!(u32, |e: &u32| RecordValue::UInt(*e));
-        scalar_num!(u8, |e: &u8| RecordValue::UChar(*e));
-        scalar_num!(u16, |e: &u16| RecordValue::UShort(*e));
-        scalar_num!(bool, |e: &bool| RecordValue::Bool(*e));
-        scalar_num!(Complex64, |e: &Complex64| RecordValue::DComplex(e.re, e.im));
-        scalar_num!(Complex32, |e: &Complex32| RecordValue::Complex(e.re, e.im));
-        // Fall back to a single-value conversion (numpy scalars, etc.).
-        let rec = convert::pyobject_to_record(py, value)?;
-        if matches!(rec, RecordValue::Array(_)) {
-            return Err(PyTypeError::new_err(
-                "putcol: unexpected array for a scalar column",
-            ));
-        }
-        Ok(vec![rec])
-    }
-
-    /// Serialize a column range to the python-visible form.
-    fn column_to_python(
-        &self,
-        py: Python<'_>,
-        _col_idx: usize,
-        cells: &[RecordValue],
-    ) -> PyResult<Py<PyAny>> {
-        let first = cells.iter().find(|c| !matches!(c, RecordValue::String(_)));
-        let is_array_col = matches!(first, Some(RecordValue::Array(_)));
-        if !is_array_col {
-            // Empty cells (e.g. a taql result with no rows): return empty.
-            if let Some(RecordValue::String(_) | RecordValue::Table(_)) = cells.first() {
-                let list = PyList::empty(py);
-                for v in cells {
-                    let s = match v {
-                        RecordValue::String(s) | RecordValue::Table(s) => s.clone(),
-                        other => other.to_json_string(),
-                    };
-                    list.append(s)?;
-                }
-                return Ok(list.into_any().unbind());
-            }
-            return convert::scalars_cells_to_array(py, cells);
-        }
-        check_cells_conform(cells)?;
-        let cell_shape = cell_shape_of(cells);
-        convert::arrays_to_ndarray_getcol(py, cells, &cell_shape)
+        self.put_slice_overlay(
+            py,
+            column,
+            col_idx,
+            value,
+            &blc,
+            &trc,
+            &inc_v,
+            startrow,
+            nrow,
+            "putcolslice",
+        )
     }
 }
 
@@ -3841,7 +3343,7 @@ impl Table {
 /// integer to a length-1 one — which selects a whole 1-D cell and, on any
 /// other rank, fails inside the `Slicer` with a `RuntimeError`
 /// (`Shape IPosition-lengths differ from ndim()`), never a `TypeError`
-/// (issue #36: casacore used to reject the scalar before any slicing
+/// (issue #36: casacure used to reject the scalar before any slicing
 /// happened, which casacore callers catching `RuntimeError` never see).  A
 /// sequence is taken as-is; anything that is neither (float, str, None) is
 /// an argument error, as in casacore — whose `ArgumentError` subclasses
@@ -3857,6 +3359,28 @@ fn slice_arg(arg: &Bound<'_, PyAny>, name: &str) -> PyResult<Vec<i64>> {
         "{name} must be a sequence of ints or an int \
          (python-casacore converts a bare int to a length-1 IPosition)"
     )))
+}
+
+/// A caller's buffer must be exactly the shape casacore's conformance
+/// check asks for (issue #38): too big, too small and wrong-row buffers all
+/// raise `ArrayColumn::getColumn ... Table array conformance error` there,
+/// while casacure filled whatever overlapped — `fill_flat` is bounds-checked,
+/// so no memory was at risk, the caller just silently got partial data.
+fn check_buf_shape(
+    buf: &Bound<'_, PyAny>,
+    expected: &[usize],
+    name: &str,
+    column: &str,
+) -> PyResult<()> {
+    let shape: Vec<usize> = buf.getattr("shape")?.extract()?;
+    if shape != expected {
+        return Err(PyRuntimeError::new_err(format!(
+            "{name}: buffer shape {shape:?} does not match the slice shape {expected:?} \
+             (casacore: ArrayColumn::getColumn in column {column}: \
+             Table array conformance error)"
+        )));
+    }
+    Ok(())
 }
 
 /// Interpret the `inc` argument of `getcolslice`/`getcolslicenp`/
@@ -4697,5 +4221,774 @@ mod cross_writer_column_tests {
         std::fs::write(dir.0.join("table.dat"), b"not a table").unwrap();
         assert_eq!(disk_column_names(&dir.0), None);
         assert!(disk_columns_differ(&dir.0, &names(&["VALUE"])));
+    }
+}
+
+impl Table {
+    /// The shared write half of `putcolslice`/`putcellslice` (issues #36,
+    /// #37, #38): overlay `value`, shaped `(nrow, sub...)`, into each row's
+    /// cell at logical `blc..trc` stepping `inc`. Every mismatch casacore
+    /// refuses is refused first — before a single cell is written, so a
+    /// refusal never leaves a half-written window behind: the value's row
+    /// count against the rows actually written, a window past the last row,
+    /// the corner ranks (pair, cell, value), and the value's per-dimension
+    /// extent against the slice.
+    #[allow(clippy::too_many_arguments)]
+    fn put_slice_overlay(
+        &self,
+        py: Python<'_>,
+        column: &str,
+        col_idx: usize,
+        value: &Bound<'_, PyAny>,
+        blc: &[i64],
+        trc: &[i64],
+        inc_v: &[i64],
+        startrow: u64,
+        nrow: i64,
+        name: &str,
+    ) -> PyResult<()> {
+        // casacore resolves its nrow=-1 to the rest of the column and the
+        // value must carry exactly those rows: casacure's old value-driven
+        // default silently wrote a prefix (issue #38).
+        let total = self.row_count();
+        let resolved = if nrow <= 0 {
+            total.saturating_sub(startrow)
+        } else {
+            nrow as u64
+        };
+        // Overlay `value[nrow, sub...]` into each fixed cell at logical
+        // blc..trc stepping inc. The numpy array is `(nrow, s0, s1, ...)` in
+        // C order.
+        let flat = convert::numpy_to_record_flat(value)
+            .ok_or_else(|| PyTypeError::new_err(format!("{name}: unsupported element type")))??;
+        let shape_obj = value.getattr("shape")?;
+        let shape: Vec<usize> = shape_obj.extract()?;
+        if shape.is_empty() {
+            return Err(PyValueError::new_err(format!("{name}: empty value")));
+        }
+        let sub: Vec<usize> = shape[1..].to_vec();
+        // Exactly the rows to write (#38): casacore's putColumnCells
+        // conformance.
+        let rows = value.len()? as u64;
+        if rows != resolved {
+            return Err(PyRuntimeError::new_err(format!(
+                "{name}: value has {rows} rows but {resolved} start at row {startrow} \
+                 (casacore: ArrayColumn::putColumnCells: Table array conformance error)"
+            )));
+        }
+        if startrow >= total || startrow + resolved > total {
+            let bad = startrow.max(total);
+            return Err(row_out_of_range(bad, total));
+        }
+        // casacore's Slicer refuses corners whose ranks differ from each
+        // other or from the cell ("Shape IPosition-lengths differ from
+        // ndim()").  Without this the starts[k]/ends[k] indexing below
+        // panics across the FFI boundary when the value carries more
+        // dimensions than the corners — a wrong-rank putcolslice was a
+        // `PanicException`, not an error (issue #36).
+        if blc.len() != trc.len() {
+            return Err(PyRuntimeError::new_err(format!(
+                "{name}: blc {blc:?} and trc {trc:?} lengths differ \
+                 (casacore: Slicer error: IPosition-lengths differ)"
+            )));
+        }
+        // Fixed cells pin the corner rank and bounds (#38): casacore's
+        // Slicer compares the IPositions against ndim(), and a corner past
+        // the cell fails the way a read slice fails.
+        let cell_dims: Option<Vec<i64>> = {
+            let desc = self.desc();
+            desc.columns[col_idx]
+                .shape
+                .as_ref()
+                .map(|s| s.iter().rev().map(|&d| d.max(0)).collect())
+        };
+        if let Some(logical) = &cell_dims {
+            if blc.len() != logical.len() {
+                return Err(PyRuntimeError::new_err(format!(
+                    "{name}: corner rank {} does not match the cell rank {} \
+                     (casacore: Slicer error: Shape IPosition-lengths differ from ndim())",
+                    blc.len(),
+                    logical.len()
+                )));
+            }
+            for k in 0..blc.len() {
+                let start = blc[k].max(0);
+                let end = trc[k];
+                if start >= logical[k] || (end >= 0 && end >= logical[k]) {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "{name}: slice {blc:?}..{trc:?} does not fit the cell shape {logical:?}"
+                    )));
+                }
+            }
+        }
+        // Full-cell slice (blc<=0.., trc<0, unit stride) -> plain putcol.
+        let full = blc.iter().all(|&b| b <= 0)
+            && trc.iter().all(|&t| t < 0)
+            && (inc_v.is_empty() || inc_v.iter().all(|&s| s == 1));
+        if full {
+            return self.putcol(py, column, value, startrow as i64, resolved as i64);
+        }
+        if sub.len() != blc.len() {
+            return Err(PyRuntimeError::new_err(format!(
+                "{name}: value slice rank {} does not fit the corner rank {} \
+                 (casacore: Slicer error: Shape IPosition-lengths differ from ndim())",
+                sub.len(),
+                blc.len()
+            )));
+        }
+        if !inc_v.is_empty() && inc_v.len() != blc.len() {
+            return Err(PyRuntimeError::new_err(format!(
+                "{name}: inc {inc_v:?} and blc {blc:?} lengths differ \
+                 (casacore: Slicer error: IPosition-lengths differ)"
+            )));
+        }
+        // Per-dimension stride: empty inc means 1 everywhere, as in
+        // python-casacore. Indexed by the value's sub-rank, which the
+        // checks above bind to the corner rank.
+        let steps: Vec<usize> = (0..sub.len())
+            .map(|k| inc_v.get(k).map(|&s| s.max(1) as usize).unwrap_or(1))
+            .collect();
+        let sub_cell = sub.iter().product::<usize>().max(1);
+        let starts: Vec<usize> = blc.iter().map(|&b| b.max(0) as usize).collect();
+        // inclusive ends reached by stepping from the start; a negative trc
+        // means "to the end of the sub-slice" (the extent check below has
+        // already pinned that length against the cell where the cell shape
+        // is known).
+        let ends: Vec<usize> = trc
+            .iter()
+            .zip(starts.iter())
+            .zip(sub.iter())
+            .zip(steps.iter())
+            .map(|(((&t, &s), &subd), &step)| {
+                if t < 0 {
+                    s + (subd - 1) * step
+                } else {
+                    t.max(0) as usize
+                }
+            })
+            .collect();
+        // Exactly the slice's elements (#38): casacore's putSlice /
+        // putColumn(slicer) conformance, per dimension. A fixed cell's own
+        // end resolves a negative trc; variable-shape cells cannot be
+        // resolved before the cell is read and stay value-driven.
+        for k in 0..sub.len() {
+            let end = if trc[k] >= 0 {
+                Some(trc[k])
+            } else {
+                cell_dims.as_ref().map(|l| l[k] - 1)
+            };
+            let Some(e) = end else { continue };
+            let start = blc[k].max(0);
+            if e < start {
+                return Err(PyRuntimeError::new_err(format!(
+                    "{name}: slice {blc:?}..{trc:?} is not ascending"
+                )));
+            }
+            let extent = (e - start) / steps[k] as i64 + 1;
+            if sub[k] != extent as usize {
+                return Err(PyRuntimeError::new_err(format!(
+                    "{name}: value has {} elements in dimension {k}, the slice has {extent} \
+                     (casacore: Table array conformance error (shape=[{}], expected [{extent}]))",
+                    sub[k], sub[k]
+                )));
+            }
+        }
+
+        for r in 0..resolved as usize {
+            let row = startrow + r as u64;
+            let mut cell = match self.read_cell(col_idx, row) {
+                Ok(c) => c,
+                Err(_) => RecordValue::Int(0),
+            };
+            // Cell's stored (as-given) shape; default for a missing cell.
+            let cshape: Vec<usize> = match &cell {
+                RecordValue::Array(a) => a.shape.iter().map(|&d| d as usize).collect(),
+                _ => {
+                    // Build a zero default of the fixed shape when present.
+                    let desc = self.desc();
+                    let fixed: Vec<usize> = desc.columns[col_idx]
+                        .shape
+                        .clone()
+                        .map(|s| s.iter().rev().map(|&d| d.max(0) as usize).collect())
+                        .unwrap_or_default();
+                    let n = fixed.iter().product::<usize>().max(1);
+                    let dt = desc.columns[col_idx].data_type;
+                    cell = RecordValue::Array(core::record::ArrayValue {
+                        shape: fixed.iter().map(|&d| d as u32).collect(),
+                        data: zero_elements(dt, n),
+                    });
+                    let _ = n;
+                    fixed
+                }
+            };
+            let mut grid = convert::cell_logical_flat(&cell);
+            let base = r * sub_cell;
+            for idx in 0..sub_cell {
+                let coords = convert::unflatten(idx, &sub);
+                let mut loc = vec![0usize; coords.len()];
+                for k in 0..coords.len() {
+                    let s = starts[k];
+                    let step = steps[k];
+                    let span = ends[k].saturating_sub(s) / step + 1;
+                    if coords[k] >= span {
+                        continue;
+                    }
+                    loc[k] = s + coords[k] * step;
+                }
+                let lf = convert::flatten_coords(&loc, &cshape);
+                if lf < grid.len() && base + idx < flat.len() {
+                    grid[lf] = flat[base + idx].clone();
+                }
+            }
+            let stored = convert::cell_from_logical(grid, &cshape);
+            self.put_cell(col_idx, row, stored)?;
+        }
+        Ok(())
+    }
+}
+
+impl Table {
+    fn put_cell(&self, col_idx: usize, row: u64, value: RecordValue) -> PyResult<()> {
+        self.put_cells(col_idx, row, std::iter::once(value))
+    }
+
+    /// Write consecutive cells from `startrow`, taking the handle and store
+    /// locks once for the whole batch (a `putcol` chunk), not per cell.
+    fn put_cells(
+        &self,
+        col_idx: usize,
+        startrow: u64,
+        values: impl IntoIterator<Item = RecordValue>,
+    ) -> PyResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let Inner::Write { shared, .. } = &mut *inner else {
+            return Err(not_writable(self.view));
+        };
+        let mut s = shared.lock().unwrap();
+        for (row, value) in (startrow..).zip(values) {
+            // Validate before writing: the putcol coercion has already
+            // produced the column's exact type, so a mismatch here is an
+            // incompatible write (e.g. a string into a double column) that
+            // casacore rejects rather than silently storing — and a
+            // fixed-shape array column must receive exactly its declared
+            // cell shape. The desc is borrowed inside the shared lock (no
+            // per-cell clone on the hot putcol path).
+            if let Some(col) = s.wt.desc().columns.get(col_idx) {
+                if !record_fits_column(col, &value) {
+                    return Err(PyTypeError::new_err(format!(
+                        "putcol/putcell: {} cannot be stored in column {} (valueType {})",
+                        value_name(&value),
+                        col.name,
+                        ::casacure::casa_value_type(col.data_type)
+                    )));
+                }
+                if let (Some(fixed), RecordValue::Array(a)) = (&col.shape, &value) {
+                    // Logical cell shape = the reversed stored shape.
+                    let matches = a.shape.len() == fixed.len()
+                        && a.shape
+                            .iter()
+                            .zip(fixed.iter().rev())
+                            .all(|(&got, &want)| got == want.max(0) as u32);
+                    if !fixed.is_empty() && !matches {
+                        let logical: Vec<u32> =
+                            fixed.iter().rev().map(|&d| d.max(0) as u32).collect();
+                        return Err(PyValueError::new_err(format!(
+                            "putcol: cell shape {:?} does not match column {} fixed shape {:?}",
+                            a.shape, col.name, logical
+                        )));
+                    }
+                }
+            }
+            s.wt.putcell(col_idx, row, value).map_err(err)?;
+            s.dirty = true;
+        }
+        Ok(())
+    }
+}
+
+impl Table {
+    fn read_cell(&self, col_idx: usize, row: u64) -> PyResult<RecordValue> {
+        let inner = self.inner.lock().unwrap();
+        match &*inner {
+            Inner::Read(t) => {
+                let n = t.nrows();
+                // Row bounds are checked here so an out-of-range row is the
+                // documented ValueError, not whatever the storage manager
+                // happens to raise (python-casacore raises "no such row";
+                // casacure's contract is ValueError for read violations).
+                if row >= n {
+                    return Err(row_out_of_range(row, n));
+                }
+                t.getcell(col_idx, row).map_err(err)
+            }
+            Inner::Write { shared, .. } => {
+                let s = shared.lock().unwrap();
+                let n = s.wt.col_len(col_idx) as u64;
+                if row >= n {
+                    return Err(row_out_of_range(row, n));
+                }
+                merged_cell(&s, col_idx, row)
+            }
+        }
+    }
+
+    fn read_cellslice(
+        &self,
+        col_idx: usize,
+        row: u64,
+        blc: &[i64],
+        trc: &[i64],
+        inc: &[i64],
+    ) -> PyResult<RecordValue> {
+        // python-casacore's getcellslice blc/trc are 1-based inclusive with
+        // -1 meaning the last element; dask-ms uses the (-1,..) idiom for
+        // "the whole cell", which the core 0-based slicer rejects.  Any -1
+        // corner means "take the whole cell" (equivalent to the core's
+        // empty-slice form).
+        if blc.iter().any(|&b| b < 0) || trc.iter().any(|&t| t < 0) {
+            return self.read_cell(col_idx, row);
+        }
+        let inner = self.inner.lock().unwrap();
+        match &*inner {
+            Inner::Read(t) => t.getcellslice_inc(col_idx, row, blc, trc, inc).map_err(err),
+            Inner::Write { shared, .. } => {
+                let s = shared.lock().unwrap();
+                let n = s.wt.col_len(col_idx) as u64;
+                if row >= n {
+                    return Err(row_out_of_range(row, n));
+                }
+                let cell = merged_cell(&s, col_idx, row)?;
+                slice_cell(cell, blc, trc, inc)
+            }
+        }
+    }
+
+    fn read_colslice(
+        &self,
+        col_idx: usize,
+        blc: &[i64],
+        trc: &[i64],
+        inc: &[i64],
+        startrow: u64,
+        nrow: u64,
+    ) -> PyResult<Vec<RecordValue>> {
+        // Same 1-based/-1 "whole cell" idiom as getcellslice.
+        if blc.iter().any(|&b| b < 0) || trc.iter().any(|&t| t < 0) {
+            return self.read_col(col_idx, startrow, nrow);
+        }
+        let inner = self.inner.lock().unwrap();
+        match &*inner {
+            Inner::Read(t) => t
+                .getcolslice_inc(col_idx, blc, trc, inc, startrow, nrow)
+                .map_err(err),
+            Inner::Write { shared, .. } => {
+                // Per-row merged read (the on-disk snapshot does not have the
+                // rows added since the last flush), then the sub-array slice.
+                let s = shared.lock().unwrap();
+                let total = s.wt.col_len(col_idx) as u64;
+                let end = startrow.saturating_add(nrow);
+                if end > total {
+                    return Err(range_out_of_range(startrow, end, total));
+                }
+                let mut out = Vec::with_capacity(nrow as usize);
+                for r in startrow..end {
+                    let cell = merged_cell(&s, col_idx, r)?;
+                    out.push(slice_cell(cell, blc, trc, inc)?);
+                }
+                Ok(out)
+            }
+        }
+    }
+}
+
+impl Table {
+    /// Store a whole `putcol` batch of cells (one `RecordValue` per row).
+    ///
+    /// Like [`Table::put_cells`]: the shared-store lock is taken once for the
+    /// whole batch and per-cell type/shape validation is kept, but the store
+    /// loop runs with the GIL released so the dask scheduler can overlap
+    /// independent writes.
+    ///
+    /// NO Rust lock may be held across the detach: re-attaching the GIL at
+    /// its end while holding the store lock deadlocks against any thread
+    /// that holds the GIL and wants the store (`col_index` -> `desc`, a
+    /// concurrent `flush`, another handle's `open`).  The backing is cloned
+    /// out and locked inside the detach instead.
+    fn put_cells_batch(
+        &self,
+        py: Python<'_>,
+        col_idx: usize,
+        startrow: u64,
+        values: Vec<RecordValue>,
+    ) -> PyResult<()> {
+        let shared = {
+            let inner = self.inner.lock().unwrap();
+            let Inner::Write { shared, .. } = &*inner else {
+                return Err(not_writable(self.view));
+            };
+            std::sync::Arc::clone(shared)
+        };
+        py.detach(|| -> PyResult<()> {
+            let mut s = shared.lock().unwrap();
+            // Validate against the column's declared type and fixed shape
+            // before writing (parity with the per-cell `put_cell` checks).
+            let desc = s.wt.desc().clone();
+            for (row, value) in (startrow..).zip(values) {
+                if let Some(col) = desc.columns.get(col_idx) {
+                    if !record_fits_column(col, &value) {
+                        return Err(PyTypeError::new_err(format!(
+                            "putcol/putcell: {} cannot be stored in column {} (valueType {})",
+                            value_name(&value),
+                            col.name,
+                            ::casacure::casa_value_type(col.data_type)
+                        )));
+                    }
+                    if let (Some(fixed), RecordValue::Array(a)) = (&col.shape, &value) {
+                        // Logical cell shape = the reversed stored shape.
+                        let matches = a.shape.len() == fixed.len()
+                            && a.shape
+                                .iter()
+                                .zip(fixed.iter().rev())
+                                .all(|(&got, &want)| got == want.max(0) as u32);
+                        if !fixed.is_empty() && !matches {
+                            let logical: Vec<u32> =
+                                fixed.iter().rev().map(|&d| d.max(0) as u32).collect();
+                            return Err(PyValueError::new_err(format!(
+                                "putcol: cell shape {:?} does not match column {} fixed shape {:?}",
+                                a.shape, col.name, logical
+                            )));
+                        }
+                    }
+                }
+                s.wt.putcell(col_idx, row, value).map_err(err)?;
+                // Mark the store dirty per stored cell: a batch that fails
+                // mid-way keeps the cells it already wrote pending for the
+                // next flush instead of silently dropping them.
+                s.dirty = true;
+            }
+            Ok(())
+        })
+    }
+
+    /// Convert user `putcol` data into one `RecordValue` per row.
+    fn value_to_cells(
+        &self,
+        py: Python<'_>,
+        col_idx: usize,
+        value: &Bound<'_, PyAny>,
+        nrow: u64,
+        is_array_col: bool,
+        varcol: bool,
+    ) -> PyResult<Vec<RecordValue>> {
+        // The column's declared element type, for scalar (list/tuple) values:
+        // casacore casts every element to it on putcol.
+        let col_dt = self.desc().columns.get(col_idx).map(|c| c.data_type);
+        // Normalize numpy unicode/byte string arrays to nested Python lists
+        // so the string handling paths (the scalar list branch and the array
+        // list->typed-ndarray normalization) see them.
+        let stringified: Option<Bound<'_, PyAny>> = if value.getattr("dtype").is_ok() {
+            let kind: String = value.getattr("dtype")?.getattr("kind")?.extract()?;
+            if kind == "U" || kind == "S" {
+                Some(value.call_method0("tolist")?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let value = match &stringified {
+            Some(s) => s,
+            None => value,
+        };
+        // Coerce numeric ndarrays (scalar AND array columns) to the column's
+        // element type (casacore casts, e.g. complex64 -> dcomplex when the
+        // column is C8, int64/int16 -> int32 for an Int column). String
+        // arrays are already handled by `stringified` above, so skip them.
+        let mut coerced: Option<Bound<'_, PyAny>> = None;
+        if stringified.is_none() {
+            if let Some(npd) = core::record::data_type_to_np(
+                self.desc().columns.get(col_idx).map(|c| &c.data_type),
+            ) {
+                // Any ndarray (typed ndarrays don't all downcast to the
+                // `PyArrayDyn<PyAny>` form, e.g. complex64).
+                if value.getattr("dtype").is_ok()
+                    && value.cast::<PyList>().is_err()
+                    && value.cast::<PyDict>().is_err()
+                {
+                    let dtype = value.getattr("dtype")?;
+                    let kind: String = dtype.getattr("kind")?.extract()?;
+                    let itemsize: i64 = dtype.getattr("itemsize")?.extract()?;
+                    let have = core::record::np_kind_itemsize(&kind, itemsize);
+                    if have != Some(npd) {
+                        coerced = Some(value.call_method1("astype", (npd,))?);
+                    }
+                }
+            }
+        }
+        let value = match &coerced {
+            Some(c) => c,
+            None => value,
+        };
+        if is_array_col {
+            // Accept a 2-D+ ndarray or a list of row-arrays.
+            if value.cast::<PyDict>().is_ok() {
+                let rec = convert::py_to_string_array(py, value)?;
+                return Ok(vec![rec]);
+            }
+            // Plain Python list/tuple (putvarcol row values, or putcol with
+            // lists-of-rows): normalize to a typed ndarray of the column's
+            // element type and fall through to the ndarray handling below.
+            let mut normalized: Vec<Bound<'_, PyAny>> = Vec::new();
+            let mut value = value;
+            if value.cast::<PyList>().is_ok() || value.cast::<PyTuple>().is_ok() {
+                let mut arr = py.import("numpy")?.getattr("asarray")?.call1((value,))?;
+                // String columns have no numpy mapping in `data_type_to_np`;
+                // unicode/byte arrays must become object arrays for the
+                // string-cell handler to see them.
+                let npd = core::record::data_type_to_np(
+                    self.desc().columns.get(col_idx).map(|c| &c.data_type),
+                )
+                .or_else(|| {
+                    matches!(
+                        self.desc().columns.get(col_idx).map(|c| c.data_type),
+                        Some(core::record::DataType::String)
+                    )
+                    .then_some("object")
+                });
+                if let Some(npd) = npd {
+                    let dt = arr.getattr("dtype")?;
+                    let kind: String = dt.getattr("kind")?.extract()?;
+                    let itemsize: i64 = dt.getattr("itemsize")?.extract()?;
+                    if core::record::np_kind_itemsize(&kind, itemsize) != Some(npd) {
+                        arr = arr.call_method1("astype", (npd,))?;
+                    }
+                }
+                normalized.push(arr);
+                value = normalized.last().unwrap();
+            }
+            // Complex arrays (the coercion above has already matched the
+            // array to the column precision); numpy 0.26 names: Complex32 =
+            // c64 (float32 complex), Complex64 = c128 (float64 complex).
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<numpy::Complex32>>() {
+                let readonly = arr.readonly();
+                return ndarray_cells_typed(&readonly, nrow, varcol, |v| {
+                    core::record::ArrayData::Complex(v.into_iter().map(|c| (c.re, c.im)).collect())
+                });
+            }
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<numpy::Complex64>>() {
+                let readonly = arr.readonly();
+                return ndarray_cells_typed(&readonly, nrow, varcol, |v| {
+                    core::record::ArrayData::DComplex(v.into_iter().map(|c| (c.re, c.im)).collect())
+                });
+            }
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<Py<PyAny>>>() {
+                let readonly = arr.readonly();
+                let shape: Vec<usize> = readonly.as_array().shape().to_vec();
+                let cell = reshape_cell(&shape);
+                let mut out = Vec::with_capacity(nrow as usize);
+                for r in 0..nrow as usize {
+                    let start = r * cell;
+                    let stop = ((r + 1) * cell).min(readonly.as_array().len());
+                    let mut elems: Vec<String> = Vec::with_capacity(stop - start);
+                    for e in readonly.as_array().iter().skip(start).take(stop - start) {
+                        elems.push(e.bind(py).extract::<String>().unwrap_or_default());
+                    }
+                    let casa_shape: Vec<u32> = shape[1..].iter().map(|&s| s as u32).collect();
+                    out.push(RecordValue::Array(core::record::ArrayValue {
+                        shape: casa_shape,
+                        data: core::record::ArrayData::String(elems),
+                    }));
+                }
+                return Ok(out);
+            }
+            for key in ["i32", "u16", "bool", "f32", "f64", "i64", "u8", "c8", "c16"] {
+                let _ = key;
+            }
+            // Numeric ndarray.
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<f64>>() {
+                let readonly = arr.readonly();
+                return ndarray_cells_typed(
+                    &readonly,
+                    nrow,
+                    varcol,
+                    core::record::ArrayData::Double,
+                );
+            }
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<f32>>() {
+                let readonly = arr.readonly();
+                return ndarray_cells_typed(
+                    &readonly,
+                    nrow,
+                    varcol,
+                    core::record::ArrayData::Float,
+                );
+            }
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<u8>>() {
+                let readonly = arr.readonly();
+                return ndarray_cells_typed(
+                    &readonly,
+                    nrow,
+                    varcol,
+                    core::record::ArrayData::UChar,
+                );
+            }
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<i16>>() {
+                let readonly = arr.readonly();
+                return ndarray_cells_typed(
+                    &readonly,
+                    nrow,
+                    varcol,
+                    core::record::ArrayData::Short,
+                );
+            }
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<u32>>() {
+                let readonly = arr.readonly();
+                return ndarray_cells_typed(&readonly, nrow, varcol, core::record::ArrayData::UInt);
+            }
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<u16>>() {
+                let readonly = arr.readonly();
+                return ndarray_cells_typed(
+                    &readonly,
+                    nrow,
+                    varcol,
+                    core::record::ArrayData::UShort,
+                );
+            }
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<i64>>() {
+                let readonly = arr.readonly();
+                return ndarray_cells_typed(
+                    &readonly,
+                    nrow,
+                    varcol,
+                    core::record::ArrayData::Int64,
+                );
+            }
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<i32>>() {
+                let readonly = arr.readonly();
+                return ndarray_cells_typed(&readonly, nrow, varcol, core::record::ArrayData::Int);
+            }
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<bool>>() {
+                let readonly = arr.readonly();
+                return ndarray_cells_typed(&readonly, nrow, varcol, core::record::ArrayData::Bool);
+            }
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<Complex32>>() {
+                let readonly = arr.readonly();
+                return ndarray_cells_typed(&readonly, nrow, varcol, |v| {
+                    core::record::ArrayData::Complex(v.into_iter().map(|c| (c.re, c.im)).collect())
+                });
+            }
+            if let Ok(arr) = value.cast::<numpy::PyArrayDyn<Complex64>>() {
+                let readonly = arr.readonly();
+                return ndarray_cells_typed(&readonly, nrow, varcol, |v| {
+                    core::record::ArrayData::DComplex(v.into_iter().map(|c| (c.re, c.im)).collect())
+                });
+            }
+            return Err(PyTypeError::new_err(format!(
+                "putcol: unsupported array data {}",
+                value.getattr("dtype")?.str()?.to_str()?
+            )));
+        }
+        // Scalar column: 1-D array (or list/tuple) of scalars. Each element
+        // is cast to the column's declared type (byte-identical semantics).
+        if let Ok(list) = value.cast::<PyList>() {
+            let mut out = Vec::with_capacity(list.len());
+            for item in list.iter() {
+                let rec = convert::pyobject_to_record(py, &item)?;
+                out.push(match col_dt.as_ref() {
+                    Some(dt) => convert::cast_scalar_to(dt, &rec),
+                    None => rec,
+                });
+            }
+            return Ok(out);
+        }
+        if let Ok(tup) = value.cast::<PyTuple>() {
+            let mut out = Vec::with_capacity(tup.len());
+            for item in tup.iter() {
+                let rec = convert::pyobject_to_record(py, &item)?;
+                out.push(match col_dt.as_ref() {
+                    Some(dt) => convert::cast_scalar_to(dt, &rec),
+                    None => rec,
+                });
+            }
+            return Ok(out);
+        }
+        if let Ok(arr) = value.cast::<numpy::PyArrayDyn<Py<PyAny>>>() {
+            let readonly = arr.readonly();
+            let mut out = Vec::with_capacity(readonly.as_array().len());
+            for e in readonly.as_array().iter() {
+                out.push(convert::pyobject_to_record(py, e.bind(py))?);
+            }
+            return Ok(out);
+        }
+        macro_rules! scalar_num {
+            ($ty:ty, $f:expr) => {{
+                if let Ok(arr) = value.cast::<numpy::PyArrayDyn<$ty>>() {
+                    let readonly = arr.readonly();
+                    let mut out = Vec::with_capacity(readonly.as_array().len());
+                    for e in readonly.as_array().iter() {
+                        out.push($f(e));
+                    }
+                    return Ok(out);
+                }
+            }};
+        }
+        scalar_num!(f64, |e: &f64| RecordValue::Double(*e));
+        scalar_num!(f32, |e: &f32| RecordValue::Float(*e));
+        scalar_num!(i64, |e: &i64| RecordValue::Int64(*e));
+        scalar_num!(i32, |e: &i32| RecordValue::Int(*e));
+        scalar_num!(i16, |e: &i16| RecordValue::Short(*e));
+        scalar_num!(u32, |e: &u32| RecordValue::UInt(*e));
+        scalar_num!(u8, |e: &u8| RecordValue::UChar(*e));
+        scalar_num!(u16, |e: &u16| RecordValue::UShort(*e));
+        scalar_num!(bool, |e: &bool| RecordValue::Bool(*e));
+        scalar_num!(Complex64, |e: &Complex64| RecordValue::DComplex(e.re, e.im));
+        scalar_num!(Complex32, |e: &Complex32| RecordValue::Complex(e.re, e.im));
+        // Fall back to a single-value conversion (numpy scalars, etc.).
+        let rec = convert::pyobject_to_record(py, value)?;
+        if matches!(rec, RecordValue::Array(_)) {
+            return Err(PyTypeError::new_err(
+                "putcol: unexpected array for a scalar column",
+            ));
+        }
+        Ok(vec![rec])
+    }
+
+    /// Serialize a column range to the python-visible form.
+    fn column_to_python(
+        &self,
+        py: Python<'_>,
+        _col_idx: usize,
+        cells: &[RecordValue],
+    ) -> PyResult<Py<PyAny>> {
+        let first = cells.iter().find(|c| !matches!(c, RecordValue::String(_)));
+        let is_array_col = matches!(first, Some(RecordValue::Array(_)));
+        if !is_array_col {
+            // Empty cells (e.g. a taql result with no rows): return empty.
+            if let Some(RecordValue::String(_) | RecordValue::Table(_)) = cells.first() {
+                let list = PyList::empty(py);
+                for v in cells {
+                    let s = match v {
+                        RecordValue::String(s) | RecordValue::Table(s) => s.clone(),
+                        other => other.to_json_string(),
+                    };
+                    list.append(s)?;
+                }
+                return Ok(list.into_any().unbind());
+            }
+            return convert::scalars_cells_to_array(py, cells);
+        }
+        check_cells_conform(cells)?;
+        let cell_shape = cell_shape_of(cells);
+        convert::arrays_to_ndarray_getcol(py, cells, &cell_shape)
+    }
+}
+
+impl Table {
+    fn col_index(&self, name: &str) -> PyResult<usize> {
+        let desc = self.desc();
+        desc.columns
+            .iter()
+            .position(|c| c.name == name)
+            .ok_or_else(|| PyKeyError::new_err(format!("no such column: {name}")))
     }
 }

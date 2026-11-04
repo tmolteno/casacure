@@ -226,20 +226,25 @@ def test_getcolslicenp_whole_cell_is_the_raw_fast_path_and_matches_getcol(ms):
     (one memcpy per row) and stay bit-identical to getcol.  The per-cell
     RecordValue path it replaces cost ~20x on a 435-row chunk read
     (2026-10-08, ssd0000.MS DATA 4x4 complex64: 0.70 ms/call vs
-    python-casacore's 0.03; the fast path restores ~0.03).  The whole-cell
-    idioms (negative/empty corners) are casacure extensions."""
+    python-casacore's 0.03; the fast path restores ~0.03).  Negative corners
+    mean begin/end in casacore too, so `(-1, -1)` is the portable whole-cell
+    idiom; *empty* corners are refused as casacore refuses them (issue #38:
+    casacure used to read them as the whole cell)."""
     t = table(ms, ack=False)
     data = t.getcol("DATA")
     for blc, trc in (
         ((0, 0), (NCHAN - 1, NCORR - 1)),  # explicit full cover
         ((-1, -1), (-1, -1)),              # the whole-cell idiom
-        ((), ()),                          # empty == whole cell
     ):
         buf = np.full((NROW, NCHAN, NCORR), np.nan + 1j * np.nan,
                       dtype=np.complex64)
         t.getcolslicenp("DATA", buf, blc, trc, (1, 1), 0, NROW)
         assert np.array_equal(buf, data), (
             f"whole-cell slice {blc}..{trc} diverged from getcol")
+    # Empty corners are casacore's Slicer rank error, not the whole cell
+    # (issue #38) -- they never reach the fast path.
+    with pytest.raises(RuntimeError, match="empty blc/trc"):
+        t.getcolslicenp("DATA", buf, (), (), (1, 1), 0, NROW)
     t.close()
 
 

@@ -5,6 +5,29 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Added
+
+- **`table` grows `getcellslicenp` and `putcellslice`** (issue #37) —
+  python-casacore's per-cell slice methods, absent from casacure until now,
+  so code ported from casacore died with
+  `AttributeError: 'builtins.table' object has no attribute ...`.
+  `getcellslicenp(column, buf, rownr, blc, trc, inc=[])` fills `buf` from one
+  cell's slice and returns `None`; the buffer carries the *slice's* shape —
+  no leading row axis, unlike `getcolslicenp` — must match it exactly
+  (casacore's `ArrayColumn::getSlice` conformance) and be C-contiguous
+  (`ValueError`, as `getcolslicenp` already raises).
+  `putcellslice(column, rownr, value, blc, trc, inc=[])` writes `value` —
+  exactly the slice's shape, no leading row axis and no broadcast (casacore
+  refuses a scalar value with a conformance error) — into one cell, with
+  `inc` as the per-dimension stride (strided writes reproduce casacore's
+  readback element for element). Both share the machinery issue #36 built:
+  `slice_arg` for the corners, the rank checks, and `putcolslice`'s
+  stride overlay — `putcellslice` is that overlay pinned to one row with the
+  value promoted to a leading 1-axis, the same trick `putcell` uses for
+  `putcol` — and both refuse scalar columns (issue #38). Every expectation
+  in the tests is pinned against python-casacore 3.8.1. Tests:
+  `tests/test_cell_slice_methods.py` (11).
+
 ### Fixed
 
 - **`getcol` of a variable-shape column whose rows differ in shape raises**
@@ -33,6 +56,33 @@ subtasks are moved here.
   `inc` as the per-dimension stride of the write, reproducing casacore's
   strided result (`[[9, 2, 9, 4], ...]`) exactly.  Tests:
   `tests/test_slice_arguments.py` (10).
+- **The slice APIs validate like casacore's: empty corners raise, scalar
+  columns are refused, and buffer/value mismatches fail instead of filling
+  or writing partially** (issue #38).  casacore's `Slicer` compares every
+  corner `IPosition` against the cell's `ndim()`, so `blc=[]`/`trc=[]` is
+  always a `RuntimeError` — casacure's core read the empty slice as "the
+  whole cell", an internal idiom the `-1` corner conversion feeds (and
+  dask-ms's `(-1, ..)` whole-cell idiom relies on) that now stays internal:
+  only the Python-visible empty corners are refused, and the `-1` form still
+  means begin/end in both libraries.  Every slice entry point now refuses a
+  scalar column (`column S is not an array column`, RuntimeError) — casacore
+  refuses one from all of them, where casacure sliced happily; plain
+  `getcol`/`getcell` reads are untouched.  `getcolslicenp` checks its buffer
+  against the exact slice shape — too big, too small and wrong-row buffers
+  all raise casacore's `ArrayColumn::getColumn ... Table array conformance
+  error` class of error on both the whole-cell fast path and the per-cell
+  path, where casacure filled whatever overlapped (`fill_flat` is
+  bounds-checked, so no memory was at risk — the caller just silently got
+  partial data).  `putcolslice` refuses — before a single cell is written,
+  so a refusal never leaves a half-written window — a value whose row count
+  or per-dimension extent differs from what would be written, and a window
+  past the last row (casacore's `putColumnCells`/`putSlice` conformance);
+  its `nrow` default is now casacore's `-1`: the rest of the column, with
+  the value required to cover exactly those rows (the old value-driven
+  default silently wrote a prefix).  Each refusal names the casacore error
+  it mirrors, and all six entry points share one validation path
+  (`check_slice_request`, `put_slice_overlay`).  Tests:
+  `tests/test_slice_validation.py` (8).
 
 ### Tests
 
