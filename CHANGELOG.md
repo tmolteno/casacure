@@ -5,6 +5,8 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.38] - 2026-11-05
+
 ### Added
 
 - **`iscelldefined(columnname, rownr)`** (issue #32), python-casacore's
