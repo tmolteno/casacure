@@ -24,7 +24,9 @@ jobs:
         # skyfield is the algorithm model used while porting it (they are the
         # `.[dev]` extra; python-casacore needs the casacore C++ libraries so
         # it is installed explicitly rather than pulled in by the extra).
-        run: pip install python-casacore pytest maturin astropy skyfield
+        # pyyaml is the `.[dev]` parser test_publish_workflow.py needs to
+        # check publish-python.yml's wheel matrix (issue #35).
+        run: pip install python-casacore pytest maturin astropy skyfield pyyaml
 
       - name: Generate casacore fixture tables
         run: python tests/make_fixtures.py
@@ -94,7 +96,7 @@ jobs:
         run: |
           uv python install 3.14t
           uv venv --python 3.14t .venv-ft
-          uv pip install --python .venv-ft/bin/python numpy pytest maturin
+          uv pip install --python .venv-ft/bin/python numpy pytest maturin pyyaml
           source .venv-ft/bin/activate
           maturin develop
 

@@ -11,7 +11,8 @@
 
 The MultiFile fixture needs real python-casacore to create (an `.aipsrc`
 in a private HOME, no user config touched); tests needing it are skipped
-when it is not installed.
+when it is not installed. A second MultiFile test shapes the directory by
+hand instead — hermetic, and covering both container flavours.
 """
 
 import os
@@ -118,3 +119,38 @@ def test_multifile_open_error_names_the_container(tmp_path):
     assert (path / "table.mf").is_file(), sorted(p.name for p in path.iterdir())
     with pytest.raises(RuntimeError, match="MultiFile"):
         ct.table(str(path), ack=False)
+
+
+@pytest.mark.parametrize("container", ["table.mf", "table.mfh5"])
+def test_multifile_open_error_is_named_hermetically(tmp_path, container):
+    """#33 without python-casacore: shape a directory the way multifile
+    storage leaves it (real `table.dat`, no per-manager `table.f*`, one
+    container) and pin the refusal — both container flavours, which the
+    casacore-created fixture above cannot produce (casacore writes only
+    `table.mf` from `.aipsrc`)."""
+    path = tmp_path / "mf2.tab"
+    t = ct.table(
+        str(path),
+        ct.maketabdesc([ct.makescacoldesc("D", 0.0, valuetype="float")]),
+        nrow=2,
+        ack=False,
+    )
+    t.putcol("D", np.ones(2, dtype="f4"))
+    t.close()
+    for f in path.glob("table.f*"):
+        f.unlink()
+    (path / container).write_bytes(b"container stand-in")
+
+    # Read-only, so the open reads the files: a *writable* reopen in this same
+    # process attaches to the live backing casacure keeps for the directory
+    # (handles accumulate into one cell store) and never re-reads them. A
+    # writable open in a fresh process — the real issue #33 shape — takes the
+    # same disk path and is pinned by the Rust test
+    # crates/casacure/tests/multifile_open.rs.
+    with pytest.raises(RuntimeError, match="MultiFile") as exc:
+        ct.table(str(path), ack=False, readonly=True)
+    msg = str(exc.value)
+    assert container in msg, msg
+    # The bare missing-file os error the issue was filed against must not
+    # surface: it reads like corruption, not like an unsupported container.
+    assert "No such file" not in msg, msg

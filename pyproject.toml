@@ -58,6 +58,8 @@ version = "3.8.37"
 #               reference (precession/nutation/sidereal time); used when
 #               porting and cross-checking the Rust implementation.
 #   pytest    - the test runner.
+#   pyyaml    - tests/test_publish_workflow.py parses publish-python.yml to
+#               hold the wheel matrix to the README's promises (issue #35).
 # python-casacore is deliberately *not* here: it needs the casacore C++
 # libraries and is only required for the casacore-parity tests (CI
 # installs it explicitly to generate fixtures and run those comparisons).
@@ -65,6 +67,7 @@ dev = [
     "astropy",
     "skyfield",
     "pytest",
+    "pyyaml",
 ]
 
 [project.scripts]

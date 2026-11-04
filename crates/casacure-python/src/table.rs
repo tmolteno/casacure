@@ -739,10 +739,13 @@ fn cell_shape_of(cells: &[RecordValue]) -> Vec<usize> {
         .unwrap_or_default()
 }
 
-/// One stacked array can only hold cells of one shape: refuse a variable-shape
-/// column whose rows differ, as casacore does, rather than cut every row to the
-/// first row's shape. Empty (undefined) cells stay exempt: they read as defaults.
-fn check_cells_conform(cells: &[RecordValue]) -> PyResult<()> {
+/// The shape conflict that stops `cells` being stacked into one array, if any:
+/// the first defined shape seen, and the first cell whose shape differs from
+/// it. Empty (undefined) cells and non-array cells never take part (they read
+/// as defaults, issue #8). Kept pure — free of `PyErr`, whose construction
+/// needs a linked Python — so the decision table is unit-tested directly;
+/// `check_cells_conform` below only renders the verdict.
+fn first_shape_conflict(cells: &[RecordValue]) -> Option<(&[u32], &[u32])> {
     let mut first: Option<&[u32]> = None;
     for cell in cells {
         let RecordValue::Array(a) = cell else {
@@ -753,17 +756,24 @@ fn check_cells_conform(cells: &[RecordValue]) -> PyResult<()> {
         }
         match first {
             None => first = Some(&a.shape),
-            Some(shape) if shape != a.shape.as_slice() => {
-                return Err(PyRuntimeError::new_err(format!(
-                    "getcol: cells of shape {shape:?} and {:?} cannot be stacked; \
-                     use getvarcol for a column whose rows differ in shape",
-                    a.shape
-                )));
-            }
+            Some(shape) if shape != a.shape.as_slice() => return Some((shape, &a.shape)),
             Some(_) => {}
         }
     }
-    Ok(())
+    None
+}
+
+/// One stacked array can only hold cells of one shape: refuse a variable-shape
+/// column whose rows differ, as casacore does, rather than cut every row to the
+/// first row's shape. Empty (undefined) cells stay exempt: they read as defaults.
+fn check_cells_conform(cells: &[RecordValue]) -> PyResult<()> {
+    match first_shape_conflict(cells) {
+        None => Ok(()),
+        Some((shape, other)) => Err(PyRuntimeError::new_err(format!(
+            "getcol: cells of shape {shape:?} and {other:?} cannot be stacked; \
+             use getvarcol for a column whose rows differ in shape"
+        ))),
+    }
 }
 
 /// A short human name for a `RecordValue` variant (for error messages).
@@ -4374,5 +4384,222 @@ mod subtable_resolve_tests {
             resolve_stored_subtable("SUB", TABLE_DIR.as_ref(), BASE.as_ref()),
             "/data/ms_cure.ms/SUB"
         );
+    }
+}
+
+/// Unit tests for the `getcol` stacking check (issue #25): one stacked array
+/// holds one shape, and empty (undefined) cells stay exempt because they read
+/// as defaults (issue #8).  The user-visible refusal — `getcol` raising
+/// instead of cutting every row to the first row's shape, with the hint to use
+/// `getvarcol` — is exercised end to end in `tests/test_core_tables_e2e.py`
+/// (the refusal itself needs a linked Python to build its `PyErr`); this pins
+/// the decision table itself, including the corners a table rarely produces.
+#[cfg(test)]
+mod getcol_conform_tests {
+    use super::first_shape_conflict;
+    use ::casacure::record::{ArrayData, ArrayValue, RecordValue};
+
+    /// A double array cell whose element count follows from `shape`.
+    fn array(shape: &[u32]) -> RecordValue {
+        let n = shape.iter().map(|&d| d as usize).product();
+        RecordValue::Array(ArrayValue {
+            shape: shape.to_vec(),
+            data: ArrayData::Double(vec![0.0; n]),
+        })
+    }
+
+    #[test]
+    fn rows_of_one_shape_stack() {
+        assert!(first_shape_conflict(&[array(&[2]), array(&[2]), array(&[2])]).is_none());
+    }
+
+    #[test]
+    fn a_single_row_or_no_rows_always_stacks() {
+        assert!(first_shape_conflict(&[array(&[3])]).is_none());
+        assert!(first_shape_conflict(&[]).is_none());
+    }
+
+    #[test]
+    fn rows_of_different_shapes_report_both_shapes() {
+        // The issue #25 shape: getcol must refuse, not cut every row to the
+        // first row's shape. The verdict carries the two shapes, which is
+        // exactly what the error message renders.
+        let cells = [array(&[1]), array(&[2]), array(&[3])];
+        assert_eq!(
+            first_shape_conflict(&cells),
+            Some((&[1u32][..], &[2u32][..]))
+        );
+        // Where the difference appears does not matter: a divergent second
+        // row or a divergent last one, either way.
+        let late = [array(&[2]), array(&[2]), array(&[3])];
+        assert_eq!(
+            first_shape_conflict(&late),
+            Some((&[2u32][..], &[3u32][..]))
+        );
+        let reversed = [array(&[3]), array(&[2])];
+        assert_eq!(
+            first_shape_conflict(&reversed),
+            Some((&[3u32][..], &[2u32][..]))
+        );
+    }
+
+    #[test]
+    fn undefined_and_empty_cells_stay_exempt() {
+        // #8: a never-written cell reads as the default.  It must not make
+        // the column ragged next to the one real shape.
+        let cells = vec![
+            array(&[2]),
+            array(&[]),               // no shape at all: never written
+            array(&[0]),              // a zero dimension: zero elements
+            RecordValue::Double(0.0), // a scalar among arrays is skipped
+            array(&[2]),
+        ];
+        assert!(first_shape_conflict(&cells).is_none());
+    }
+
+    #[test]
+    fn all_undefined_cells_stack_as_defaults() {
+        assert!(first_shape_conflict(&[array(&[]), array(&[0]), RecordValue::Int(0)]).is_none());
+    }
+
+    #[test]
+    fn exempt_cells_do_not_hide_a_real_difference() {
+        // The exemption covers exempt cells only: two real, different shapes
+        // still refuse with undefined rows interleaved between them.
+        assert_eq!(
+            first_shape_conflict(&[array(&[]), array(&[2]), array(&[3])]),
+            Some((&[2u32][..], &[3u32][..]))
+        );
+        assert_eq!(
+            first_shape_conflict(&[array(&[2]), array(&[0]), array(&[3])]),
+            Some((&[2u32][..], &[3u32][..]))
+        );
+    }
+}
+
+/// Unit tests for the out-of-band schema check (issue #30): a later open
+/// reusing this process's live backing must notice that another writer
+/// added, removed or replaced `table.dat` — or that it became unreadable —
+/// instead of serving the stale schema. The end-to-end scenarios (a column
+/// python-casacore/dask-ms added, an external `removecols`, a dirty backing
+/// refusing to flush over a foreign column) are pinned in
+/// `tests/test_cross_writer_visibility.py`; this covers the decision
+/// itself, including the unreadable-file corner no table produces on
+/// purpose.
+#[cfg(test)]
+mod cross_writer_column_tests {
+    use super::{disk_column_names, disk_columns_differ};
+    use ::casacure::record::{DataType, RecordValue, TableRecord};
+    use ::casacure::{create_table, ColumnDesc, ColumnKind, TableDesc};
+    use std::path::PathBuf;
+
+    /// `<temp>/<name>`, removed first and again on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Scratch {
+            let p = std::env::temp_dir()
+                .join(format!("casacure-py-diskcols-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Scratch(p)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn empty_record() -> TableRecord {
+        TableRecord {
+            desc: Default::default(),
+            record_type: 0,
+            values: Vec::new(),
+        }
+    }
+
+    /// One scalar double column per name — enough to shape `table.dat`'s
+    /// column list, which is all the check reads.
+    fn desc_with(names: &[&str]) -> TableDesc {
+        TableDesc {
+            name: String::new(),
+            version: String::new(),
+            comment: String::new(),
+            keywords: empty_record(),
+            private_keywords: empty_record(),
+            columns: names
+                .iter()
+                .map(|n| ColumnDesc {
+                    name: (*n).into(),
+                    comment: String::new(),
+                    data_type: DataType::Double,
+                    data_manager_type: "StandardStMan".into(),
+                    data_manager_group: "SSM".into(),
+                    options: 0,
+                    ndim: -1,
+                    shape: None,
+                    max_length: 0,
+                    keywords: empty_record(),
+                    kind: ColumnKind::Scalar(RecordValue::Double(0.0)),
+                    tile_shape: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// A real table directory holding exactly `names`, in order.
+    fn table_with(tag: &str, names: &[&str]) -> Scratch {
+        let dir = Scratch::new(tag);
+        let values: Vec<Vec<RecordValue>> = names
+            .iter()
+            .map(|_| vec![RecordValue::Double(1.0)])
+            .collect();
+        create_table(dir.0.as_path(), &desc_with(names), &values).unwrap();
+        dir
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn the_backing_owners_own_column_set_is_not_a_change() {
+        let dir = table_with("same", &["VALUE"]);
+        assert_eq!(disk_column_names(&dir.0), Some(names(&["VALUE"])));
+        assert!(!disk_columns_differ(&dir.0, &names(&["VALUE"])));
+    }
+
+    #[test]
+    fn a_column_added_out_of_band_is_a_change() {
+        // What a foreign writer's addcols leaves behind: the disk column
+        // list holds a column this backing never synced (issue #30's
+        // dask-ms case).
+        let dir = table_with("added", &["VALUE", "EXTRA"]);
+        assert_eq!(disk_column_names(&dir.0), Some(names(&["VALUE", "EXTRA"])));
+        assert!(disk_columns_differ(&dir.0, &names(&["VALUE"])));
+    }
+
+    #[test]
+    fn a_column_removed_out_of_band_is_a_change() {
+        // The backing still believes EXTRA exists; disk says otherwise.
+        let dir = table_with("removed", &["VALUE"]);
+        assert!(disk_columns_differ(&dir.0, &names(&["VALUE", "EXTRA"])));
+    }
+
+    #[test]
+    fn an_unreadable_table_dat_counts_as_changed() {
+        // The callers re-materialise from disk or drop the entry when this
+        // reports "changed", so a directory that is no longer a table must
+        // not be served from the stale backing either.
+        let dir = Scratch::new("nodat");
+        assert_eq!(disk_column_names(&dir.0), None);
+        assert!(disk_columns_differ(&dir.0, &names(&["VALUE"])));
+
+        let dir = table_with("corrupt", &["VALUE"]);
+        std::fs::write(dir.0.join("table.dat"), b"not a table").unwrap();
+        assert_eq!(disk_column_names(&dir.0), None);
+        assert!(disk_columns_differ(&dir.0, &names(&["VALUE"])));
     }
 }

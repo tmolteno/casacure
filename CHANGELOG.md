@@ -12,6 +12,41 @@ subtasks are moved here.
   shape without a message. Empty (undefined) cells stay exempt and read as
   defaults (issue #8).
 
+### Tests
+
+- **The recent fixes gained the coverage they were missing.**
+  Issue #33's container-naming refusal is now pinned hermetically:
+  `crates/casacure/tests/multifile_open.rs` shapes a MultiFile directory by
+  hand (real `table.dat`, no `table.f*`, one container) for both `table.mf`
+  and `table.mfh5`, and bounds the check both ways — a plain missing data
+  file still says `table.f0: No such file...`, an absent directory never
+  says MultiFile — where the Python fixture test needs real python-casacore
+  to create the table and covers `table.mf` only;
+  `tests/test_getvarcol_and_multifile.py` grows the same hermetic check at
+  the Python surface (a read-only open, since a same-process writable
+  reopen attaches to the live backing by design).  Issue #25's stacking
+  check is split into the pure `first_shape_conflict` — behaviour
+  unchanged, it only lifts the decision out of the `PyErr` construction,
+  whose symbols cannot link under pyo3's `extension-module` — with 6 unit
+  tests over its decision table (undefined, zero-dim and scalar cells stay
+  exempt per issue #8, and never mask a real difference), and
+  `tests/test_core_tables_e2e.py` pins the check's second call site
+  (`getcolslice`) plus `getcell` and the refusal message against
+  python-casacore 3.8.1's behaviour: a slice every row satisfies stacks, a
+  slice past the shortest row raises rather than clipping.  Issue #30's
+  cross-writer staleness decision (`disk_columns_differ`) gains 4 unit
+  tests — an added or removed out-of-band column counts as changed, the
+  backing owner's own set does not, and an unreadable or corrupt
+  `table.dat` counts as changed too (the corner
+  `tests/test_cross_writer_visibility.py`'s six end-to-end scenarios do not
+  produce).  Issue #35's silent matrix drift gets
+  `tests/test_publish_workflow.py` (3 tests; PyYAML added to `.[dev]` and
+  both CI installs): the macOS and Windows
+  matrices must build exactly the CPython range the README table promises,
+  both Linux architectures must be built through manylinux with the sdist
+  exactly once, and the Linux range must equal `requires-python` —
+  mutation-checked: dropping the macOS 3.10 entry fails the suite.
+
 ## [3.8.37] - 2026-11-03
 
 ### Fixed

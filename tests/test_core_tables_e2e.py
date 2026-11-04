@@ -710,3 +710,37 @@ def test_getcol_stacks_defined_cells_past_an_undefined_one(tmp_path):
     r = table(p, ack=False)
     np.testing.assert_array_equal(r.getcol("V"), [[1.0, 2.0], [0.0, 0.0], [3.0, 4.0]])
     r.close()
+
+
+def test_ragged_column_slice_cell_and_message_paths(tmp_path):
+    """#25's refusal lives in `column_to_python`, the stacker behind both
+    `getcol` and its sibling `getcolslice`; pin the whole surface against
+    python-casacore's behaviour (verified against 3.8.1):
+
+    - a slice every row can satisfy conforms and stacks — casacore returns
+      the same values,
+    - a slice past the shortest row raises (casacore raises its Slicer error
+      there) instead of silently clipping the longer rows,
+    - `getcell` keeps returning whole rows of any length, and
+    - the `getcol` refusal names `getvarcol` as the way out.
+    """
+    p = str(tmp_path / "ragged_slice.tab")
+    t = table(p, maketabdesc([makearrcoldesc("V", 0.0, ndim=1)]), nrow=3, ack=False)
+    for row in range(3):
+        t.putcell("V", row, np.arange(1.0, row + 2.0))
+    t.close()
+
+    r = table(p, ack=False)
+    # [0]..[0] fits every row (shapes 1, 2, 3): the slice conforms per row
+    # and stacks.
+    np.testing.assert_array_equal(r.getcolslice("V", [0], [0]), [[1.0], [1.0], [1.0]])
+    # [0]..[1] does not fit row 0 (shape [1]): refused, never cut to fit.
+    with pytest.raises(RuntimeError):
+        r.getcolslice("V", [0], [1])
+    # getcell is unchanged: whole rows, whatever their length.
+    np.testing.assert_array_equal(r.getcell("V", 0), [1.0])
+    np.testing.assert_array_equal(r.getcell("V", 2), [1.0, 2.0, 3.0])
+    # The refusal message is the documented contract: it names getvarcol.
+    with pytest.raises(RuntimeError, match="getvarcol"):
+        r.getcol("V")
+    r.close()
