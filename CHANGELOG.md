@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. Completed `TODO.md`
 subtasks are moved here.
 
-## [Unreleased]
+## [3.8.38] - 2026-11-05
 
 ### Changed
 
@@ -22,8 +22,6 @@ subtasks are moved here.
   covers it. The NumPy C-API is resolved at runtime by rust-numpy, so
   the abi3 wheel runs on numpy 1.x and 2.x alike (verified on 3.10 with
   numpy 1.26 and 2.2).
-
-## [3.8.38] - 2026-11-05
 
 ### Added
 
