@@ -776,6 +776,23 @@ fn check_cells_conform(cells: &[RecordValue]) -> PyResult<()> {
     }
 }
 
+/// Whether `cells` holds string arrays. python-casacore's `getcol` never
+/// refuses a ragged string column: it stacks it, cutting (or padding) every
+/// row to the first row's shape and returning the `{"array", "shape"}`
+/// dict — an MS `HISTORY.CLI_COMMAND` column comes back as
+/// `[nrow, 1]` with each row's first element. The conform check must
+/// therefore not apply to string arrays; the numeric variable-shape case
+/// still raises, as casacore does (`StManIndArray::get shapes not
+/// conforming`).
+fn is_string_array_column(cells: &[RecordValue]) -> bool {
+    cells.iter().any(|c| {
+        matches!(
+            c,
+            RecordValue::Array(a) if matches!(a.data, ArrayData::String(_))
+        )
+    })
+}
+
 /// A short human name for a `RecordValue` variant (for error messages).
 fn value_name(v: &RecordValue) -> &'static str {
     match v {
@@ -2378,7 +2395,20 @@ impl Table {
                 }
                 Ok(())
             }
-            Inner::Write { shared } => shared.lock().unwrap().wt.unlock().map_err(err),
+            Inner::Write { shared } => {
+                let mut s = shared.lock().unwrap();
+                s.wt.unlock().map_err(err)?;
+                // casacore's `unlock()` physically flushes pending writes so
+                // other processes see them once the lock drops. Disk now
+                // holds this backing's own descriptor — refresh the snapshot
+                // the schema guard compares against, or the handle's next
+                // `flush_if_dirty` reads its own unlock-flush as a foreign
+                // addcols/removecols and refuses to write (dask-ms's
+                // add-column path hits exactly this).
+                s.disk_columns = s.wt.desc().columns.iter().map(|c| c.name.clone()).collect();
+                s.dirty = false;
+                Ok(())
+            }
         }
     }
 
@@ -5021,7 +5051,9 @@ impl Table {
             }
             return convert::scalars_cells_to_array(py, cells);
         }
-        check_cells_conform(cells)?;
+        if !is_string_array_column(cells) {
+            check_cells_conform(cells)?;
+        }
         let cell_shape = cell_shape_of(cells);
         convert::arrays_to_ndarray_getcol(py, cells, &cell_shape)
     }

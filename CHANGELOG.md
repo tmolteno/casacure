@@ -3,6 +3,34 @@
 All notable changes to this project are documented here. Completed `TODO.md`
 subtasks are moved here.
 
+## [Unreleased]
+
+### Fixed
+
+- **`unlock()` refreshes the schema guard's snapshot after its implicit
+  flush.** casacore's `unlock()` physically flushes pending writes (so other
+  processes see them once the lock drops), but the binding kept `disk_columns`
+  at its last-sync value. The handle's *own* unlock-flush after `addcols`
+  therefore read as a foreign schema change at the next `flush()`/`putcol`,
+  and the write was refused with "the table's columns changed on disk …
+  while this handle holds unflushed writes". dask-ms's add-column
+  choreography — `lock(write=True)`, `addcols`, `unlock`, `putcol`,
+  `flush` — hit it on every new column (10 dask-ms tests red on 3.8.38).
+  The foreign-writer guard (issue #30) is untouched:
+  `tests/test_cross_writer_visibility.py` still refuses genuine out-of-band
+  schema changes (6/6), and a regression test pins the dask-ms sequence
+  (`test_unlock_after_addcols_flushes_without_tripping_the_guard`).
+
+- **`getcol` on a ragged `Array<String>` column stacks like python-casacore
+  instead of raising.** Every row is cut (or padded) to the first row's
+  shape and returned as the `{"array", "shape"}` dict, exactly as
+  python-casacore 3.8.1 does — byte-identical on a real MS
+  `HISTORY.CLI_COMMAND` (`[nrow, 1]`, each row's first element). The issue
+  #25 refusal stays for numeric variable-shape columns, which casacore also
+  raises on (`StManIndArray::get shapes not conforming`). On 3.8.38
+  dask-ms's `dask-ms convert` failed on any MS with HISTORY entries
+  (`getcol: cells of shape … cannot be stacked`).
+
 ## [3.8.38] - 2026-11-05
 
 ### Changed

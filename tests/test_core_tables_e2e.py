@@ -744,3 +744,70 @@ def test_ragged_column_slice_cell_and_message_paths(tmp_path):
     with pytest.raises(RuntimeError, match="getvarcol"):
         r.getcol("V")
     r.close()
+
+
+def test_getcol_ragged_string_array_stacks_like_casacore(tmp_path):
+    """`getcol` on a ragged ``Array<String>`` column never refuses: it stacks
+    every row cut (or padded) to the first row's shape and returns the
+    ``{"array", "shape"}`` dict — exactly what python-casacore 3.8.1 does
+    (pinned against a real MS ``HISTORY.CLI_COMMAND``: shape ``[nrow, 1]``,
+    each row's first element, byte-identical output). The issue #25 refusal
+    applies to numeric variable-shape columns, which casacore raises on too
+    (``StManIndArray::get shapes not conforming``); string arrays never
+    raised in python-casacore.
+    """
+    p = str(tmp_path / "ragged_str.tab")
+    t = table(p, maketabdesc([makearrcoldesc("S", "", ndim=1)]), nrow=3, ack=False)
+    t.putcell("S", 0, ["a"])
+    t.putcell("S", 1, ["b1", "b2"])
+    t.putcell("S", 2, ["c1", "c2", "c3"])
+    t.close()
+
+    r = table(p, ack=False)
+    d = r.getcol("S")
+    assert set(d) == {"shape", "array"}
+    # First row's shape wins, as casacore stacks it.
+    assert d["shape"] == [3, 1]
+    # Each row is cut to its first element — casacore's stacking, not an error.
+    assert d["array"] == ["a", "b1", "c1"]
+    # getvarcol keeps every row whole.
+    assert [len(v) for v in r.getvarcol("S").values()] == [1, 2, 3]
+    r.close()
+
+
+def test_unlock_after_addcols_flushes_without_tripping_the_guard(tmp_path):
+    """casacore's ``unlock()`` physically flushes pending writes; the binding
+    must refresh the snapshot its schema guard compares against, or the
+    handle's *own* unlock-flush (which persists the just-added column) reads
+    as a foreign addcols at the next ``flush`` and refuses the write.
+
+    That is dask-ms's add-column choreography — ``lock(write=True)``,
+    ``addcols``, ``unlock``, ``putcol``, ``flush`` — which used to die with
+    "the table's columns changed on disk ... while this handle holds
+    unflushed writes" (10 dask-ms tests).
+    """
+    p = str(tmp_path / "unlock_addcols.tab")
+    t = table(
+        p,
+        maketabdesc([makescacoldesc("DATA", 0.0, valuetype="float")]),
+        nrow=3,
+        ack=False,
+    )
+    t.putcol("DATA", np.array([1.0, 2.0, 3.0], dtype=np.float32))
+    t.close()
+
+    w = table(p, ack=False)
+    w.lock(write=True)
+    w.addcols(makescacoldesc("NEW", 0.0, valuetype="float"))
+    w.unlock()  # physically persists the new column
+    w.putcol("NEW", np.zeros(3, dtype=np.float32), startrow=0, nrow=3)
+    w.flush()
+    w.close()
+
+    r = table(p, ack=False)
+    assert "NEW" in r.colnames()
+    np.testing.assert_array_equal(r.getcol("NEW"), np.zeros(3, dtype=np.float32))
+    np.testing.assert_array_equal(
+        r.getcol("DATA"), np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    )
+    r.close()
