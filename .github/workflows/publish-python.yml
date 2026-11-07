@@ -67,7 +67,10 @@ jobs:
             target: aarch64-unknown-linux-gnu
             manylinux: auto
             interpreters: "python3.14t"
-          - platform: macos-14
+          # macos-14 images were retired on 2026-11-02 (GitHub Actions
+          # runner-image retirement): a job pinned to that label never gets a
+          # runner and the run is cancelled with the PyPI publish skipped.
+          - platform: macos-15
             target: aarch64-apple-darwin
             abi3: true
           - platform: windows-latest
