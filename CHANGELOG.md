@@ -5,6 +5,8 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.39] - 2026-11-07
+
 ### Fixed
 
 - **`unlock()` refreshes the schema guard's snapshot after its implicit
