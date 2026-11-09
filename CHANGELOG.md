@@ -5,6 +5,8 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.40] - 2026-11-09
+
 ### Fixed
 
 - **String-array keywords in a description are written as `Array<String>`
