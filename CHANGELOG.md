@@ -5,6 +5,8 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.41] - 2026-11-10
+
 ### Fixed
 
 - **Keyword records are written Variable, so casacore and CASA can modify a
