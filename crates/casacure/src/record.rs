@@ -1137,6 +1137,23 @@ impl TableRecord {
         s
     }
 }
+/// Dimension vector from an encoded `{"shape":[..], ...}` member: its
+/// non-negative integer elements, or `None` when it is not one. An empty
+/// member (`[]`, which `parse_array` types as an empty string array) means a
+/// 0-d array — the shape `to_json_string` writes for one.
+fn shape_dims(data: &ArrayData) -> Option<Vec<u32>> {
+    match data {
+        ArrayData::Int(v) if v.iter().all(|&i| i >= 0) => {
+            Some(v.iter().map(|&i| i as u32).collect())
+        }
+        ArrayData::Int64(v) if v.iter().all(|&i| i >= 0) => {
+            Some(v.iter().map(|&i| i as u32).collect())
+        }
+        ArrayData::String(v) if v.is_empty() => Some(Vec::new()),
+        _ => None,
+    }
+}
+
 /// Parse a JSON object into a `TableRecord` (`{"name": value, ...}`).
 /// This is the inverse of `TableRecord::to_json_string`: it reconstructs the
 /// typed keyword/descriptor structures from the dict representation
@@ -1245,6 +1262,33 @@ impl<'a> JsonParser<'a> {
             }
             Some(b'{') => {
                 let (sub_desc, values) = self.parse_object()?;
+                // `TableRecord::to_json_string` encodes an array as
+                // `{"shape":[..],"array":[..]}`; invert that here so a JSON
+                // round-trip keeps the value an Array instead of downgrading
+                // it to a Record. casacure#40: a keyword decoded as a Record
+                // is written to disk as a sub-record where casacore declares
+                // `Array<String>`, and CASA then refuses the table
+                // (`TableRecordRep::get_pointer - incorrect data type`).
+                // Only the exact two-field encoding is converted, so a genuine
+                // record that merely happens to carry both field names keeps
+                // its type.
+                if sub_desc.fields.len() == 2 {
+                    let pos = |n: &str| sub_desc.fields.iter().position(|f| f.name == n);
+                    if let (Some(si), Some(ai)) = (pos("shape"), pos("array")) {
+                        if let (RecordValue::Array(sh), RecordValue::Array(payload)) =
+                            (&values[si], &values[ai])
+                        {
+                            if let Some(dims) = shape_dims(&sh.data) {
+                                let value = RecordValue::Array(ArrayValue {
+                                    shape: dims,
+                                    data: payload.data.clone(),
+                                });
+                                let dt = infer_data_type(&value);
+                                return Ok((dt, None, value));
+                            }
+                        }
+                    }
+                }
                 let rec = TableRecord {
                     desc: sub_desc.clone(),
                     record_type: 0,
@@ -1673,6 +1717,53 @@ mod tests {
             }
             other => panic!("NEST: {other:?}"),
         }
+    }
+
+    #[test]
+    fn json_array_dict_decodes_to_array() {
+        // The inverse of json_parser_round_trip: to_json_string emits arrays
+        // as {"shape":[..],"array":[..]}, and parsing that back must give an
+        // Array, not a Record — a Record lands on disk as a sub-record where
+        // casacore declares Array<String>, and CASA then refuses the table
+        // (casacure#40: QuantumUnits / MEASINFO / FLAG_CATEGORY keywords).
+        let json = r#"{"QS":{"shape":[2],"array":["s","u"]},"AR":{"shape":[3],"array":[1,2,3]},"EMPTY":{"shape":[0],"array":[]}}"#;
+        let rec = parse_json_record(json).unwrap();
+        match rec.get("QS") {
+            Some(RecordValue::Array(a)) => {
+                assert_eq!(a.shape, vec![2]);
+                assert_eq!(a.data, ArrayData::String(vec!["s".into(), "u".into()]));
+            }
+            other => panic!("QS: {other:?}"),
+        }
+        match rec.get("AR") {
+            Some(RecordValue::Array(a)) => {
+                assert_eq!(a.shape, vec![3]);
+                assert_eq!(a.data, ArrayData::Int(vec![1, 2, 3]));
+            }
+            other => panic!("AR: {other:?}"),
+        }
+        // An empty payload keeps its dims (the FLAG_CATEGORY `[]` case).
+        match rec.get("EMPTY") {
+            Some(RecordValue::Array(a)) => assert_eq!(a.shape, vec![0]),
+            other => panic!("EMPTY: {other:?}"),
+        }
+        // encode → decode → encode is stable.
+        assert_eq!(rec.to_json_string(), json);
+
+        // A genuine record that merely carries a `shape` and an `array`
+        // field alongside a third keeps its type (only the exact two-field
+        // encoding is inverted). Bare member arrays normalise to the dict
+        // form on encode, so compare against that normalised form.
+        let json2 = r#"{"MEASINFO":{"shape":[1],"array":[2],"type":"epoch"}}"#;
+        let rec2 = parse_json_record(json2).unwrap();
+        assert!(matches!(rec2.get("MEASINFO"), Some(RecordValue::Record(_))));
+        let enc = rec2.to_json_string();
+        let rec2b = parse_json_record(&enc).unwrap();
+        assert!(matches!(
+            rec2b.get("MEASINFO"),
+            Some(RecordValue::Record(_))
+        ));
+        assert_eq!(rec2b.to_json_string(), enc);
     }
 
     #[test]

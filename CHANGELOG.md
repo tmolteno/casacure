@@ -5,6 +5,36 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **String-array keywords in a description are written as `Array<String>`
+  again, so CASA can open the table (issue #40).** The JSON round-trip
+  `table()` uses for a new description was asymmetric: `to_json_string`
+  encodes an array as `{"shape":[…],"array":[…]}`, but the parser read any
+  object back as a `Record`. `QuantumUnits: ['m','m','m']` and
+  `FLAG_CATEGORY`'s `CATEGORY: []` therefore landed on disk as sub-records
+  where casacore declares `Array<String>` — CASA refused the table
+  (`TableRecordRep::get_pointer - incorrect data type used for field
+  QuantumUnits`) and the description's fixed structure made it unrepairable
+  afterwards (`removecolkeyword` → "Record cannot be changed"). The parser
+  now inverts the exact two-field encoding (a genuine record that merely
+  carries a `shape` and an `array` field alongside a third keeps its type),
+  and the bindings turn any `{shape, array}` dict a caller passes back into
+  an array, so re-writing a description read from an older table repairs it
+  the way python-casacore does. Root cause of tmolteno/skarabina#14; hit by
+  every dask-ms-2 `xds_to_table` write (skarabina's averaged MSs, tart2ms's
+  output) — python-casacore reads the written tables back as arrays again.
+
+- **`putcolkeyword` stores numpy string arrays as `Array<String>`, not their
+  repr (issue #40).** `np.array(['s'])` (dtype `U`/`S`) has no rust-numpy
+  element type and fell through to the `str()` fallback, writing the keyword
+  as `"['s']"`; such arrays are now iterated into a string array (numpy
+  *scalars* stay plain strings). Regression tests:
+  `tests/test_keyword_arrays.py` (5 tests — description lists, numpy
+  `putcolkeyword`, the empty list, dict-form repair, `addcols`), each read
+  back through casacure **and**, where available, through real
+  python-casacore — the CASA-side oracle.
+
 ## [3.8.39] - 2026-11-07
 
 ### Fixed

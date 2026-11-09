@@ -754,26 +754,14 @@ pub(crate) fn pyobject_to_record(py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResu
         return Ok(RecordValue::Double(f));
     }
     if let Ok(d) = v.cast::<PyDict>() {
-        // The `{"shape": [..], "array": [..]}` multidim-string dict form:
-        // only when the array is actually strings.
+        // The `{"shape": [..], "array": [..]}` array dict form. python-casacore
+        // turns any such dict into an array, so do the same for any element
+        // type (casacure#40): re-writing a description that was read back from
+        // a table written by an older casacure then repairs the sub-record
+        // instead of copying it forward.
         if d.contains("shape")? && d.contains("array")? {
-            let is_strings = match d.get_item("array")? {
-                Some(a) => match a.cast::<PyList>() {
-                    Ok(list) => match list.iter().next() {
-                        None => true,
-                        Some(e) => {
-                            e.is_instance_of::<PyString>()
-                                || e.is_instance_of::<numpy::PyArrayDyn<Py<PyAny>>>()
-                        }
-                    },
-                    Err(_) => false,
-                },
-                None => false,
-            };
-            if is_strings {
-                if let Ok(sv) = py_to_string_array(py, v) {
-                    return Ok(sv);
-                }
+            if let Some(arr) = shape_array_dict(py, d)? {
+                return Ok(arr);
             }
         }
         return Ok(RecordValue::Record(dict_to_table_record(py, d)?));
@@ -880,6 +868,37 @@ pub(crate) fn pyobject_to_record(py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResu
             data: ArrayData::String(s),
         }));
     }
+    // numpy string/bytes arrays (dtype kind 'U'/'S'): rust-numpy has no
+    // element type for them, so they used to fall through to the str()
+    // fallback below and were stored as their repr ("['s']") — casacure#40,
+    // case 2 (`putcolkeyword` with `np.array(['s'])`). A numpy *scalar*
+    // (shape ()) stays a plain string.
+    if let Ok(dtype) = v.getattr("dtype") {
+        let kind = dtype.getattr("kind").and_then(|k| k.extract::<String>());
+        if matches!(kind.as_deref(), Ok("U") | Ok("S")) {
+            let shape: Vec<u32> = match v.getattr("shape").and_then(|s| s.extract::<Vec<usize>>()) {
+                Ok(s) => s.into_iter().map(|d| d as u32).collect(),
+                Err(_) => Vec::new(),
+            };
+            if !shape.is_empty() {
+                let mut data = Vec::new();
+                for item in pyo3::types::PyIterator::from_object(v)? {
+                    let e = item?;
+                    if let Ok(s) = e.extract::<String>() {
+                        data.push(s);
+                    } else if let Ok(b) = e.extract::<Vec<u8>>() {
+                        data.push(String::from_utf8_lossy(&b).into_owned());
+                    } else {
+                        data.push(e.str()?.to_cow()?.into_owned());
+                    }
+                }
+                return Ok(RecordValue::Array(ArrayValue {
+                    shape,
+                    data: ArrayData::String(data),
+                }));
+            }
+        }
+    }
     Ok(RecordValue::String(v.str()?.to_cow()?.into_owned()))
 }
 
@@ -949,6 +968,43 @@ fn list_to_array(py: Python<'_>, list: &Bound<'_, PyList>) -> PyResult<RecordVal
         Err(PyTypeError::new_err(
             "cannot convert mixed list to a keyword array",
         ))
+    }
+}
+
+/// A `{"shape": [...], "array": [...]}` dict as an `ArrayValue` — the dict
+/// form `to_json_string` writes for arrays and that multidim string reads
+/// return. `None` when it does not actually encode one (shape not a list of
+/// non-negative ints, or the payload not a flat scalar sequence), so the
+/// caller can keep such a dict as a genuine record.
+fn shape_array_dict(py: Python<'_>, d: &Bound<'_, PyDict>) -> PyResult<Option<RecordValue>> {
+    let (Some(shape_obj), Some(array_obj)) = (d.get_item("shape")?, d.get_item("array")?) else {
+        return Ok(None);
+    };
+    // dims: a list/tuple of ints, or a numpy integer array (reads emit
+    // `np.array([...], dtype=int32)` for the shape).
+    let dims: Vec<u32> = if let Ok(v) = shape_obj.extract::<Vec<u32>>() {
+        v
+    } else if let Ok(list) = shape_obj.call_method0("tolist") {
+        match list.extract::<Vec<u32>>() {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        }
+    } else {
+        return Ok(None);
+    };
+    // payload: a flat scalar sequence (list/tuple/numpy array).
+    let is_seq = array_obj.cast::<PyList>().is_ok()
+        || array_obj.cast::<PyTuple>().is_ok()
+        || array_obj.getattr("dtype").is_ok();
+    if !is_seq {
+        return Ok(None);
+    }
+    match pyobject_to_record(py, &array_obj) {
+        Ok(RecordValue::Array(a)) => Ok(Some(RecordValue::Array(ArrayValue {
+            shape: dims,
+            data: a.data,
+        }))),
+        _ => Ok(None),
     }
 }
 
