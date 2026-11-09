@@ -42,9 +42,22 @@ if [ -x .venv/bin/maturin ] && [ -x .venv/bin/python ]; then
     # is wiped at the start of every run instead: bounded to one run,
     # never accumulated (invoke release sets the same thing for its own
     # push; this covers plain `git push`).
-    mkdir -p /var/tmp/pytest-gate
+    #
+    # The basemp lives inside the checkout, not under /var/tmp: on a box
+    # where /var/tmp is a read-only mount (harness sandboxes) pytest's
+    # wipe fails with EROFS, the subsequent mkdir hits the leftovers and
+    # every test errors at setup with FileExistsError (292 of them,
+    # 2026-11-09, which blocked the v3.8.40 push). A caller that already
+    # chose a basemp through PYTEST_ADDOPTS keeps it verbatim.
+    if [[ "${PYTEST_ADDOPTS:-}" == *"--basetemp="* ]]; then
+        pytest_opts="$PYTEST_ADDOPTS"
+    else
+        basem="$(git rev-parse --show-toplevel)/.pytest-tmp"
+        mkdir -p "$basem"
+        pytest_opts="${PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }--basetemp=$basem"
+    fi
     PYTHONPATH=tests/shim \
-    PYTEST_ADDOPTS="--basetemp=/var/tmp/pytest-gate${PYTEST_ADDOPTS:+ $PYTEST_ADDOPTS}" \
+    PYTEST_ADDOPTS="$pytest_opts" \
         .venv/bin/python -m pytest tests/ -q
 fi
 
