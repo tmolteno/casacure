@@ -167,12 +167,12 @@ pub fn maketabdesc_from_json(columns: &[&str]) -> Result<TableDesc, MsError> {
         comment: String::new(),
         keywords: TableRecord {
             desc: Default::default(),
-            record_type: 0,
+            record_type: crate::record::RECORD_VARIABLE,
             values: Vec::new(),
         },
         private_keywords: TableRecord {
             desc: Default::default(),
-            record_type: 0,
+            record_type: crate::record::RECORD_VARIABLE,
             values: Vec::new(),
         },
         columns: Vec::new(),

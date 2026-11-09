@@ -52,7 +52,7 @@ impl Default for TaqlTable {
             columns: Vec::new(),
             source_keywords: crate::record::TableRecord {
                 desc: Default::default(),
-                record_type: 0,
+                record_type: crate::record::RECORD_VARIABLE,
                 values: Vec::new(),
             },
         }
@@ -1908,7 +1908,7 @@ fn desc_of_result(
             max_length: 0,
             keywords: crate::record::TableRecord {
                 desc: Default::default(),
-                record_type: 0,
+                record_type: crate::record::RECORD_VARIABLE,
                 values: Vec::new(),
             },
             kind: crate::tabledesc::ColumnKind::Scalar(def),
@@ -1921,12 +1921,12 @@ fn desc_of_result(
         comment: String::new(),
         keywords: crate::record::TableRecord {
             desc: Default::default(),
-            record_type: 0,
+            record_type: crate::record::RECORD_VARIABLE,
             values: Vec::new(),
         },
         private_keywords: crate::record::TableRecord {
             desc: Default::default(),
-            record_type: 0,
+            record_type: crate::record::RECORD_VARIABLE,
             values: Vec::new(),
         },
         columns: Vec::new(),
@@ -1974,7 +1974,7 @@ fn desc_of_result(
                     max_length: 0,
                     keywords: crate::record::TableRecord {
                         desc: Default::default(),
-                        record_type: 0,
+                        record_type: crate::record::RECORD_VARIABLE,
                         values: Vec::new(),
                     },
                     kind: crate::tabledesc::ColumnKind::Array,
@@ -4392,12 +4392,12 @@ pub fn create_table(query: &str) -> Result<PathBuf, TaqlError> {
         comment: String::new(),
         keywords: crate::record::TableRecord {
             desc: Default::default(),
-            record_type: 0,
+            record_type: crate::record::RECORD_VARIABLE,
             values: Vec::new(),
         },
         private_keywords: crate::record::TableRecord {
             desc: Default::default(),
-            record_type: 0,
+            record_type: crate::record::RECORD_VARIABLE,
             values: Vec::new(),
         },
         columns: Vec::new(),
@@ -4446,7 +4446,7 @@ pub fn create_table(query: &str) -> Result<PathBuf, TaqlError> {
                 // Parse a small keyword assignment list: name = value, ...
                 let mut rec = crate::record::TableRecord {
                     desc: Default::default(),
-                    record_type: 0,
+                    record_type: crate::record::RECORD_VARIABLE,
                     values: Vec::new(),
                 };
                 loop {
@@ -4535,7 +4535,7 @@ fn parse_column_spec(p: &mut Parser) -> Result<ColumnDesc, TaqlError> {
     let mut maxlen = 0i64;
     let keywords = crate::record::TableRecord {
         desc: Default::default(),
-        record_type: 0,
+        record_type: crate::record::RECORD_VARIABLE,
         values: Vec::new(),
     };
 
@@ -4714,7 +4714,7 @@ mod tests {
     fn empty_record() -> crate::record::TableRecord {
         crate::record::TableRecord {
             desc: Default::default(),
-            record_type: 0,
+            record_type: crate::record::RECORD_VARIABLE,
             values: Vec::new(),
         }
     }

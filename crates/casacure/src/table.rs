@@ -5245,7 +5245,7 @@ pub fn default_cell_value(cd: &crate::tabledesc::ColumnDesc) -> Option<RecordVal
         crate::tabledesc::ColumnKind::Record => {
             Some(RecordValue::Record(crate::record::TableRecord {
                 desc: Default::default(),
-                record_type: 0,
+                record_type: crate::record::RECORD_VARIABLE,
                 values: Vec::new(),
             }))
         }
@@ -5743,7 +5743,7 @@ mod tests {
     fn empty_record() -> TableRecord {
         TableRecord {
             desc: Default::default(),
-            record_type: 0,
+            record_type: crate::record::RECORD_VARIABLE,
             values: Vec::new(),
         }
     }
@@ -6405,7 +6405,7 @@ mod tests {
         let hh = {
             let mut r = crate::record::TableRecord {
                 desc: Default::default(),
-                record_type: 0,
+                record_type: crate::record::RECORD_VARIABLE,
                 values: Vec::new(),
             };
             r.desc.fields.push(crate::record::RecordDescField {
@@ -6422,7 +6422,7 @@ mod tests {
         let nest = {
             let mut r = crate::record::TableRecord {
                 desc: Default::default(),
-                record_type: 0,
+                record_type: crate::record::RECORD_VARIABLE,
                 values: Vec::new(),
             };
             r.desc.fields.push(crate::record::RecordDescField {
@@ -6513,7 +6513,7 @@ mod tests {
         let nested = {
             let mut inner = crate::record::TableRecord {
                 desc: Default::default(),
-                record_type: 0,
+                record_type: crate::record::RECORD_VARIABLE,
                 values: Vec::new(),
             };
             inner.desc.fields.push(crate::record::RecordDescField {
@@ -6533,7 +6533,7 @@ mod tests {
         };
         let mut nest = crate::record::TableRecord {
             desc: Default::default(),
-            record_type: 0,
+            record_type: crate::record::RECORD_VARIABLE,
             values: Vec::new(),
         };
         nest.desc.fields.push(crate::record::RecordDescField {

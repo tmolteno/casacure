@@ -3877,7 +3877,7 @@ fn taql_result_to_table(_py: Python<'_>, out: core::taql::TaqlTable) -> PyResult
         keywords: out.source_keywords.clone(),
         private_keywords: TableRecord {
             desc: Default::default(),
-            record_type: 0,
+            record_type: ::casacure::record::RECORD_VARIABLE,
             values: Vec::new(),
         },
         columns: Vec::new(),
@@ -3923,7 +3923,7 @@ fn taql_result_to_table(_py: Python<'_>, out: core::taql::TaqlTable) -> PyResult
             max_length: 0,
             keywords: TableRecord {
                 desc: Default::default(),
-                record_type: 0,
+                record_type: ::casacure::record::RECORD_VARIABLE,
                 values: Vec::new(),
             },
             kind,
@@ -4209,7 +4209,7 @@ mod cross_writer_column_tests {
     fn empty_record() -> TableRecord {
         TableRecord {
             desc: Default::default(),
-            record_type: 0,
+            record_type: ::casacure::record::RECORD_VARIABLE,
             values: Vec::new(),
         }
     }

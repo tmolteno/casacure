@@ -6,7 +6,7 @@
 //! Layout:
 //!
 //! - The header file (`table.f{seq}`) is always canonical **big-endian**
-//!   AipsIO. Its root is `"TiledColumnStMan"` with the fixed cell shape,
+//!   AipsIO. Its root is `"TiledColumnStMan"` with the tile shape,
 //!   then a nested `"TiledStMan"` object: sequence nr, row count, column
 //!   data types, hypercolumn name, dimensionality, the tile files
 //!   (sequence nr + length), and one hypercube per column group.
@@ -110,7 +110,7 @@ pub struct TsmHeader {
     /// (`TiledColumnStMan` or `TiledShapeStMan`); the same `TiledStMan`
     /// payload follows either way.
     pub root_type: String,
-    /// The subclass IPosition payload: the fixed cell shape for
+    /// The subclass IPosition payload: the tile shape for
     /// `TiledColumnStMan`, the default tile shape for `TiledShapeStMan`.
     pub subclass_shape: Vec<i64>,
     pub version: u32,
@@ -1037,7 +1037,7 @@ pub fn parse_header(data: &[u8]) -> Result<TsmHeader, TsmError> {
         });
     }
     let root_type = obj.type_name;
-    // Subclass payload: only TiledColumnStMan writes one (the fixed cell
+    // Subclass payload: only TiledColumnStMan writes one (its tile
     // shape as an IPosition). TiledShapeStMan's root carries nothing — its
     // default tile shape travels in the (empty) table.dat blob or in a
     // placeholder cube, so it is reconstructed from the cubes below.
@@ -1195,8 +1195,8 @@ const DEFAULT_TILE_BYTES: usize = 524288;
 /// the header file (canonical big-endian AipsIO) and the tile data file.
 /// `stman_type` is the manager name the header carries (`TiledColumnStMan`
 /// or `TiledShapeStMan` — casacore dispatches on it when re-opening); the
-/// subclass payload is the default tile shape for `TiledShapeStMan`, an
-/// empty IPosition for `TiledColumnStMan`. `cell_shape` is the fixed
+/// subclass payload is nothing for `TiledShapeStMan` and the tile shape
+/// for `TiledColumnStMan`. `cell_shape` is the fixed
 /// per-row cell shape in CASA (reversed logical) dim order; `cells[i]`
 /// holds the encoded bytes of that row's cell.  Returns
 /// `(table.f{seq} bytes, table.f{seq}_TSM{file_seq} tile bytes, file_seq)` —
@@ -1410,13 +1410,14 @@ fn tsm_header(p: TsmHeaderParams<'_>) -> Vec<u8> {
 
     let mut hw = crate::aipsio::Writer::new();
     hw.put_root_object_start(stman_type, 1);
-    // Subclass payload: only TiledColumnStMan writes the fixed cell shape
-    // IPosition; TiledShapeStMan's root carries nothing (casacore reads the
-    // default tile shape from the cubes).
+    // Subclass payload: only TiledColumnStMan writes one, its tile shape
+    // (`TiledColumnStMan::flush`: `<< tileShape_p`), which casacore reports
+    // as dminfo `SPEC.DEFAULTTILESHAPE` and CASA reads when it clones a
+    // column's storage manager (casacure#41: it was written empty).
+    // TiledShapeStMan's root carries nothing (casacore reads the default
+    // tile shape from the cubes).
     if stman_type == "TiledColumnStMan" {
-        hw.put_object_start("IPosition", 1);
-        hw.put_u32(0);
-        hw.put_object_end();
+        put_iposition(&mut hw, &tile_shape);
     }
     if big_endian {
         hw.put_object_start("TiledStMan", 1);
@@ -1871,7 +1872,7 @@ fn put_empty_values_record(hw: &mut crate::aipsio::Writer) {
     hw.put_object_start("RecordDesc", 2);
     hw.put_i32(0); // no fields
     hw.put_object_end();
-    hw.put_i32(1); // record type (Fixed)
+    hw.put_i32(1); // record type (Variable)
     hw.put_object_end();
 }
 
@@ -2081,7 +2082,7 @@ mod tests {
             max_length: 0,
             keywords: crate::record::TableRecord {
                 desc: Default::default(),
-                record_type: 0,
+                record_type: crate::record::RECORD_VARIABLE,
                 values: Vec::new(),
             },
             kind: ColumnKind::Array,
@@ -2798,6 +2799,37 @@ mod tests {
         assert_eq!(tsm.read_cell(&desc, 1).unwrap(), want(1));
         assert_eq!(tsm.read_cell(&desc, 2).unwrap(), want(2));
         assert_eq!(tsm.read_cell(&desc, 3).unwrap(), zero, "unset row");
+    }
+
+    /// casacure#41: a TiledColumnStMan header carries its tile shape as the
+    /// root IPosition (`TiledColumnStMan::flush`), which casacore reports as
+    /// dminfo `SPEC.DEFAULTTILESHAPE`; it used to be written empty.
+    #[test]
+    fn tiled_column_stman_header_carries_tile_shape() {
+        let cells: Vec<Vec<u8>> = (0..5)
+            .map(|row| {
+                tsm_encode_cell(false, DataType::Int, &ArrayData::Int(vec![row; 6])).unwrap()
+            })
+            .collect();
+        let (header_bytes, _tile_data, _tsfile_seq) = write_tsm_file(
+            "TiledColumnStMan",
+            false,
+            3,
+            "TiledData",
+            DataType::Int,
+            &[3, 2],
+            &cells,
+            Some(&[3, 2, 4]),
+        )
+        .unwrap();
+        let header = parse_header(&header_bytes).unwrap();
+        assert_eq!(header.root_type, "TiledColumnStMan");
+        assert_eq!(header.cubes.len(), 1);
+        assert_eq!(header.cubes[0].tile_shape, vec![3, 2, 4]);
+        assert_eq!(
+            header.subclass_shape, header.cubes[0].tile_shape,
+            "the header carries the tile shape"
+        );
     }
 
     /// A TiledShapeStMan-written file round-trips: the header carries the

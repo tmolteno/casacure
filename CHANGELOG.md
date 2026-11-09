@@ -5,6 +5,44 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Keyword records are written Variable, so casacore and CASA can modify a
+  casacure-written table (issue #41).** Every record casacure made (the
+  table, column and private keyword sets, nested keyword records, dicts from
+  the bindings) carried record type 0, `RecordInterface::Fixed`; casacore
+  makes all of them Variable (`TableRecord()`). On a Fixed set, casacore
+  refuses to add a field (`Record cannot be changed (fixed structure)`), so
+  real python-casacore could not `putkeyword` or `putcolkeyword` a new
+  keyword, nor `addcols` a tiled column (it registers a hypercolumn in the
+  private keyword set). CASA's `clearcal` adds `MODEL_DATA` by cloning
+  DATA's storage manager, so it failed on every skarabina 1.0.22+ averaged
+  MS, with a misleading `TableDesc::add; columns not disjoint` from its
+  fallback, and left a half-added column behind. New records are now
+  Variable (`RECORD_VARIABLE`; `TableRecord::default()` too); records read
+  from disk keep their type.
+
+- **A Variable nested record is written framed, as casacore does.** The
+  writer put every nested record's description into its parent's, the
+  layout casacore uses only for a Fixed sub-record (`TableRecordRep::
+  addField`). casacore then read e.g. `MEASINFO` as a fixed layout, and
+  adding a field to it (`MEASINFO.TabRefTypes`) wrote a table it could not
+  reopen (`AipsIO::getend: part of object not read`). A Variable (or empty)
+  sub-record is now described in its parent only as a record and written
+  with its own description and type; a Fixed one read from disk keeps the
+  bare layout.
+
+- **TiledColumnStMan headers carry the tile shape.** The header's root
+  IPosition is casacore's `tileShape_p`, reported as dminfo
+  `SPEC.DEFAULTTILESHAPE` and used by CASA when it clones a column's storage
+  manager; casacure wrote it empty. Regression tests:
+  `tests/test_record_type.py` (real python-casacore adds keywords, nested
+  fields and tiled columns to a casacure-written table, and casacure reads
+  them back; a casacore table casacure added keywords to stays extendable)
+  and Rust unit tests in `record.rs` and `tsm.rs`. Checked end to end: a
+  skarabina 1.0.24 average written with this build passes CASA `clearcal`,
+  `setjy`, `flagmanager` and `gaincal`.
+
 ## [3.8.40] - 2026-11-09
 
 ### Fixed

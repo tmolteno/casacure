@@ -675,7 +675,7 @@ mod tests {
             max_length: 0,
             keywords: crate::record::TableRecord {
                 desc: Default::default(),
-                record_type: 0,
+                record_type: crate::record::RECORD_VARIABLE,
                 values: Vec::new(),
             },
             kind: ColumnKind::Scalar(RecordValue::Int(0)),

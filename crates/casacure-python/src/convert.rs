@@ -710,7 +710,7 @@ fn resolve_subtable_py(name: &str, table_dir: Option<&std::path::Path>) -> Strin
 pub(crate) fn dict_to_table_record(py: Python<'_>, d: &Bound<'_, PyDict>) -> PyResult<TableRecord> {
     let mut rec = TableRecord {
         desc: Default::default(),
-        record_type: 0,
+        record_type: ::casacure::record::RECORD_VARIABLE,
         values: Vec::new(),
     };
     for (k, v) in d.iter() {

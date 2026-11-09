@@ -83,7 +83,7 @@ fn clone_col(cd: &ColumnDesc, name: &str, comment: &str, group: &str) -> ColumnD
     c.data_manager_group = group.to_string();
     c.keywords = crate::record::TableRecord {
         desc: Default::default(),
-        record_type: 0,
+        record_type: crate::record::RECORD_VARIABLE,
         values: Vec::new(),
     };
     c
@@ -156,7 +156,7 @@ pub fn add_imaging_columns(path: &Path) -> Result<Vec<String>, MsUtilError> {
             max_length: 0,
             keywords: crate::record::TableRecord {
                 desc: Default::default(),
-                record_type: 0,
+                record_type: crate::record::RECORD_VARIABLE,
                 values: Vec::new(),
             },
             kind: crate::tabledesc::ColumnKind::Array,
@@ -436,12 +436,12 @@ mod tests {
                 comment: String::new(),
                 keywords: crate::record::TableRecord {
                     desc: Default::default(),
-                    record_type: 0,
+                    record_type: crate::record::RECORD_VARIABLE,
                     values: Vec::new(),
                 },
                 private_keywords: crate::record::TableRecord {
                     desc: Default::default(),
-                    record_type: 0,
+                    record_type: crate::record::RECORD_VARIABLE,
                     values: Vec::new(),
                 },
                 columns: vec![ColumnDesc {
@@ -456,7 +456,7 @@ mod tests {
                     max_length: 0,
                     keywords: crate::record::TableRecord {
                         desc: Default::default(),
-                        record_type: 0,
+                        record_type: crate::record::RECORD_VARIABLE,
                         values: Vec::new(),
                     },
                     kind: crate::tabledesc::ColumnKind::Scalar(RecordValue::Double(0.0)),

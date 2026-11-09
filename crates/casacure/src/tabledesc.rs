@@ -123,12 +123,12 @@ impl TableDesc {
             comment: String::new(),
             keywords: crate::record::TableRecord {
                 desc: Default::default(),
-                record_type: 0,
+                record_type: crate::record::RECORD_VARIABLE,
                 values: Vec::new(),
             },
             private_keywords: crate::record::TableRecord {
                 desc: Default::default(),
-                record_type: 0,
+                record_type: crate::record::RECORD_VARIABLE,
                 values: Vec::new(),
             },
             columns: Vec::new(),
@@ -292,7 +292,7 @@ pub(crate) fn column_from_desc_dict(
         Some(RecordValue::Record(r)) => r.clone(),
         _ => crate::record::TableRecord {
             desc: Default::default(),
-            record_type: 0,
+            record_type: crate::record::RECORD_VARIABLE,
             values: Vec::new(),
         },
     };
@@ -644,7 +644,7 @@ pub fn parse_table_desc(r: &mut Reader<'_>) -> Result<TableDesc, TableDescError>
     } else {
         TableRecord {
             desc: Default::default(),
-            record_type: 0,
+            record_type: crate::record::RECORD_VARIABLE,
             values: Vec::new(),
         }
     };
@@ -848,7 +848,7 @@ mod tests {
     fn empty_record() -> TableRecord {
         TableRecord {
             desc: Default::default(),
-            record_type: 0,
+            record_type: crate::record::RECORD_VARIABLE,
             values: Vec::new(),
         }
     }
