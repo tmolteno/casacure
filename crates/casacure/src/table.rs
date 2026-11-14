@@ -4105,13 +4105,13 @@ impl WritableTable {
             .collect();
         dms.extend(new_blobs);
         let mut col_dm_seq: Vec<u32> = Vec::with_capacity(ncols);
-        for c in 0..ncols {
+        for (c, col) in dat.column_set.columns.iter().enumerate().take(ncols) {
             let seq = plan
                 .dms
                 .iter()
                 .find(|d| d.cols.contains(&c))
                 .map(|d| d.seq)
-                .unwrap_or_else(|| dat.column_set.columns[c].data_manager_seq);
+                .unwrap_or(col.data_manager_seq);
             col_dm_seq.push(seq);
         }
         let bytes = build_table_dat_with_seq_count(
