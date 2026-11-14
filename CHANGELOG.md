@@ -5,6 +5,8 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.42] - 2026-11-14
+
 ### Fixed
 
 - **IncrementalStMan array and string columns raise a named error instead of
