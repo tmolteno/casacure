@@ -895,7 +895,13 @@ pub fn read_array_cell(
             _ => ArrayData::Double(Vec::new()),
         };
         return Ok(RecordValue::Array(ArrayValue {
-            shape: Vec::new(),
+            // An undefined cell keeps the declared rank: zero extents per
+            // dimension for a variable-shape column, the declared shape for
+            // a fixed one (#45).
+            shape: match &desc.shape {
+                Some(s) if !s.is_empty() => s.iter().rev().map(|&d| d.max(0) as u32).collect(),
+                _ => vec![0; desc.ndim.max(0) as usize],
+            },
             data,
         }));
     }

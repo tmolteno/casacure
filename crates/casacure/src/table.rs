@@ -697,11 +697,12 @@ fn build_ssm_data(
                         }
                         continue;
                     }
-                    if cd.data_type == crate::record::DataType::String && arr.shape.is_empty() {
-                        // An undefined cell (e.g. a freshly added row of a
-                        // variable-shape column): write casacore's "no
-                        // array" zero-length reference, not string content.
-                        bytes.extend_from_slice(&[0u8; 12]);
+                    if cd.shape.as_ref().is_none_or(|s| s.is_empty()) && arr.data.is_empty() {
+                        // An undefined cell (a row of a variable-shape column
+                        // that was never written): casacore's "no array"
+                        // null reference — a zero-length ref cell, not
+                        // array content (#45).
+                        bytes.extend(std::iter::repeat_n(0u8, size as usize));
                         continue;
                     }
                     if cd.data_type == crate::record::DataType::String {
@@ -5211,8 +5212,14 @@ pub fn default_cell_value(cd: &crate::tabledesc::ColumnDesc) -> Option<RecordVal
         crate::tabledesc::ColumnKind::Scalar(default) => Some(default.clone()),
         crate::tabledesc::ColumnKind::Array => {
             // Default cells are in the as-given (logical) orientation: the
-            // descriptor stores the reversed shape.
-            let mut shape: Vec<i64> = cd.shape.clone().unwrap_or_default();
+            // descriptor stores the reversed shape.  A variable-shape column
+            // gets an empty array that keeps the declared rank (all-zero
+            // extents), so a never-written cell reads with the column's
+            // dimensionality rather than collapsing to a scalar shape (#45).
+            let mut shape: Vec<i64> = match &cd.shape {
+                Some(s) if !s.is_empty() => s.clone(),
+                _ => vec![0; cd.ndim.max(0) as usize],
+            };
             shape.reverse();
             // No shape (a variable-shape column) is an EMPTY array, not the
             // one element the product over no dimensions would give.
@@ -7463,11 +7470,13 @@ mod tests {
     fn empty_variable_shape_array_cells_read_back_empty() {
         // A variable-shape (ndim=2, no fixed shape) array column whose cells
         // hold an empty array — the state of an MS array column between
-        // `addrows` and the first write.  Its array-index record carries
-        // ndim 0; decoding that with `product()` over no dims (== 1) claimed a
-        // single element, so the LAST row's record ran past the end of
-        // table.f0i ("array reference 36 falls outside the array index file
-        // (len 40)" — the dask-ms smoke's WEIGHT column).
+        // `addrows` and the first write.  Such a cell is stored as casacore's
+        // "no array" null reference (undefined), and reads back with the
+        // column's declared rank at zero extents (#45) — not as a scalar-
+        // shaped cell, and without an array-index record whose ndim 0 would
+        // decode as one element and run the LAST row's reference past the
+        // end of table.f0i ("array reference 36 falls outside the array
+        // index file (len 40)" — the dask-ms smoke's WEIGHT column).
         use crate::record::{ArrayData, ArrayValue};
         let mut desc = typed_desc();
         let mut cd = array_col("A", DataType::Complex, 0, Vec::new());
@@ -7487,7 +7496,7 @@ mod tests {
             let RecordValue::Array(a) = t.getcell(0, row).unwrap() else {
                 panic!("row {row}: expected an array cell");
             };
-            assert!(a.shape.is_empty(), "row {row} must read back empty");
+            assert_eq!(a.shape, [0, 0], "row {row} keeps the declared rank");
             match &a.data {
                 ArrayData::Complex(v) => assert!(v.is_empty(), "row {row} has no elements"),
                 other => panic!("row {row}: unexpected data {other:?}"),

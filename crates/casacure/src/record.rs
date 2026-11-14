@@ -275,6 +275,29 @@ pub enum RecordValue {
 }
 
 impl ArrayData {
+    /// The number of elements (0 for an empty / never-written cell).
+    pub fn len(&self) -> usize {
+        match self {
+            ArrayData::Bool(v) => v.len(),
+            ArrayData::UChar(v) => v.len(),
+            ArrayData::Short(v) => v.len(),
+            ArrayData::UShort(v) => v.len(),
+            ArrayData::Int(v) => v.len(),
+            ArrayData::UInt(v) => v.len(),
+            ArrayData::Int64(v) => v.len(),
+            ArrayData::Float(v) => v.len(),
+            ArrayData::Double(v) => v.len(),
+            ArrayData::Complex(v) => v.len(),
+            ArrayData::DComplex(v) => v.len(),
+            ArrayData::String(v) => v.len(),
+        }
+    }
+
+    /// Whether the cell holds no elements (an empty / never-written cell).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// The byte layout of a fixed-size numeric array, as stored in memory.
     ///
     /// Every fixed-size element type above is a plain `Vec` of a unit-sized

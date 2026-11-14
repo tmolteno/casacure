@@ -2500,6 +2500,19 @@ impl Table {
             nrow as u64
         };
         let col_idx = self.col_index(column)?;
+        if nrow == 0 {
+            // casacore returns an empty 1-D array of the column type (a
+            // string column: an empty list), whatever the handle kind.
+            let desc = self.desc();
+            if let Some(cd) = desc.columns.get(col_idx) {
+                if let Some(arr) = zeros_for_column(py, cd, &[0])? {
+                    return Ok(arr);
+                }
+                if cd.data_type == core::record::DataType::String {
+                    return Ok(PyList::empty(py).into_any().unbind());
+                }
+            }
+        }
         // Clone the Arc out of the lock so concurrent reads through this
         // handle are not serialised on the inner mutex.
         let read_table = {
@@ -2510,12 +2523,6 @@ impl Table {
             }
         };
         if let Some(t) = &read_table {
-            if nrow == 0 {
-                // casacore returns an empty 1-D array of the column type.
-                if let Some(arr) = zeros_for_column(py, &t.dat.desc.columns[col_idx], &[0])? {
-                    return Ok(arr);
-                }
-            }
             // Typed fast path: allocate the result array and fill it
             // straight from the data files (see `getcolnp`).
             if startrow.saturating_add(nrow) <= t.nrows() && t.raw_column_supported(col_idx) {
