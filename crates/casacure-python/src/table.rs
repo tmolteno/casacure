@@ -3192,11 +3192,32 @@ impl Table {
         Ok(())
     }
 
-    /// `rownumbers()` -- the base-table row answering each row of this
-    /// table, in this table's order (python-casacore's
-    /// `table.rownumbers()`).  casacore reference tables route writes
-    /// through it; a table that is its own source answers 0..nrows.
-    fn rownumbers(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    /// `rownumbers(other=None)` — with no argument, the base-table row
+    /// answering each row of this table, in this table's order
+    /// (python-casacore's `table.rownumbers()`); a table that is its own
+    /// source answers 0..nrows.  With another table, each of this table's
+    /// rows as its row number in `other` (-1 where the row is absent, the
+    /// `sel.rownumbers(t)` / `t.rownumbers(sel)` pair).
+    #[pyo3(signature = (other = None))]
+    fn rownumbers(&self, py: Python<'_>, other: Option<&Table>) -> PyResult<Py<PyAny>> {
+        if let Some(o) = other {
+            let (base, mine) = self.rooted_rows()?;
+            let (o_base, theirs) = o.rooted_rows()?;
+            if base != o_base {
+                return Err(PyValueError::new_err(
+                    "rownumbers: tables do not share a base table",
+                ));
+            }
+            let mut index = std::collections::HashMap::with_capacity(theirs.len());
+            for (i, &r) in theirs.iter().enumerate() {
+                index.insert(r, i as i64);
+            }
+            let out: Vec<i64> = mine
+                .iter()
+                .map(|&r| index.get(&r).copied().unwrap_or(-1))
+                .collect();
+            return Ok(numpy::PyArray1::from_slice(py, &out).into_any().unbind());
+        }
         let total = self.row_count();
         let rows: Vec<u64> = {
             let inner = self.inner.lock().unwrap();
@@ -3209,6 +3230,21 @@ impl Table {
             }
         };
         Ok(numpy::PyArray1::from_slice(py, &rows).into_any().unbind())
+    }
+
+    /// This handle's rows rooted at the ultimate base table.
+    fn rooted_rows(&self) -> PyResult<(std::path::PathBuf, Vec<u64>)> {
+        let inner = self.inner.lock().unwrap();
+        match &*inner {
+            Inner::Read(t) => Ok(t.rooted_row_numbers()),
+            Inner::Write { shared, .. } => {
+                let (total, dir) = {
+                    let s = shared.lock().unwrap();
+                    (s.wt.col_len(0) as u64, s.wt.dir().to_path_buf())
+                };
+                Ok((dir, (0..total).collect()))
+            }
+        }
     }
 
     /// `putcol(column, value, startrow=0, nrow=0)` — ndarray or list.

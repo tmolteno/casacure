@@ -1497,6 +1497,20 @@ impl Table {
         self.view.as_ref().map(|v| v.rows.as_slice())
     }
 
+    /// This table's rows as row numbers of the ultimate base table, with
+    /// that table's path — the shared identity behind
+    /// `rownumbers(other)` (reference tables chain through their views).
+    pub fn rooted_row_numbers(&self) -> (std::path::PathBuf, Vec<u64>) {
+        match &self.view {
+            Some(v) => {
+                let (base, root_rows) = v.source.rooted_row_numbers();
+                let rows = v.rows.iter().map(|&r| root_rows[r as usize]).collect();
+                (base, rows)
+            }
+            None => (self.path.clone(), (0..self.nrows()).collect()),
+        }
+    }
+
     pub fn row_order(
         source: std::sync::Arc<Table>,
         rows: Vec<u64>,
@@ -3370,6 +3384,11 @@ impl WritableTable {
 
     pub fn desc(&self) -> &crate::tabledesc::TableDesc {
         &self.desc
+    }
+
+    /// The table directory.
+    pub fn dir(&self) -> &std::path::Path {
+        &self.dir
     }
 
     pub fn putcolkeyword(

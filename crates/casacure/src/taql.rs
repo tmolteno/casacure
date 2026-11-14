@@ -443,6 +443,8 @@ fn is_clause_word(w: &str) -> bool {
         w.to_ascii_lowercase().as_str(),
         "where"
             | "orderby"
+            | "order"
+            | "by"
             | "groupby"
             | "having"
             | "limit"
@@ -631,9 +633,13 @@ impl Parser {
                 self.next();
             }
         }
-        // Columns: either `*` or a comma list of `expr [AS name]`.
+        // Columns: either `*` or a comma list of `expr [AS name]`.  `FROM`
+        // right after SELECT/UNIQUE is casacore's no-column-list form: the
+        // whole row (`SELECT *`).
         let columns = if matches!(self.peek(), Some(Tok::Op(o)) if o == "*") {
             self.next();
+            None
+        } else if matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("from")) {
             None
         } else {
             Some(self.parse_column_list()?)
@@ -679,8 +685,18 @@ impl Parser {
                         }
                     }
                     loop {
-                        let expr = self.parse_expr()?;
+                        // casacore accepts the direction flag before the
+                        // key too (`ORDERBY DESC TIME`).
                         let mut desc = false;
+                        if let Some(Tok::Ident(k)) = self.peek() {
+                            if k.eq_ignore_ascii_case("desc") {
+                                desc = true;
+                                self.next();
+                            } else if k.eq_ignore_ascii_case("asc") {
+                                self.next();
+                            }
+                        }
+                        let expr = self.parse_expr()?;
                         if let Some(Tok::Ident(w)) = self.peek() {
                             if w.eq_ignore_ascii_case("desc") {
                                 desc = true;
@@ -810,7 +826,46 @@ impl Parser {
     }
 
     fn parse_cmp(&mut self) -> Result<Expr, TaqlError> {
-        let mut left = self.parse_add()?;
+        let left = self.parse_add()?;
+
+        // `[NOT] BETWEEN <lo> AND <hi>` at comparison precedence; casacore
+        // reads it as `left >= lo AND left <= hi` (and the negation as
+        // `NOT (...)`), which is also how `NOT BETWEEN` desugars here.
+        let mut between_not = None;
+        if let Some(Tok::Ident(w)) = self.peek() {
+            if w.eq_ignore_ascii_case("between") {
+                self.next();
+                between_not = Some(false);
+            } else if w.eq_ignore_ascii_case("not")
+                && matches!(
+                    self.toks.get(self.pos + 1),
+                    Some(Tok::Ident(w2)) if w2.eq_ignore_ascii_case("between")
+                )
+            {
+                self.next();
+                self.next();
+                between_not = Some(true);
+            }
+        }
+        if let Some(negated) = between_not {
+            let lo = self.parse_add()?;
+            let and = self.expect_ident()?;
+            if !and.eq_ignore_ascii_case("and") {
+                return Err(TaqlError::Parse(format!(
+                    "BETWEEN expects AND, found {and}"
+                )));
+            }
+            let hi = self.parse_add()?;
+            let ge = Expr::Binary(BinOp::Ge, Box::new(left.clone()), Box::new(lo.clone()));
+            let le = Expr::Binary(BinOp::Le, Box::new(left), Box::new(hi));
+            let both = Expr::Binary(BinOp::And, Box::new(ge), Box::new(le));
+            return Ok(if negated {
+                Expr::Unary(UnOp::Not, Box::new(both))
+            } else {
+                both
+            });
+        }
+        let mut left = left;
 
         // `[NOT] LIKE / ILIKE / IN` at comparison precedence; restore the
         // token position if the `NOT` is not followed by one of these.
@@ -1287,8 +1342,17 @@ fn parse_tail(p: &mut Parser) -> TResult<Tail> {
                     }
                 }
                 loop {
-                    let expr = p.parse_expr()?;
+                    // Direction flag before or after the key (casacore).
                     let mut desc = false;
+                    if let Some(Tok::Ident(k)) = p.peek() {
+                        if k.eq_ignore_ascii_case("desc") {
+                            desc = true;
+                            p.next();
+                        } else if k.eq_ignore_ascii_case("asc") {
+                            p.next();
+                        }
+                    }
+                    let expr = p.parse_expr()?;
                     if let Some(Tok::Ident(k)) = p.peek() {
                         if k.eq_ignore_ascii_case("desc") {
                             desc = true;
@@ -4827,6 +4891,42 @@ mod tests {
         let b = query(&t, "SELECT ROWID() AS r FROM $1 ORDERBY ANT");
         assert_eq!(ints(a.getcol("r").unwrap()), ints(b.getcol("r").unwrap()));
         let d = query(&t, "SELECT ROWID() AS r FROM $1 ORDER BY VAL DESC");
+        assert_eq!(ints(d.getcol("r").unwrap()), [2, 0, 3, 1, 4]);
+    }
+
+    #[test]
+    fn between_and_select_from_and_desc_prefix() {
+        // Issue #44: BETWEEN, SELECT without a column list, and the
+        // direction flag before the ORDERBY key.
+        let (_dir, t) = probe_table();
+        let r = query(&t, "SELECT ROWID() AS r FROM $1 WHERE VAL BETWEEN 1 AND 2");
+        assert_eq!(ints(r.getcol("r").unwrap()), [1, 3, 4]);
+        let r = query(
+            &t,
+            "SELECT ROWID() AS r FROM $1 WHERE VAL NOT BETWEEN 1 AND 2",
+        );
+        assert_eq!(ints(r.getcol("r").unwrap()), [0, 2]);
+        // No column list: the whole row, like `SELECT *`.
+        let r = query(&t, "SELECT FROM $1 WHERE VAL BETWEEN 1 AND 2");
+        let vals: Vec<f64> = r
+            .getcol("VAL")
+            .unwrap()
+            .iter()
+            .map(|v| match v {
+                RecordValue::Double(x) => *x,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(vals, [2.0, 2.0, 1.0]);
+        // DESC before the key, in both the ORDERBY and spaced ORDER BY
+        // forms, alone and mixed with a trailing flag.
+        let a = query(&t, "SELECT ROWID() AS r FROM $1 ORDERBY DESC VAL");
+        let b = query(&t, "SELECT ROWID() AS r FROM $1 ORDER BY DESC VAL");
+        let c = query(&t, "SELECT ROWID() AS r FROM $1 ORDERBY VAL DESC");
+        assert_eq!(ints(a.getcol("r").unwrap()), [2, 0, 3, 1, 4]);
+        assert_eq!(ints(b.getcol("r").unwrap()), ints(a.getcol("r").unwrap()));
+        assert_eq!(ints(c.getcol("r").unwrap()), ints(a.getcol("r").unwrap()));
+        let d = query(&t, "SELECT ROWID() AS r FROM $1 ORDERBY DESC VAL, ANT ASC");
         assert_eq!(ints(d.getcol("r").unwrap()), [2, 0, 3, 1, 4]);
     }
 
