@@ -500,3 +500,37 @@ def test_casacore_azel_uses_the_geocentric_latitude():
         np.degrees(cc_azel["m0"]["value"]), np.degrees(cc_azel["m1"]["value"]),
     )
     assert sep_geodetic > 1.0, sep_geodetic
+
+
+def test_issue43_epoch_offsets_and_itrf_position():
+    """Issue #43: UTC->TAI/UT1 must apply the offsets (not relabel), and
+    ITRF positions report (lon, geocentric lat, radius) with honest units.
+    Values pinned against python-casacore 3.8.1."""
+    me = cm.measures()
+    q = lambda v, u: {"value": v, "unit": u}
+    mjd = 59444.5
+    e = me.epoch("UTC", q(mjd, "d"))
+    secs = lambda m: (m["m0"]["value"] - mjd) * 86400.0
+
+    assert secs(me.measure(e, "TAI")) == pytest.approx(37.0, abs=1e-4)
+    assert secs(me.measure(e, "UT1")) == pytest.approx(-0.1301, abs=1e-3)
+    tt = me.measure(e, "TT")
+    assert tt["refer"] == "TDT"
+    assert secs(tt) == pytest.approx(69.184, abs=1e-3)
+    # TDB keeps raising rather than relabelling (its periodic terms are
+    # not modelled).
+    with pytest.raises(ValueError, match="bad reference type"):
+        me.measure(e, "TDB")
+    tai = me.epoch("TAI", q(mjd, "d"))
+    assert secs(me.measure(tai, "UTC")) == pytest.approx(-37.0, abs=1e-4)
+    # The string quantity form casacore accepts.
+    assert me.epoch("UTC", "59444.5d")["m0"]["value"] == pytest.approx(mjd)
+
+    p = me.position("ITRF", q(5109360.133, "m"), q(2006852.586, "m"), q(-3238948.127, "m"))
+    assert p["m0"]["unit"] == "rad" and p["m1"]["unit"] == "rad" and p["m2"]["unit"] == "m"
+    assert p["m0"]["value"] == pytest.approx(0.374266, abs=1e-6)
+    assert p["m1"]["value"] == pytest.approx(-0.533065, abs=1e-6)
+    assert p["m2"]["value"] == pytest.approx(6373680.51, abs=0.01)
+    w = me.measure(p, "WGS84")
+    assert w["m1"]["value"] == pytest.approx(-0.536009, abs=1e-6)
+    assert w["m2"]["value"] == pytest.approx(1086.599, abs=1e-3)

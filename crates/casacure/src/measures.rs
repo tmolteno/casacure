@@ -22,6 +22,12 @@
 //!
 //! * `epoch('utc', q)` interprets `q` as **days since MJD 0** (so
 //!   `epoch('utc', quantity(1000,'s'))` gives `m0 = 0.011574…` in `'d'`).
+//! * `measure(e, refer)` between `UTC`/`TAI`/`UT1`/`UT2`/`TT` applies the
+//!   real offsets: a leap-second table for TAI−UTC, the bundled IERS
+//!   series for UT1−UTC, +32.184 s for TT (returned as `TDT`).  `TDB`
+//!   raises rather than relabelling.  ITRF positions are
+//!   (lon, geocentric lat, radius); `ITRF`↔`WGS84` converts through the
+//!   WGS84 ellipsoid.
 //! * `measure(d, 'AZEL')`/`measure(d, 'AZELGEO')` convert via the frame's
 //!   `position` and `epoch`; the azimuth is measured **east from north**
 //!   and wrapped to `(-π, π]` (the range python-casacore reports), and the
@@ -212,8 +218,9 @@ impl Measures {
     }
 
     /// `position(refer, v0, v1, v2)` — an observer position. `ITRF` takes
-    /// Cartesian metres (`m0..m2` as x, y, z); `WGS84` takes
-    /// (lon, lat, height) as (rad, rad, m).
+    /// Cartesian metres (x, y, z) and stores casacore's (lon, geocentric
+    /// lat, radius) form; `WGS84` takes (lon, lat, height) as
+    /// (rad, rad, m).
     pub fn position(
         &self,
         refer: &str,
@@ -230,7 +237,7 @@ impl Measures {
                 Ok(Measure {
                     mtype: MeasureType::Position,
                     refer: "ITRF".into(),
-                    values: [x, y, z],
+                    values: geocentric_itrf([x, y, z]),
                 })
             }
             "WGS84" => {
@@ -252,40 +259,59 @@ impl Measures {
         match m.mtype {
             MeasureType::Direction => self.convert_direction(m, refer),
             MeasureType::Epoch => self.convert_epoch(m, refer),
-            MeasureType::Position => {
-                // Position conversions are trivial for the pair we support.
-                let r = refer.to_ascii_uppercase();
-                match (m.refer.as_str(), r.as_str()) {
-                    ("ITRF", "ITRF") => Ok(m.clone()),
-                    ("WGS84", "WGS84") => Ok(m.clone()),
-                    _ => Err(MeasuresError::BadReference(r)),
-                }
-            }
+            MeasureType::Position => self.convert_position(m, refer),
         }
     }
 
-    fn convert_epoch(&self, m: &Measure, refer: &str) -> Result<Measure, MeasuresError> {
+    fn convert_position(&self, m: &Measure, refer: &str) -> Result<Measure, MeasuresError> {
         let r = refer.to_ascii_uppercase();
-        let days = m.values[0];
         let out = match (m.refer.as_str(), r.as_str()) {
-            (a, b) if a == b => days,
-            // UTC/TAI/UT1 family: all stored on the same MJD-0 day scale in
-            // this subset (no IERS data); casacore's offsets are sub-millisecond.
-            ("UTC" | "TAI" | "UT1" | "UT2", "UTC" | "TAI" | "UT1" | "UT2") => days,
-            (
-                "UTC" | "TAI" | "UT1" | "UT2" | "GMST" | "GMST1" | "GAST" | "LAST" | "LMST",
-                "GMST" | "GMST1" | "GAST" | "LAST" | "LMST",
-            ) => {
-                return Err(MeasuresError::Convert(
-                    "sidereal-time epoch conversion needs a position frame".into(),
-                ));
+            ("ITRF", "ITRF") | ("WGS84", "WGS84") => return Ok(m.clone()),
+            // ITRF measures are (lon, geocentric lat, radius); WGS84 are
+            // (lon, geodetic lat, height).  Both frames share the WGS84
+            // ellipsoid, so the conversion goes through Cartesian metres.
+            ("ITRF", "WGS84") => {
+                let site = crate::astro::Site::from_itrf(itrf_cartesian(m.values))
+                    .map_err(|e| MeasuresError::Convert(e.to_string()))?;
+                [site.elong, site.phi, site.hm]
+            }
+            ("WGS84", "ITRF") => {
+                let xyz = sofars::coords::gd2gc(1, m.values[0], m.values[1], m.values[2])
+                    .map_err(|e| MeasuresError::Convert(format!("gd2gc status {e}")))?;
+                geocentric_itrf(xyz)
             }
             _ => return Err(MeasuresError::BadReference(r)),
         };
         Ok(Measure {
-            mtype: MeasureType::Epoch,
+            mtype: MeasureType::Position,
             refer: r,
-            values: [out, 0.0, 0.0],
+            values: out,
+        })
+    }
+
+    fn convert_epoch(&self, m: &Measure, refer: &str) -> Result<Measure, MeasuresError> {
+        let r = refer.to_ascii_uppercase();
+        if m.refer == r {
+            return Ok(m.clone());
+        }
+        if matches!(r.as_str(), "GMST" | "GMST1" | "GAST" | "LAST" | "LMST")
+            || matches!(
+                m.refer.as_str(),
+                "GMST" | "GMST1" | "GAST" | "LAST" | "LMST"
+            )
+        {
+            return Err(MeasuresError::Convert(
+                "sidereal-time epoch conversion needs a position frame".into(),
+            ));
+        }
+        // Convert through a UTC pivot: TAI-UTC from the leap-second table,
+        // UT1-UTC from the bundled IERS series (the same data GMST uses).
+        let utc = epoch_to_utc(&m.refer, m.values[0])?;
+        let (days, out_refer) = utc_to_epoch(&r, utc)?;
+        Ok(Measure {
+            mtype: MeasureType::Epoch,
+            refer: out_refer,
+            values: [days, 0.0, 0.0],
         })
     }
 
@@ -428,12 +454,12 @@ fn normalize_dir_refer(refer: &str) -> Result<String, MeasuresError> {
     }
 }
 
-/// The observer's site for a `position` measure: ITRF is Cartesian
-/// (x, y, z metres) converted via WGS84; WGS84 is already
-/// (lon, lat, height).
+/// The observer's site for a `position` measure: ITRF measures are
+/// (lon, geocentric lat, radius) — Cartesian metres are reconstructed for
+/// the geodetic conversion; WGS84 is already (lon, lat, height).
 fn site_of(pos: &Measure) -> Result<crate::astro::Site, MeasuresError> {
     match pos.refer.as_str() {
-        "ITRF" => crate::astro::Site::from_itrf([pos.values[0], pos.values[1], pos.values[2]])
+        "ITRF" => crate::astro::Site::from_itrf(itrf_cartesian(pos.values))
             .map_err(|e| MeasuresError::Convert(e.to_string())),
         "WGS84" => Ok(crate::astro::Site::wgs84(
             pos.values[0],
@@ -442,6 +468,95 @@ fn site_of(pos: &Measure) -> Result<crate::astro::Site, MeasuresError> {
         )),
         other => Err(MeasuresError::BadReference(other.to_string())),
     }
+}
+
+/// ITRF measure values (lon, geocentric lat, radius) back to Cartesian
+/// metres.
+fn itrf_cartesian(v: [f64; 3]) -> [f64; 3] {
+    let (lon, lat, r) = (v[0], v[1], v[2]);
+    let (sin_lat, cos_lat) = lat.sin_cos();
+    let (sin_lon, cos_lon) = lon.sin_cos();
+    [r * cos_lat * cos_lon, r * cos_lat * sin_lon, r * sin_lat]
+}
+
+/// Cartesian metres as casacore's ITRF position: (lon, geocentric lat,
+/// radius).
+fn geocentric_itrf([x, y, z]: [f64; 3]) -> [f64; 3] {
+    let r = (x * x + y * y + z * z).sqrt();
+    [y.atan2(x), z.atan2(x.hypot(y)), r]
+}
+
+/// TAI-UTC (leap seconds) at UTC MJD `mjd`, from the published leap-second
+/// table (piecewise constant).  Dates before 1972-01-01 (MJD 41317, the
+/// first table entry) clamp to its 10 s value — the bundled IERS series
+/// does not reach back that far either.
+fn tai_minus_utc(mjd: f64) -> f64 {
+    // (UTC MJD of the leap, TAI-UTC from that instant).
+    const LEAPS: &[(f64, f64)] = &[
+        (41317.0, 10.0), // 1972-01-01
+        (41499.0, 11.0), // 1972-07-01
+        (41683.0, 12.0), // 1973-01-01
+        (42048.0, 13.0), // 1974-01-01
+        (42413.0, 14.0), // 1975-01-01
+        (42778.0, 15.0), // 1976-01-01
+        (43144.0, 16.0), // 1977-01-01
+        (43509.0, 17.0), // 1978-01-01
+        (43874.0, 18.0), // 1979-01-01
+        (44239.0, 19.0), // 1980-01-01
+        (44426.0, 20.0), // 1981-07-01
+        (44791.0, 21.0), // 1982-07-01
+        (45156.0, 22.0), // 1983-07-01
+        (45887.0, 23.0), // 1985-07-01
+        (46247.0, 24.0), // 1988-01-01
+        (46977.0, 25.0), // 1990-01-01
+        (47342.0, 26.0), // 1991-01-01
+        (47519.0, 27.0), // 1992-07-01
+        (47884.0, 28.0), // 1993-07-01
+        (48249.0, 29.0), // 1994-07-01
+        (48803.0, 30.0), // 1996-01-01
+        (48990.0, 31.0), // 1997-07-01
+        (49522.0, 32.0), // 1999-01-01
+        (52091.0, 33.0), // 2006-01-01
+        (53187.0, 34.0), // 2009-01-01
+        (54470.0, 35.0), // 2012-07-01
+        (55566.0, 36.0), // 2015-07-01
+        (56109.0, 37.0), // 2017-01-01
+    ];
+    let i = LEAPS.partition_point(|&(at, _)| at <= mjd);
+    if i == 0 {
+        LEAPS[0].1
+    } else {
+        LEAPS[i - 1].1
+    }
+}
+
+/// `days` on the `from` scale as UTC days (MJD-0 scale, like casacore).
+/// UT2 converts as UT1: python-casacore 3.8.1 returns a bit-identical
+/// value for the two scales (probed over 45000-59444).
+fn epoch_to_utc(from: &str, days: f64) -> Result<f64, MeasuresError> {
+    let secs = match from {
+        "UTC" => 0.0,
+        "TAI" => tai_minus_utc(days),
+        "UT1" | "UT2" => crate::astro::eop(days).0,
+        "TDT" | "TT" => tai_minus_utc(days) + 32.184,
+        other => return Err(MeasuresError::BadReference(other.to_string())),
+    };
+    Ok(days - secs / 86400.0)
+}
+
+/// UTC `days` on the `to` scale.  `TT` comes back as casacore's `TDT`;
+/// `TDB` keeps raising (its periodic terms are not modelled) rather than
+/// relabelling the input.
+fn utc_to_epoch(to: &str, days: f64) -> Result<(f64, String), MeasuresError> {
+    let secs = match to {
+        "UTC" => 0.0,
+        "TAI" => tai_minus_utc(days),
+        "UT1" | "UT2" => crate::astro::eop(days).0,
+        "TDT" | "TT" => tai_minus_utc(days) + 32.184,
+        other => return Err(MeasuresError::BadReference(other.to_string())),
+    };
+    let refer = if to == "TT" { "TDT" } else { to };
+    Ok((days + secs / 86400.0, refer.to_string()))
 }
 
 /// WGS84 geodetic (lon, lat) from ITRF Cartesian (x, y, z) in metres.
@@ -691,5 +806,76 @@ mod tests {
         let (lon, lat) = itrf_to_geodetic(POS.0, POS.1, POS.2);
         assert!((lon.to_degrees() - 0.939190946).abs() < 1e-6, "lon={lon}");
         assert!((lat.to_degrees() - 0.945681226).abs() < 1e-6, "lat={lat}");
+    }
+
+    /// Seconds from a converted epoch measure back to the input MJD.
+    fn seconds_from(m: &Measures, e: &Measure, refer: &str) -> f64 {
+        (m.measure(e, refer).unwrap().values[0] - e.values[0]) * 86400.0
+    }
+
+    #[test]
+    fn epoch_offsets_match_casacore() {
+        // python-casacore 3.8.1 at MJD 59444.5 (issue #43): UTC->TAI +37 s,
+        // UTC->UT1 -0.1301 s (bundled IERS series), UTC->TT +69.184 s
+        // (returned as TDT); TDB keeps raising.
+        let m = Measures::new();
+        let e = m.epoch("UTC", &q(59444.5, "d")).unwrap();
+        assert!((seconds_from(&m, &e, "TAI") - 37.0).abs() < 1e-4);
+        assert!((seconds_from(&m, &e, "UT1") - (-0.1301)).abs() < 1e-3);
+        let tt = m.measure(&e, "TT").unwrap();
+        assert_eq!(tt.refer, "TDT");
+        assert!(((tt.values[0] - 59444.5) * 86400.0 - 69.184).abs() < 1e-6);
+        assert!(m.measure(&e, "TDB").is_err());
+        // And back: TAI->UTC -37 s.
+        let tai = m.epoch("TAI", &q(59444.5, "d")).unwrap();
+        assert!((seconds_from(&m, &tai, "UTC") - (-37.0)).abs() < 1e-4);
+        // UT2 converts as UT1 (casacore returns a bit-identical value).
+        assert!((seconds_from(&m, &e, "UT2") - seconds_from(&m, &e, "UT1")).abs() < 1e-12);
+    }
+
+    #[test]
+    fn leap_second_table_boundaries() {
+        assert_eq!(tai_minus_utc(59444.5), 37.0); // 2021
+        assert_eq!(tai_minus_utc(56108.999), 36.0); // just before 2017-01-01
+        assert_eq!(tai_minus_utc(56109.0), 37.0);
+        assert_eq!(tai_minus_utc(41316.999), 10.0); // before the first leap
+        assert_eq!(tai_minus_utc(50000.0), 32.0); // 1995-ish
+    }
+
+    #[test]
+    fn itrf_position_is_lon_lat_radius() {
+        // python-casacore 3.8.1 (issue #43): ITRF Cartesian metres come
+        // back as (lon, geocentric lat, radius), units rad/rad/m.
+        let m = Measures::new();
+        let p = m
+            .position(
+                "ITRF",
+                &q(5109360.133, "m"),
+                &q(2006852.586, "m"),
+                &q(-3238948.127, "m"),
+            )
+            .unwrap();
+        assert!((p.values[0] - 0.374266).abs() < 1e-6, "lon={}", p.values[0]);
+        assert!(
+            (p.values[1] - (-0.533065)).abs() < 1e-6,
+            "lat={}",
+            p.values[1]
+        );
+        assert!((p.values[2] - 6373680.51).abs() < 0.01, "r={}", p.values[2]);
+        // ITRF->WGS84: geodetic (lon, lat, height); casacore gives
+        // (0.374266, -0.536009, 1086.599).
+        let w = m.measure(&p, "WGS84").unwrap();
+        assert!((w.values[0] - 0.374266).abs() < 1e-6);
+        assert!(
+            (w.values[1] - (-0.536009)).abs() < 1e-6,
+            "lat={}",
+            w.values[1]
+        );
+        assert!((w.values[2] - 1086.599).abs() < 1e-3, "h={}", w.values[2]);
+        // And back again.
+        let back = m.measure(&w, "ITRF").unwrap();
+        for (a, b) in back.values.iter().zip(p.values.iter()) {
+            assert!((a - b).abs() < 1e-6);
+        }
     }
 }

@@ -119,7 +119,41 @@ fn quantity_from_py(v: &Bound<'_, PyAny>) -> PyResult<CoreQuantity> {
     if let Ok(f) = v.extract::<f64>() {
         return CoreQuantity::new(f, "rad").map_err(err);
     }
-    Err(PyTypeError::new_err("expected a Quantity, dict or number"))
+    if let Ok(s) = v.extract::<String>() {
+        // casacore accepts the string form, e.g. "59444.5d".
+        let (value, unit) = parse_quantity_str(&s)
+            .ok_or_else(|| PyValueError::new_err(format!("cannot parse quantity {s:?}")))?;
+        return CoreQuantity::new(value, unit).map_err(err);
+    }
+    Err(PyTypeError::new_err(
+        "expected a Quantity, dict, number or string",
+    ))
+}
+
+/// Split `"59444.5d"` into `(59444.5, "d")`: the longest numeric prefix
+/// (sign, digits, point, optional exponent), the rest the unit.
+fn parse_quantity_str(s: &str) -> Option<(f64, &str)> {
+    let s = s.trim();
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && (b[i].is_ascii_digit() || matches!(b[i], b'+' | b'-' | b'.')) {
+        i += 1;
+    }
+    if i < b.len() && matches!(b[i], b'e' | b'E') {
+        let mut j = i + 1;
+        if j < b.len() && matches!(b[j], b'+' | b'-') {
+            j += 1;
+        }
+        let digits = j;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > digits {
+            i = j;
+        }
+    }
+    let value: f64 = s[..i].parse().ok()?;
+    Some((value, s[i..].trim()))
 }
 
 fn py_to_quantity<'py>(py: Python<'py>, q: &CoreQuantity) -> PyResult<Bound<'py, PyAny>> {
