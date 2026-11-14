@@ -1708,8 +1708,13 @@ impl Table {
         self.colnames()
     }
 
-    /// `getcoldesc(column)` -> dict (python-casacore format).
-    fn getcoldesc(&self, py: Python<'_>, column: &str) -> PyResult<Py<PyAny>> {
+    /// `getcoldesc(column, actual=True)` -> dict (python-casacore format).
+    /// `actual` (casacore's default) reports the data manager the column is
+    /// bound to, from the table's dminfo; a table casacore wrote stores
+    /// `StandardStMan` in the column description itself, so the stored
+    /// fields are wrong for it (#42).
+    #[pyo3(signature = (column, actual = true))]
+    fn getcoldesc(&self, py: Python<'_>, column: &str, actual: bool) -> PyResult<Py<PyAny>> {
         let desc = self.desc();
         let col = desc
             .columns
@@ -1720,6 +1725,15 @@ impl Table {
             .parent()
             .map(|p| p.to_path_buf());
         let vt = self_coldesc(py, col, base.as_deref())?;
+        if actual {
+            for dm in self.dminfo_info()?.values() {
+                if dm.columns.iter().any(|c| c == column) {
+                    vt.set_item("dataManagerType", &dm.type_name)?;
+                    vt.set_item("dataManagerGroup", &dm.name)?;
+                    break;
+                }
+            }
+        }
         Ok(vt.into_any().unbind())
     }
 
@@ -1958,22 +1972,7 @@ impl Table {
 
     /// `getdminfo()` -> dict.
     fn getdminfo(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let inner = self.inner.lock().unwrap();
-        let info = match &*inner {
-            Inner::Read(t) => {
-                let dir = std::path::PathBuf::from(t.name());
-                core::get_dminfo(&dir, &t.dat).map_err(err)?
-            }
-            Inner::Write { shared, .. } => {
-                // Descriptors may carry unflushed structural changes
-                // (addcols/removecols/keywords), so persist before reading
-                // the on-disk metadata snapshot.
-                flush_if_dirty(&self.dir_of(), shared)?;
-                let s = shared.lock().unwrap();
-                let dir = PathBuf::from(s.read.name());
-                core::get_dminfo(&dir, &s.read.dat).map_err(err)?
-            }
-        };
+        let info = self.dminfo_info()?;
         let out = PyDict::new(py);
         for (key, dm) in &info {
             let d = PyDict::new(py);
@@ -2045,7 +2044,7 @@ impl Table {
         if !names.iter().any(|n| n == "DATA") {
             return Err(PyValueError::new_err("Column DATA does not exist"));
         }
-        let data_desc_obj = self.getcoldesc(py, "DATA")?;
+        let data_desc_obj = self.getcoldesc(py, "DATA", true)?;
         let data_desc = data_desc_obj.bind(py).cast::<PyDict>()?;
         // Whether DATA is tiled (python-casacore checks `dminfo['TYPE'][:5]
         // == 'Tiled'`).
@@ -5109,5 +5108,23 @@ impl Table {
             .iter()
             .position(|c| c.name == name)
             .ok_or_else(|| PyKeyError::new_err(format!("no such column: {name}")))
+    }
+
+    /// The core data-manager info, flushing a dirty write handle first
+    /// (descriptors may carry unflushed structural changes).
+    fn dminfo_info(&self) -> PyResult<std::collections::BTreeMap<String, core::DmInfo>> {
+        let inner = self.inner.lock().unwrap();
+        match &*inner {
+            Inner::Read(t) => {
+                let dir = std::path::PathBuf::from(t.name());
+                core::get_dminfo(&dir, &t.dat).map_err(err)
+            }
+            Inner::Write { shared, .. } => {
+                flush_if_dirty(&self.dir_of(), shared)?;
+                let s = shared.lock().unwrap();
+                let dir = PathBuf::from(s.read.name());
+                core::get_dminfo(&dir, &s.read.dat).map_err(err)
+            }
+        }
     }
 }

@@ -376,6 +376,8 @@ pub enum DmInfoError {
     BadSpecField { manager: String, field: String },
     /// `SPEC.DEFAULTTILESHAPE` is malformed or does not fit the column.
     BadTileShape { detail: String },
+    /// TiledColumnStMan was asked to store a non-fixed-shape column.
+    NotFixedShape { column: String },
 }
 
 impl std::fmt::Display for DmInfoError {
@@ -399,6 +401,12 @@ impl std::fmt::Display for DmInfoError {
             ),
             DmInfoError::BadTileShape { detail } => {
                 write!(f, "bad SPEC.DEFAULTTILESHAPE in dminfo: {detail}")
+            }
+            DmInfoError::NotFixedShape { column } => {
+                write!(
+                    f,
+                    "TiledColumnStMan needs array column {column} to be FixedShape"
+                )
             }
         }
     }
@@ -613,6 +621,17 @@ fn apply_dm_record(
     for idx in targets {
         let cd = &mut cols[idx];
         if let Some(t) = dm_type {
+            // casacore refuses a TiledColumnStMan on anything but a
+            // fixed-shape array column at creation; so do we, rather than
+            // writing a table casacore then cannot open (#42).
+            if t == "TiledColumnStMan"
+                && (!matches!(cd.kind, ColumnKind::Array)
+                    || !cd.shape.as_ref().is_some_and(|s| !s.is_empty()))
+            {
+                return Err(DmInfoError::NotFixedShape {
+                    column: cd.name.clone(),
+                });
+            }
             cd.data_manager_type = t.to_string();
         }
         // The group defaults to the (possibly new) manager type, as

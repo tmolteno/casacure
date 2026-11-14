@@ -254,10 +254,17 @@ pub(crate) fn tsm_grow(
     // the layout has it, else the descriptor's requested shape. Only the
     // dimensionality has to fit the cell here (a cell-splitting tile's cell
     // part legitimately differs); anything malformed falls back to the
-    // derived shape via the whole-table rewrite, not a wrong header.
-    let tile_shape: Option<Vec<i64>> = stored_tile
-        .or_else(|| cd.tile_shape.clone())
-        .filter(|t| t.len() == cell_shape.len() + 1 && t.iter().all(|&d| d > 0));
+    // derived shape via the whole-table rewrite, not a wrong header.  The
+    // stored candidate can be a placeholder that predates the cell shape
+    // (a table created empty, its header carrying only a nominal tile), so
+    // it does not disqualify the requested shape — the first candidate that
+    // fits wins (#42: a requested DEFAULTTILESHAPE [2,4,8] was dropped for
+    // the [65536] placeholder, and the column silently re-tiled to
+    // [2,4,8192]).
+    let tile_shape: Option<Vec<i64>> = [stored_tile.clone(), cd.tile_shape.clone()]
+        .into_iter()
+        .flatten()
+        .find(|t| t.len() == cell_shape.len() + 1 && t.iter().all(|&d| d > 0));
     if dry_run {
         return Ok(true);
     }
