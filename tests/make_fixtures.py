@@ -181,6 +181,46 @@ def make_ism_table(fixtures: Path) -> dict:
         }
 
 
+def make_ism_array_table(fixtures: Path) -> dict:
+    """An IncrementalStMan table whose group also binds the non-scalar column
+    kinds casacure does not read yet (issue #47): a fixed-shape float array
+    (WEIGHT), a variable-shape float array (SIGMA) and a string (NAME), plus
+    a scalar TIME as the control that must keep reading."""
+    import numpy as np
+
+    path = fixtures / "ism_arrays.tab"
+    td = ct.maketabdesc([
+        ct.makearrcoldesc("WEIGHT", 0.0, ndim=1, shape=[4], valuetype="float"),
+        ct.makearrcoldesc("SIGMA", 0.0, ndim=1, valuetype="float"),
+        ct.makescacoldesc("TIME", 0.0),
+        ct.makescacoldesc("NAME", "x"),
+    ])
+    dm = {
+        "*1": {
+            "TYPE": "IncrementalStMan",
+            "NAME": "ism",
+            "SPEC": {},
+            "COLUMNS": ["WEIGHT", "SIGMA", "TIME", "NAME"],
+        }
+    }
+    nrow = 10
+    w = np.ones((nrow, 4), np.float32)
+    w[5:] = 2.0
+    with ct.table(str(path), td, nrow=nrow, dminfo=dm, ack=False) as t:
+        t.putcol("WEIGHT", w)
+        t.putcol("SIGMA", 3 * w)
+        t.putcol("TIME", np.arange(nrow, dtype=float))
+        t.putcol("NAME", ["a"] * 5 + ["b"] * 5)
+        return {
+            "path": path.name,
+            "nrows": nrow,
+            "big_endian": sys.byteorder == "big",
+            "values": {
+                "TIME": [float(x) for x in t.getcol("TIME")],
+            },
+        }
+
+
 def make_tsm_table(fixtures: Path) -> dict:
     """A table whose DATA column (fixed-shape 2x3 dcomplex) is stored with
     TiledColumnStMan — the MS visibility-data storage pattern."""
@@ -408,6 +448,7 @@ def main() -> None:
             "array": make_array_table(FIXTURES),
             "longstr": make_long_string_table(FIXTURES),
             "ism": make_ism_table(FIXTURES),
+            "ism_arrays": make_ism_array_table(FIXTURES),
             "tsm": make_tsm_table(FIXTURES),
             "kw": make_keyword_table(FIXTURES),
             "subs": make_subtable_tree(FIXTURES),

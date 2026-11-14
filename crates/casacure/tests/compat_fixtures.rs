@@ -572,6 +572,58 @@ fn fixture_ism_read() {
         );
     }
 }
+/// Reads the real casacore-written `ism_arrays.tab` (issue #47): the
+/// non-scalar IncrementalStMan column kinds — a fixed-shape float array
+/// (WEIGHT), a variable-shape array (SIGMA) and a string (NAME) — raise
+/// `NotScalar`/`StringUnsupported` instead of returning one garbage scalar
+/// per row; the scalar TIME column in the same ISM group still reads.
+#[test]
+fn fixture_ism_arrays_raise() {
+    let Some(manifest) = load_manifest() else {
+        return;
+    };
+    let Some(t) = manifest.tables.get("ism_arrays") else {
+        return;
+    };
+    let fixtures_dir = manifest_path().parent().unwrap().to_path_buf();
+    let dir = fixtures_dir.join(&t.path);
+    let dat_bytes = std::fs::read(dir.join("table.dat")).expect("cannot read table.dat");
+    let dat = casacure::parse_table_dat(&dat_bytes)
+        .unwrap_or_else(|e| panic!("ism_arrays: table.dat failed to parse: {e}"));
+
+    let ism = casacure::IsmFile::open(&dir, 0, dat.header.big_endian)
+        .unwrap_or_else(|e| panic!("ism_arrays: ISM file failed to open: {e}"));
+
+    for (column, name) in [(0, "WEIGHT"), (1, "SIGMA")] {
+        let desc = dat.desc.column(name).unwrap();
+        assert!(
+            matches!(
+                ism.read_scalar_cell(column, desc, 0),
+                Err(casacure::IsmError::NotScalar(_))
+            ),
+            "ism_arrays: {name} must raise NotScalar, got {:?}",
+            ism.read_scalar_cell(column, desc, 0)
+        );
+    }
+    assert!(
+        matches!(
+            ism.read_scalar_cell(3, dat.desc.column("NAME").unwrap(), 0),
+            Err(casacure::IsmError::StringUnsupported)
+        ),
+        "ism_arrays: NAME must raise StringUnsupported"
+    );
+    for (row, expected) in t.values["TIME"].iter().enumerate() {
+        let got = ism
+            .read_scalar_cell(2, dat.desc.column("TIME").unwrap(), row as u64)
+            .unwrap_or_else(|e| panic!("ism_arrays TIME row {row}: {e}"));
+        assert_eq!(
+            got,
+            casacure::record::RecordValue::Double(expected.as_f64().unwrap()),
+            "ism_arrays TIME row {row}"
+        );
+    }
+}
+
 /// Reads the real casacore-written `tsm.tab`: the fixed-shape (2x3 dcomplex)
 /// DATA column comes back through the TiledColumnStMan tile file
 /// (`table.f0_TSM0`).

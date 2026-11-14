@@ -57,7 +57,7 @@ pub enum IsmError {
     Ssm(#[from] crate::ssm::SsmError),
     #[error("IncrementalStMan strings are not supported yet")]
     StringUnsupported,
-    #[error("column {0} is not a scalar IncrementalStMan column")]
+    #[error("IncrementalStMan array column {0} is not supported yet")]
     NotScalar(String),
 }
 
@@ -281,6 +281,12 @@ impl IsmFile {
     ) -> Result<(), E> {
         if desc.data_type == DataType::String {
             return Err(IsmError::StringUnsupported.into());
+        }
+        if matches!(desc.kind, crate::tabledesc::ColumnKind::Array) {
+            // An array cell is not one scalar at the stored offset; reading
+            // it as such returns garbage (issue #47). Refuse loudly until
+            // array cells are decoded properly.
+            return Err(IsmError::NotScalar(desc.name.clone()).into());
         }
         let want = ism_cell_size(desc) as usize;
         let data_off = 4usize; // data area starts after the index-offset u32
@@ -745,6 +751,28 @@ mod tests {
         assert!(matches!(
             f.read_scalar_cell(0, &d, 3),
             Err(IsmError::RowOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_array_and_string_columns() {
+        // Reading a non-scalar ISM column must raise, not return garbage
+        // values decoded from the wrong offsets (issue #47). The guard fires
+        // before any data is touched, so the single-interval file suffices.
+        let f = IsmFile::parse(&one_interval_file(), false).unwrap();
+        let mut arr = scalar_desc("A", DataType::Float);
+        arr.ndim = 1;
+        arr.shape = Some(vec![4]);
+        arr.kind = ColumnKind::Array;
+        assert!(matches!(
+            f.read_scalar_cell(0, &arr, 0),
+            Err(IsmError::NotScalar(name)) if name == "A"
+        ));
+        let mut s = scalar_desc("S", DataType::String);
+        s.kind = ColumnKind::Scalar(RecordValue::String(String::new()));
+        assert!(matches!(
+            f.read_scalar_cell(0, &s, 0),
+            Err(IsmError::StringUnsupported)
         ));
     }
 

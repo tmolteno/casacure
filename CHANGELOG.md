@@ -5,6 +5,26 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **IncrementalStMan array and string columns raise a named error instead of
+  returning garbage (issue #47).** casacure reads ISM columns as one scalar
+  per row; for a column casacore wrote as an ISM array (fixed or variable
+  shape — e.g. `WEIGHT`/`SIGMA` in makems/timba-generated MSs) that decoded
+  the ISM offsets as data, returning plausible-looking float32 garbage of
+  shape `(nrow,)` with no error. `IsmFile::for_each_cell_raw` — the funnel
+  for every ISM read — now refuses array columns loudly
+  (`IncrementalStMan array column X is not supported yet`), alongside the
+  existing string refusal, until array/string cells are decoded. The guard
+  keys on `ColumnKind::Array` (the same discriminator the StandardStMan
+  path uses): casacore stores scalar columns with `ndim=0` in `table.dat`,
+  so an `ndim` check would misfire on the scalars that read correctly.
+  Regression tests: a new casacore-written fixture `ism_arrays.tab` (the
+  issue's reproducer column set) asserted from Rust
+  (`compat_fixtures.rs::fixture_ism_arrays_raise`) and Python
+  (`tests/test_ism_unsupported.py`); unit test in `ism.rs`; `DIFFERENCES.md`
+  documents the named-error behaviour.
+
 ## [3.8.41] - 2026-11-10
 
 ### Fixed
