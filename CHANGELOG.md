@@ -5,6 +5,30 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Reading a never-written variable-shape column raises like casacore
+  instead of returning a silent `(nrow, 0, ..., 0)` (issue #49).** The
+  #45-era behavior stacked every undefined cell into a zero-sized guess,
+  which broke dask-ms-2 (9 tests) and skarabina (114 tests) against
+  3.8.44 — both held their locks at 3.8.41. `getcol`, `getcolnp`,
+  `getcolslice`, `getcolslicenp`, `getcell`, `getcellslice` and
+  `getcellslicenp` now refuse at the first undefined row of the read with
+  casacore's own message (`SSMIndColumn::getShape` /
+  `SSMIndStringColumn::getShape: no array in row N in column C of table T`),
+  on read and write handles alike; `getvarcol` maps an undefined cell to
+  `False`, as python-casacore's `isDefined` walk does. Scalar and
+  fixed-shape columns are untouched (issue #8 defaults). One deliberate
+  corner remains: casacore tolerates a read when the first row of the range
+  holds an explicitly-written *empty* array (it short-circuits a
+  zero-element column shape); casacure stores an empty putcell as the same
+  null reference as a never-written row, so it cannot tell the two apart
+  and raises. Regression tests in `tests/test_undefined_cells.py` and
+  `tests/test_core_tables_e2e.py`; the #45-era pins
+  (`test_getcol_stacks_defined_cells_past_an_undefined_one`,
+  `test_undefined_string_array_cells_survive_rewrite`) are re-pointed at
+  the oracle, which they had contradicted.
+
 ## [3.8.44] - 2026-11-14
 
 ## [3.8.43] - 2026-11-14

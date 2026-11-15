@@ -84,6 +84,7 @@ def ms(tmp_path):
     t.putcol("WEIGHT", np.ones((NROW, NCORR), dtype=np.float32))
     t.putcol("SIGMA", np.ones((NROW, NCORR), dtype=np.float32))
     t.putcol("FLAG", np.zeros((NROW, NCHAN, NCORR), dtype=bool))
+    t.putcol("FLAG_CATEGORY", np.zeros((NROW, 1, NCHAN, NCORR), dtype=bool))
     t.putcol("DATA", data)
     t.putcol("FIELD_ID", np.zeros(NROW, dtype=np.int32))
     t.putcol("DATA_DESC_ID", np.zeros(NROW, dtype=np.int32))

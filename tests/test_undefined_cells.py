@@ -1,20 +1,22 @@
-"""Never-written cells: shapes and dtypes (issue #45).
+"""Never-written cells: shapes and dtypes (issue #45) and the refusal to
+read them (issue #49).
 
-Three read/write disagreements with the column description, all pinned
-against python-casacore 3.8.1's behavior:
+Read/write contracts pinned against python-casacore 3.8.1's behavior:
 
-1. a never-written variable-shape array column keeps its declared rank:
-   `getcol` returns an empty `(nrow, 0, ..., 0)` array (the cell default
-   with zero extents per dimension), not a `(nrow,)` scalar-shaped result
-   that breaks `[:, :, :, k]` indexing;
+1. a never-written variable-shape array column keeps its declared rank on
+   disk (a null "no array" reference per dimension, `iscelldefined` False) —
+   and reading it through the Python API now *raises*, as casacore does:
+   `getcol`/`getcell`/`getcolslice`/`getcellslice` refuse with
+   `SSMIndColumn::getShape: no array in row N` (issue #49; 3.8.44 stacked a
+   silent `(nrow, 0, ..., 0)` instead, which broke dask-ms-2 and skarabina).
+   `getvarcol` maps the undefined cell to `False`;
 2. a 0-row table reads every column as an empty array of the column's
    dtype (not `int32` for everything), and a string column as an empty
    list;
 3. `addcols` of a variable-shape array column leaves its cells UNDEFINED
-   (a null "no array" reference, `iscelldefined` False) rather than
-   storing defined, empty 1-D cells that contradict the column's `ndim` —
-   casacore refuses to iterate the latter (`ArrayIterator<T>: at the
-   moment cannot iterate by scalars`).
+   rather than storing defined, empty 1-D cells that contradict the
+   column's `ndim` — casacore refuses to iterate the latter
+   (`ArrayIterator<T>: at the moment cannot iterate by scalars`).
 
 Real python-casacore runs in subprocesses without ``tests/shim`` on the
 path (the shim stands in for it); those tests skip when it is not
@@ -31,6 +33,8 @@ import pytest
 import casacure.tables as ct
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+NO_ARRAY = "no array in row"
 
 
 def _real_casacore_env():
@@ -76,18 +80,22 @@ def _desc():
     )
 
 
-def test_never_written_variable_shape_keeps_declared_rank(tmp_path):
+def test_never_written_variable_shape_refuses_to_read(tmp_path):
+    """issue #49: reading a never-written variable-shape column raises
+    casacore's `no array in row N`, it does not stack a silent
+    `(nrow, 0, ..., 0)`; `getvarcol` maps the cell to False."""
     t = ct.table(str(tmp_path / "u.tab"), _desc(), nrow=3, ack=False)
     t.putcol("D", np.arange(3.0))
     t.close()
 
     t = ct.table(str(tmp_path / "u.tab"), ack=False)
-    v = t.getcol("FLAG_CATEGORY")
-    assert v.shape == (3, 0, 0, 0)
-    assert v.dtype == np.bool_
-    assert t.getcell("FLAG_CATEGORY", 0).shape == (0, 0, 0)
-    # Undefined on disk, and still reported so.
+    # Still undefined on disk.
     assert not t.iscelldefined("FLAG_CATEGORY", 0)
+    with pytest.raises(RuntimeError, match=NO_ARRAY):
+        t.getcol("FLAG_CATEGORY")
+    with pytest.raises(RuntimeError, match="no array in row 0"):
+        t.getcell("FLAG_CATEGORY", 0)
+    assert t.getvarcol("FLAG_CATEGORY") == {"r1": False, "r2": False, "r3": False}
     t.close()
 
 
@@ -119,7 +127,8 @@ def test_addcols_variable_shape_cells_stay_undefined(tmp_path):
     _add_variable_column(path)
     t = ct.table(str(path), ack=False)
     assert not t.iscelldefined("CORRECTED_DATA", 0)
-    assert t.getcol("CORRECTED_DATA").shape == (3, 0, 0)
+    with pytest.raises(RuntimeError, match=NO_ARRAY):
+        t.getcol("CORRECTED_DATA")
     t.close()
 
 
@@ -142,3 +151,4 @@ def test_casacore_reads_addcols_variable_column_as_undefined(tmp_path):
         str(path),
     )
     assert "False" in out  # undefined, like a casacore-added column
+    assert "getcol raises" in out  # ... and casacore refuses to read it

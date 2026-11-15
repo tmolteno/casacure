@@ -307,12 +307,16 @@ def test_undefined_string_array_cells_survive_rewrite(tmp_path):
     t.close()
     t = table(p)
     assert list(t.getcol("NAME")) == ["TART", "a name longer than eight"]
-    assert np.asarray(t.getcell("LOG", 0)).size == 0
+    # Undefined string cells refuse like casacore's
+    # SSMIndStringColumn::getShape (issue #49).
+    with pytest.raises(RuntimeError, match="SSMIndStringColumn"):
+        t.getcell("LOG", 0)
     assert list(t.getcell("LOG", 1)) == ["entry"]
-    assert np.asarray(t.getcell("SCHEDULE", 1)).size == 0
-    # getcol over undefined cells must not crash (python-casacore raises
-    # "no array in row"; casacure answers with the String default)
-    t.getcol("SCHEDULE")
+    with pytest.raises(RuntimeError, match="SSMIndStringColumn"):
+        t.getcell("SCHEDULE", 1)
+    with pytest.raises(RuntimeError, match="SSMIndStringColumn"):
+        t.getcol("SCHEDULE")
+    assert t.getvarcol("SCHEDULE") == {"r1": False, "r2": False}
     t.close()
 
 
@@ -698,9 +702,11 @@ def test_getcol_refuses_cells_of_different_shapes(tmp_path):
     r.close()
 
 
-def test_getcol_stacks_defined_cells_past_an_undefined_one(tmp_path):
-    """An empty (undefined) cell stays exempt from the shape check: it reads as
-    a default (issue #8), it does not make the column ragged."""
+def test_getcol_refuses_defined_cells_past_an_undefined_one(tmp_path):
+    """An undefined cell in a variable-shape column refuses the whole read,
+    as casacore does (issue #49) — the 3.8.44 stacking of zero-sized guesses
+    broke dask-ms-2 and skarabina. `getvarcol` still walks the column,
+    mapping the undefined cell to False (casacore's isDefined convention)."""
     p = str(tmp_path / "gap.tab")
     t = table(p, maketabdesc([makearrcoldesc("V", 0.0, ndim=1)]), nrow=3, ack=False)
     t.putcell("V", 0, np.array([1.0, 2.0]))
@@ -708,7 +714,69 @@ def test_getcol_stacks_defined_cells_past_an_undefined_one(tmp_path):
     t.close()
 
     r = table(p, ack=False)
-    np.testing.assert_array_equal(r.getcol("V"), [[1.0, 2.0], [0.0, 0.0], [3.0, 4.0]])
+    with pytest.raises(RuntimeError, match="no array in row 1"):
+        r.getcol("V")
+    with pytest.raises(RuntimeError, match="no array in row 1"):
+        r.getcell("V", 1)
+    with pytest.raises(RuntimeError, match="no array in row 1"):
+        r.getcellslice("V", 1, [0], [1])
+    # The error names the first undefined row of the read's range.
+    with pytest.raises(RuntimeError, match="no array in row 1"):
+        r.getcol("V", 1, 2)
+    # Written cells still read; getvarcol maps the gap to False.
+    np.testing.assert_array_equal(r.getcell("V", 0), [1.0, 2.0])
+    np.testing.assert_array_equal(r.getcol("V", 0, 1), [[1.0, 2.0]])
+    var = r.getvarcol("V")
+    np.testing.assert_array_equal(var["r1"], [1.0, 2.0])
+    assert var["r2"] is False
+    np.testing.assert_array_equal(var["r3"], [3.0, 4.0])
+    r.close()
+
+
+def test_getcol_of_never_written_variable_shape_column_raises(tmp_path):
+    """issue #49's repro: a never-written variable-shape column (an MS
+    FLAG_CATEGORY no FLAGGER has touched) reads casacore's
+    `SSMIndColumn::getShape: no array in row 0`, not a silent
+    `(nrow, 0, ..., 0)`; string columns refuse through
+    SSMIndStringColumn."""
+    p = str(tmp_path / "ms_like.tab")
+    t = table(
+        p,
+        maketabdesc(
+            [
+                makearrcoldesc("DATA", 0j, ndim=2, valuetype="complex"),
+                makearrcoldesc("FLAG_CATEGORY", False, ndim=3, valuetype="boolean"),
+                makearrcoldesc("LOG", "", ndim=1, valuetype="string"),
+            ]
+        ),
+        nrow=10,
+        ack=False,
+    )
+    t.putcol("DATA", np.zeros((10, 16, 2), dtype=complex))
+    t.close()
+
+    r = table(p, ack=False)
+    with pytest.raises(RuntimeError, match="no array in row 0") as ei:
+        r.getcol("FLAG_CATEGORY")
+    assert "SSMIndColumn::getShape" in str(ei.value)
+    with pytest.raises(RuntimeError, match="SSMIndStringColumn"):
+        r.getcol("LOG")
+    with pytest.raises(RuntimeError, match="no array in row 0"):
+        r.getcolnp("FLAG_CATEGORY", np.zeros((10, 0, 0, 0), dtype=bool))
+    with pytest.raises(RuntimeError, match="no array in row 0"):
+        r.getcolslice("FLAG_CATEGORY", [0, 0, 0], [0, 0, 0])
+    # Same through a write handle; a pending write counts as defined, a row
+    # appended but never written is "no array".
+    w = table(p, readonly=False, ack=False)
+    with pytest.raises(RuntimeError, match="no array in row 0"):
+        w.getcol("FLAG_CATEGORY")
+    w.putcol("FLAG_CATEGORY", np.zeros((10, 2, 3, 4), dtype=bool))
+    w.addrows(1)
+    with pytest.raises(RuntimeError, match="no array in row 10"):
+        w.getcol("FLAG_CATEGORY")
+    w.putcell("FLAG_CATEGORY", 10, np.zeros((2, 3, 4), dtype=bool))
+    assert w.getcol("FLAG_CATEGORY").shape == (11, 2, 3, 4)
+    w.close()
     r.close()
 
 

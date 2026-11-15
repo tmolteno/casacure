@@ -638,6 +638,66 @@ fn merged_cell(s: &WriteData, col_idx: usize, row: u64) -> PyResult<RecordValue>
     Ok(buffered_default_cell(s, col_idx, row))
 }
 
+/// Whether `col_idx` addresses a variable-shape array column — the only
+/// kind whose cells can be undefined (casacore's `isShapeDefined`: a scalar
+/// or fixed-shape cell always holds a value).
+fn is_variable_shape_array(desc: &core::tabledesc::TableDesc, col_idx: usize) -> bool {
+    let cd = &desc.columns[col_idx];
+    matches!(cd.kind, core::tabledesc::ColumnKind::Array)
+        && !cd.shape.as_deref().is_some_and(|s| !s.is_empty())
+}
+
+/// casacore's refusal for reading an undefined variable-shape cell
+/// (issue #49): `SSMIndColumn::getShape` — `SSMIndStringColumn` for a
+/// string column — raises `no array in row N`, which surfaces as a
+/// `RuntimeError` carrying this exact message.
+fn no_array_error(table: &str, column: &str, row: u64, is_string: bool) -> PyErr {
+    let which = if is_string {
+        "SSMIndStringColumn"
+    } else {
+        "SSMIndColumn"
+    };
+    PyRuntimeError::new_err(format!(
+        "Table DataManager error: Invalid operation: {which}::getShape: \
+         no array in row {row} in column {column} of table {table}"
+    ))
+}
+
+/// The table directory this backing reads, for error messages (the path as
+/// opened, like casacore's).
+fn inner_table_name(inner: &Inner) -> String {
+    match inner {
+        Inner::Read(t) => t.name().to_string(),
+        Inner::Write { shared, .. } => shared.lock().unwrap().read.name().to_string(),
+    }
+}
+
+/// Whether the cell of `col_idx` at `row` holds a value, through whichever
+/// backing is current — the shared logic of `iscelldefined` (issue #32): a
+/// pending buffered write counts as defined; otherwise the on-disk state
+/// when the snapshot has the row; otherwise the schema default — a real
+/// value for a scalar or fixed-shape column, "no array" for a variable-
+/// shape one. `row` must be inside the table (callers bounds-check first).
+fn inner_cell_defined(inner: &Inner, col_idx: usize, row: u64) -> PyResult<bool> {
+    match inner {
+        Inner::Read(t) => t.is_cell_defined(col_idx, row).map_err(err),
+        Inner::Write { shared, .. } => {
+            let s = shared.lock().unwrap();
+            if s.wt.pending_cell(col_idx, row).is_some() {
+                return Ok(true);
+            }
+            if row < s.read.nrows() {
+                if let Some(di) = disk_col_index(&s, col_idx) {
+                    return s.read.is_cell_defined(di, row).map_err(err);
+                }
+            }
+            // Not on disk and not pending: the schema default — defined for
+            // a scalar or fixed-shape column, "no array" for a variable one.
+            Ok(!is_variable_shape_array(s.wt.desc(), col_idx))
+        }
+    }
+}
+
 /// `ValueError` for a row the table does not have (the casacure contract for
 /// read violations; casacore raises its own "no such row" `RuntimeError`).
 fn row_out_of_range(row: u64, nrow: u64) -> PyErr {
@@ -1418,6 +1478,71 @@ user,usernoread,permanent,permanentwait"
                 merged_col_cells(&s, col_idx, startrow, nrow)
             }
         }
+    }
+
+    /// Refuse a `getcol`-family read of a variable-shape column that covers
+    /// an undefined cell, as casacore does (issue #49): the read raises
+    /// `no array in row N` at the first undefined row, instead of stacking
+    /// the zero-sized guess that broke dask-ms-2 and skarabina on 3.8.44.
+    /// Scalar and fixed-shape columns keep their defaults (issue #8). Rows
+    /// outside the table are left to the read itself, which reports them as
+    /// it always has; the common case costs one descriptor check.
+    fn refuse_undefined_cells(
+        &self,
+        column: &str,
+        col_idx: usize,
+        startrow: u64,
+        nrow: u64,
+    ) -> PyResult<()> {
+        let desc = self.desc();
+        if nrow == 0 || !is_variable_shape_array(&desc, col_idx) {
+            return Ok(());
+        }
+        let is_string = desc.columns[col_idx].data_type == core::record::DataType::String;
+        let total = self.row_count();
+        let inner = self.inner.lock().unwrap();
+        let table = inner_table_name(&inner);
+        for row in startrow..startrow.saturating_add(nrow) {
+            if row >= total {
+                break;
+            }
+            if !inner_cell_defined(&inner, col_idx, row)? {
+                return Err(no_array_error(&table, column, row, is_string));
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Table::refuse_undefined_cells`] for the single-cell reads
+    /// (`getcell`, `getcellslice`): casacore refuses an undefined
+    /// variable-shape cell with the same `no array in row N` error, also
+    /// under a write handle whose unflushed state has not written it.
+    fn refuse_undefined_cell(&self, column: &str, col_idx: usize, row: u64) -> PyResult<()> {
+        let desc = self.desc();
+        if !is_variable_shape_array(&desc, col_idx) {
+            return Ok(());
+        }
+        let is_string = desc.columns[col_idx].data_type == core::record::DataType::String;
+        if row >= self.row_count() {
+            return Ok(()); // the read reports the out-of-range row as before
+        }
+        let inner = self.inner.lock().unwrap();
+        if !inner_cell_defined(&inner, col_idx, row)? {
+            return Err(no_array_error(
+                &inner_table_name(&inner),
+                column,
+                row,
+                is_string,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether the cell of `col_idx` at `row` holds a value (issue #32
+    /// semantics); `row` must be inside the table.
+    fn cell_defined(&self, col_idx: usize, row: u64) -> PyResult<bool> {
+        let inner = self.inner.lock().unwrap();
+        inner_cell_defined(&inner, col_idx, row)
     }
 
     fn desc(&self) -> core::tabledesc::TableDesc {
@@ -2499,6 +2624,7 @@ impl Table {
             nrow as u64
         };
         let col_idx = self.col_index(column)?;
+        self.refuse_undefined_cells(column, col_idx, startrow, nrow)?;
         if nrow == 0 {
             // casacore returns an empty 1-D array of the column type (a
             // string column: an empty list), whatever the handle kind.
@@ -2739,6 +2865,7 @@ impl Table {
             nrow as u64
         };
         let col_idx = self.col_index(column)?;
+        self.refuse_undefined_cells(column, col_idx, startrow, nrow)?;
         // Typed-buffer fast path: for a read handle over a StandardStMan
         // numeric column, decode each cell straight from the mapped data
         // file into `buf` — no per-cell `RecordValue`/`ArrayData` Vec. This
@@ -2803,6 +2930,7 @@ impl Table {
         };
         let col_idx = self.col_index(column)?;
         self.check_slice_request("getcolslice", column, col_idx, &blc, &trc)?;
+        self.refuse_undefined_cells(column, col_idx, startrow, nrow)?;
         let cells =
             py.detach(|| self.read_colslice(col_idx, &blc, &trc, &inc_v, startrow, nrow))?;
         self.column_to_python(py, col_idx, &cells)
@@ -2841,6 +2969,7 @@ impl Table {
         };
         let col_idx = self.col_index(column)?;
         self.check_slice_request("getcolslicenp", column, col_idx, &blc, &trc)?;
+        self.refuse_undefined_cells(column, col_idx, startrow, nrow)?;
         // Whole-cell fast path (DDFacet's chunk reader lives here): a slice
         // that covers the fixed cell on a raw-supported column fills the
         // buffer straight from the data files, one memcpy per row.  The
@@ -2889,6 +3018,7 @@ impl Table {
     fn getcell(&self, py: Python<'_>, column: &str, row: u64) -> PyResult<Py<PyAny>> {
         self.auto_tick()?;
         let col_idx = self.col_index(column)?;
+        self.refuse_undefined_cell(column, col_idx, row)?;
         let v = self.read_cell(col_idx, row)?;
         if let RecordValue::Array(mut a) = v {
             // Array cells keep every stored dimension for `getcol` — casacore
@@ -2921,10 +3051,10 @@ impl Table {
     /// `iscelldefined(column, rownr)` — whether the cell holds a value
     /// (issue #32). A scalar or fixed-shape-array cell is defined in every
     /// row; a variable-shape array cell is defined only when an array was
-    /// written to it (an undefined one reads as its default per issue #8,
-    /// and this is the only way to tell the two apart). A pending buffered
-    /// write counts as defined; a row added but never written reads as the
-    /// schema default, which for a variable-shape column is "no array".
+    /// written to it (an undefined one refuses `getcol`/`getcell` with
+    /// casacore's "no array in row N", issue #49). A pending buffered write
+    /// counts as defined; a row added but never written is "no array" for
+    /// a variable-shape column.
     fn iscelldefined(&self, column: &str, row: u64) -> PyResult<bool> {
         self.auto_tick()?;
         let col_idx = self.col_index(column)?;
@@ -2935,7 +3065,6 @@ impl Table {
                 if row >= n {
                     return Err(row_out_of_range(row, n));
                 }
-                t.is_cell_defined(col_idx, row).map_err(err)
             }
             Inner::Write { shared, .. } => {
                 let s = shared.lock().unwrap();
@@ -2943,23 +3072,9 @@ impl Table {
                 if row >= n {
                     return Err(row_out_of_range(row, n));
                 }
-                if s.wt.pending_cell(col_idx, row).is_some() {
-                    return Ok(true);
-                }
-                let desc = &s.wt.desc().columns[col_idx];
-                let variable_array = matches!(desc.kind, core::tabledesc::ColumnKind::Array)
-                    && !desc.shape.as_deref().is_some_and(|sh| !sh.is_empty());
-                if row < s.read.nrows() {
-                    if let Some(di) = disk_col_index(&s, col_idx) {
-                        return s.read.is_cell_defined(di, row).map_err(err);
-                    }
-                }
-                // Not on disk and not pending: the schema default — a real
-                // value for a scalar or fixed-shape column, "no array" for
-                // a variable-shape one.
-                Ok(!variable_array)
             }
         }
+        inner_cell_defined(&inner, col_idx, row)
     }
 
     /// `getcellslice(column, rownr, blc, trc, inc=[])` — python-casacore's
@@ -2988,6 +3103,7 @@ impl Table {
         self.auto_tick()?;
         let col_idx = self.col_index(column)?;
         self.check_slice_request("getcellslice", column, col_idx, &blc, &trc)?;
+        self.refuse_undefined_cell(column, col_idx, row)?;
         let v = self.read_cellslice(col_idx, row, &blc, &trc, &inc_v)?;
         convert::cell_to_py(py, &v)
     }
@@ -3021,13 +3137,14 @@ impl Table {
         self.auto_tick()?;
         let col_idx = self.col_index(column)?;
         self.check_slice_request("getcellslicenp", column, col_idx, &blc, &trc)?;
+        self.refuse_undefined_cell(column, col_idx, row)?;
         // One cell's slice: the same read as getcellslice, so every corner
         // rank/range refusal (and the -1 whole-cell idiom) comes with it.
         let v = py.detach(|| self.read_cellslice(col_idx, row, &blc, &trc, &inc_v))?;
         let expected: Vec<usize> = match &v {
-            // An array column always yields an array cell (even an
-            // undefined one reads as the default, issue #8); the shape is
-            // exactly what `getcellslice` would return, so the buffer
+            // An array column always yields an array cell (an undefined
+            // variable-shape cell is refused earlier, issue #49); the shape
+            // is exactly what `getcellslice` would return, so the buffer
             // contract and that method's output agree by construction.
             RecordValue::Array(a) => a.shape.iter().map(|&d| d as usize).collect(),
             _ => Vec::new(),
@@ -3104,9 +3221,17 @@ impl Table {
             nrow as u64
         };
         let col_idx = self.col_index(column)?;
+        let undefined_is_false = is_variable_shape_array(&self.desc(), col_idx);
         let d = PyDict::new(py);
         for r in 0..nrow {
-            let v = self.read_cell(col_idx, startrow + r)?;
+            let row = startrow + r;
+            // python-casacore maps an undefined variable-shape cell to
+            // False (its getvarcol walks isDefined); issue #49.
+            if undefined_is_false && row < total && !self.cell_defined(col_idx, row)? {
+                d.set_item(format!("r{}", row + 1), false)?;
+                continue;
+            }
+            let v = self.read_cell(col_idx, row)?;
             // python-casacore numbers the keys from row 0 of the table
             // (`getvarcol("V", 1, 2)` -> r2, r3), not from the window's
             // start. (The dict-form putcol/putvarcol input is a different
