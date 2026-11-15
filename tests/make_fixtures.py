@@ -182,41 +182,106 @@ def make_ism_table(fixtures: Path) -> dict:
 
 
 def make_ism_array_table(fixtures: Path) -> dict:
-    """An IncrementalStMan table whose group also binds the non-scalar column
-    kinds casacure does not read yet (issue #47): a fixed-shape float array
-    (WEIGHT), a variable-shape float array (SIGMA) and a string (NAME), plus
-    a scalar TIME as the control that must keep reading."""
+    """An IncrementalStMan table exercising every cell kind casacure reads
+    (issue #48): a fixed-shape float array (WEIGHT), a variable-shape float
+    array with a different shape per row (SIGMA), a variable-shape 2-D int
+    array (ARR2), a fixed-shape bool array (FLAG), a scalar string column
+    with lengths from 0 to 20 (NAME), plus a scalar TIME control."""
     import numpy as np
 
     path = fixtures / "ism_arrays.tab"
+    nrow = 10
+    names = ["", "a", "abc", "abcde", "a much longer string", "xy", "", "end"]
+    names = (names * ((nrow // len(names)) + 1))[:nrow]
+    sigma = [np.arange(r + 1, dtype=np.float64) * 1.5 for r in range(nrow)]
+    arr2 = [
+        (np.arange(2 * (r % 3 + 1), dtype=np.int32) + 100 * r).reshape(2, r % 3 + 1)
+        for r in range(nrow)
+    ]
+    weight = np.ones((nrow, 4), np.float32)
+    weight[5:] = 2.0
+    flag = np.zeros((nrow, 3), bool)
+    flag[::2] = True
     td = ct.maketabdesc([
         ct.makearrcoldesc("WEIGHT", 0.0, ndim=1, shape=[4], valuetype="float"),
-        ct.makearrcoldesc("SIGMA", 0.0, ndim=1, valuetype="float"),
+        ct.makearrcoldesc("SIGMA", 0.0, ndim=1, valuetype="double"),
+        ct.makearrcoldesc("ARR2", 0, ndim=2, valuetype="integer"),
+        ct.makearrcoldesc("FLAG", False, ndim=1, shape=[3], valuetype="boolean"),
         ct.makescacoldesc("TIME", 0.0),
-        ct.makescacoldesc("NAME", "x"),
+        ct.makescacoldesc("NAME", ""),
     ])
     dm = {
         "*1": {
             "TYPE": "IncrementalStMan",
             "NAME": "ism",
             "SPEC": {},
-            "COLUMNS": ["WEIGHT", "SIGMA", "TIME", "NAME"],
+            "COLUMNS": ["WEIGHT", "SIGMA", "ARR2", "FLAG", "TIME", "NAME"],
         }
     }
-    nrow = 10
-    w = np.ones((nrow, 4), np.float32)
-    w[5:] = 2.0
     with ct.table(str(path), td, nrow=nrow, dminfo=dm, ack=False) as t:
-        t.putcol("WEIGHT", w)
-        t.putcol("SIGMA", 3 * w)
+        t.putcol("WEIGHT", weight)
+        for r in range(nrow):
+            t.putcell("SIGMA", r, sigma[r])
+            t.putcell("ARR2", r, arr2[r])
+        t.putcol("FLAG", flag)
         t.putcol("TIME", np.arange(nrow, dtype=float))
-        t.putcol("NAME", ["a"] * 5 + ["b"] * 5)
+        t.putcol("NAME", names)
         return {
             "path": path.name,
             "nrows": nrow,
             "big_endian": sys.byteorder == "big",
             "values": {
+                "WEIGHT": weight.tolist(),
+                "SIGMA": [s.tolist() for s in sigma],
+                "ARR2": [a.tolist() for a in arr2],
+                "FLAG": flag.tolist(),
                 "TIME": [float(x) for x in t.getcol("TIME")],
+                "NAME": names,
+            },
+        }
+
+
+def make_ism_bucket_table(fixtures: Path) -> dict:
+    """A multi-bucket IncrementalStMan table: enough rows that casacore's
+    default bucket size splits the column across several buckets, so reads
+    crossing bucket boundaries are covered (scalars, strings, arrays)."""
+    import numpy as np
+
+    path = fixtures / "ism_buckets.tab"
+    nrow = 5000
+    time = np.arange(nrow, dtype=np.float64) * 1.25
+    ant1 = (np.arange(nrow) % 7).astype(np.int32)
+    name = [f"row-{i % 13}" for i in range(nrow)]
+    vec = np.stack([np.full(3, float(i % 5)) for i in range(nrow)])
+    td = ct.maketabdesc([
+        ct.makescacoldesc("TIME", 0.0),
+        ct.makescacoldesc("ANT1", 0),
+        ct.makescacoldesc("NAME", ""),
+        ct.makearrcoldesc("VEC", 0.0, ndim=1, shape=[3]),
+    ])
+    dm = {
+        "*1": {
+            "TYPE": "IncrementalStMan",
+            "NAME": "ism",
+            "SPEC": {},
+            "COLUMNS": ["TIME", "ANT1", "NAME", "VEC"],
+        }
+    }
+    with ct.table(str(path), td, nrow=nrow, dminfo=dm, ack=False) as t:
+        t.putcol("TIME", time)
+        t.putcol("ANT1", ant1)
+        t.putcol("NAME", name)
+        t.putcol("VEC", vec)
+        # nbuckets is observable only through the Rust reader; assert in Rust.
+        return {
+            "path": path.name,
+            "nrows": nrow,
+            "big_endian": sys.byteorder == "big",
+            "values": {
+                "TIME": [float(x) for x in time],
+                "ANT1": [int(x) for x in ant1],
+                "NAME": name,
+                "VEC": vec.tolist(),
             },
         }
 
@@ -449,6 +514,7 @@ def main() -> None:
             "longstr": make_long_string_table(FIXTURES),
             "ism": make_ism_table(FIXTURES),
             "ism_arrays": make_ism_array_table(FIXTURES),
+            "ism_buckets": make_ism_bucket_table(FIXTURES),
             "tsm": make_tsm_table(FIXTURES),
             "kw": make_keyword_table(FIXTURES),
             "subs": make_subtable_tree(FIXTURES),

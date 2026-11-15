@@ -572,13 +572,65 @@ fn fixture_ism_read() {
         );
     }
 }
-/// Reads the real casacore-written `ism_arrays.tab` (issue #47): the
-/// non-scalar IncrementalStMan column kinds — a fixed-shape float array
-/// (WEIGHT), a variable-shape array (SIGMA) and a string (NAME) — raise
-/// `NotScalar`/`StringUnsupported` instead of returning one garbage scalar
-/// per row; the scalar TIME column in the same ISM group still reads.
+/// Flatten a JSON array value into (shape, leaves); scalars give an empty
+/// shape.
+fn flatten_json(v: &serde_json::Value) -> (Vec<u32>, Vec<serde_json::Value>) {
+    let mut shape = Vec::new();
+    let mut cur = vec![v.clone()];
+    while let Some(first) = cur.first().and_then(|c| c.as_array()) {
+        shape.push(first.len() as u32);
+        cur = cur
+            .iter()
+            .flat_map(|c| c.as_array().unwrap().clone())
+            .collect();
+    }
+    (shape, cur)
+}
+
+/// The `RecordValue` casacure must return for a JSON-encoded cell of the
+/// column's dtype.
+fn json_cell(desc: &casacure::ColumnDesc, v: &serde_json::Value) -> casacure::record::RecordValue {
+    use casacure::record::{ArrayData, ArrayValue, RecordValue};
+    match &desc.kind {
+        casacure::ColumnKind::Scalar(_) => match desc.data_type {
+            casacure::record::DataType::Double => RecordValue::Double(v.as_f64().unwrap()),
+            casacure::record::DataType::Int => RecordValue::Int(v.as_i64().unwrap() as i32),
+            casacure::record::DataType::String => {
+                RecordValue::String(v.as_str().unwrap().to_string())
+            }
+            other => panic!("json_cell: unsupported scalar dtype {other:?}"),
+        },
+        casacure::ColumnKind::Array => {
+            let (shape, leaves) = flatten_json(v);
+            let data = match desc.data_type {
+                casacure::record::DataType::Float => {
+                    ArrayData::Float(leaves.iter().map(|l| l.as_f64().unwrap() as f32).collect())
+                }
+                casacure::record::DataType::Double => {
+                    ArrayData::Double(leaves.iter().map(|l| l.as_f64().unwrap()).collect())
+                }
+                casacure::record::DataType::Int => {
+                    ArrayData::Int(leaves.iter().map(|l| l.as_i64().unwrap() as i32).collect())
+                }
+                casacure::record::DataType::Bool => {
+                    ArrayData::Bool(leaves.iter().map(|l| l.as_bool().unwrap()).collect())
+                }
+                other => panic!("json_cell: unsupported array dtype {other:?}"),
+            };
+            RecordValue::Array(ArrayValue { shape, data })
+        }
+        casacure::ColumnKind::Record => panic!("json_cell: record column"),
+    }
+}
+
+/// Reads the real casacore-written `ism_arrays.tab` (issues #47/#48): every
+/// non-scalar IncrementalStMan cell kind — a fixed-shape float array
+/// (WEIGHT), per-row-shaped variable arrays (SIGMA, ARR2), a fixed bool
+/// array (FLAG) and strings from empty to 20 chars (NAME) — decodes to
+/// casacore's values; the scalar TIME column in the same ISM group still
+/// reads.
 #[test]
-fn fixture_ism_arrays_raise() {
+fn fixture_ism_arrays_read() {
     let Some(manifest) = load_manifest() else {
         return;
     };
@@ -594,32 +646,84 @@ fn fixture_ism_arrays_raise() {
     let ism = casacure::IsmFile::open(&dir, 0, dat.header.big_endian)
         .unwrap_or_else(|e| panic!("ism_arrays: ISM file failed to open: {e}"));
 
-    for (column, name) in [(0, "WEIGHT"), (1, "SIGMA")] {
+    for name in ["WEIGHT", "SIGMA", "ARR2", "FLAG", "TIME", "NAME"] {
         let desc = dat.desc.column(name).unwrap();
-        assert!(
-            matches!(
-                ism.read_scalar_cell(column, desc, 0),
-                Err(casacure::IsmError::NotScalar(_))
-            ),
-            "ism_arrays: {name} must raise NotScalar, got {:?}",
-            ism.read_scalar_cell(column, desc, 0)
-        );
+        let column = dat
+            .desc
+            .columns
+            .iter()
+            .position(|c| c.name == name)
+            .unwrap();
+        for (row, expected) in t.values[name].iter().enumerate() {
+            let got = ism
+                .read_cell(column, desc, row as u64)
+                .unwrap_or_else(|e| panic!("ism_arrays {name} row {row}: {e}"));
+            assert_eq!(
+                got,
+                json_cell(desc, expected),
+                "ism_arrays {name} row {row}"
+            );
+        }
     }
+}
+
+/// Reads the real casacore-written `ism_buckets.tab`: 5000 rows split
+/// across many IncrementalStMan buckets, so a ranged read crosses bucket
+/// boundaries (scalars, strings and arrays alike).
+#[test]
+fn fixture_ism_buckets_read() {
+    let Some(manifest) = load_manifest() else {
+        return;
+    };
+    let Some(t) = manifest.tables.get("ism_buckets") else {
+        return;
+    };
+    let fixtures_dir = manifest_path().parent().unwrap().to_path_buf();
+    let dir = fixtures_dir.join(&t.path);
+    let dat_bytes = std::fs::read(dir.join("table.dat")).expect("cannot read table.dat");
+    let dat = casacure::parse_table_dat(&dat_bytes)
+        .unwrap_or_else(|e| panic!("ism_buckets: table.dat failed to parse: {e}"));
+
+    let ism = casacure::IsmFile::open(&dir, 0, dat.header.big_endian)
+        .unwrap_or_else(|e| panic!("ism_buckets: ISM file failed to open: {e}"));
     assert!(
-        matches!(
-            ism.read_scalar_cell(3, dat.desc.column("NAME").unwrap(), 0),
-            Err(casacure::IsmError::StringUnsupported)
-        ),
-        "ism_arrays: NAME must raise StringUnsupported"
+        ism.header.nbucket > 1,
+        "ism_buckets: fixture must span multiple buckets (got {})",
+        ism.header.nbucket
     );
-    for (row, expected) in t.values["TIME"].iter().enumerate() {
-        let got = ism
-            .read_scalar_cell(2, dat.desc.column("TIME").unwrap(), row as u64)
-            .unwrap_or_else(|e| panic!("ism_arrays TIME row {row}: {e}"));
+
+    // Whole-column read through the Table API, then a windowed one — both
+    // must see the bucket boundaries identically.
+    let table = casacure::Table::open(&dir, false)
+        .unwrap_or_else(|e| panic!("ism_buckets: open failed: {e}"));
+    for name in ["TIME", "ANT1", "NAME", "VEC"] {
+        let col_idx = dat
+            .desc
+            .columns
+            .iter()
+            .position(|c| c.name == name)
+            .unwrap();
+        let cells = table
+            .getcol(col_idx, 0, t.nrows)
+            .unwrap_or_else(|e| panic!("ism_buckets getcol {name}: {e}"));
+        assert_eq!(cells.len() as u64, t.nrows, "ism_buckets {name} length");
+        let expect = &t.values[name];
+        for row in [0u64, 1, 511, 512, 1023, 2048, 4095, 4999] {
+            assert_eq!(
+                cells[row as usize],
+                json_cell(&dat.desc.columns[col_idx], &expect[row as usize]),
+                "ism_buckets {name} row {row}"
+            );
+        }
+        // A windowed read crossing a boundary.
+        let win = table
+            .getcol(col_idx, 510, 6)
+            .unwrap_or_else(|e| panic!("ism_buckets window {name}: {e}"));
+        assert_eq!(win.len(), 6);
         assert_eq!(
-            got,
-            casacure::record::RecordValue::Double(expected.as_f64().unwrap()),
-            "ism_arrays TIME row {row}"
+            win[1],
+            json_cell(&dat.desc.columns[col_idx], &expect[511]),
+            "ism_buckets {name} window row 511"
         );
     }
 }

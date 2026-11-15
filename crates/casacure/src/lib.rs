@@ -32,7 +32,10 @@ pub use columnset::{
     parse_column_set, parse_standard_stman, write_multi_column_set, write_standard_stman,
     ColumnInfo, ColumnSet, ColumnSetError, DataManager, DataManagerBlob, DmBlob, StandardStMan,
 };
-pub use ism::{write_ism_file, IsmError, IsmFile, IsmHeader, IsmIndex, WriteIsmColumn};
+pub use ism::{
+    build_array_index_file, encode_ism_string_cell, write_ism_file, IsmError, IsmFile, IsmHeader,
+    IsmIndex, WriteIsmColumn,
+};
 pub use ssm::{
     encode_scalar_cell, layout, read_array_cell, scalar_cell_size, write_standard_stman_file,
     SsmError, SsmIndex, StandardStManFile, StandardStManHeader, StandardStManLayout, WriteColumn,

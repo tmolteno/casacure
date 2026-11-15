@@ -123,10 +123,17 @@ def test_scalar_roundtrip_incremental(tmp_path, vt, dtype, values):
     t2.close()
 
 
-def test_incremental_rejects_string(tmp_path):
+def test_incremental_string_roundtrip(tmp_path):
+    # ISM scalar strings write and read since issue #48 (inline
+    # u32-prefixed cells, interval-compressed like scalars).
     p = str(tmp_path / "t.tab")
-    with pytest.raises(RuntimeError):
-        table(p, _make_scalar_desc("C", "string", "IncrementalStMan"), 2)
+    t = table(p, _make_scalar_desc("C", "string", "IncrementalStMan"), 5)
+    t.putcol("C", ["", "a", "abc", "a much longer string", "xy"])
+    t.close()
+    t2 = table(p)
+    assert t2.getcol("C") == ["", "a", "abc", "a much longer string", "xy"]
+    assert t2.getcell("C", 3) == "a much longer string"
+    t2.close()
 
 
 # ---------------------------------------------------------------------------

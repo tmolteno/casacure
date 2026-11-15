@@ -55,10 +55,12 @@ pub enum IsmError {
     ColumnEmpty { column: usize, row: u64 },
     #[error(transparent)]
     Ssm(#[from] crate::ssm::SsmError),
-    #[error("IncrementalStMan strings are not supported yet")]
-    StringUnsupported,
     #[error("IncrementalStMan array column {0} is not supported yet")]
     NotScalar(String),
+    #[error("IncrementalStMan array column {0} has no array index file (table.f{{seq}}i)")]
+    MissingArrayFile(String),
+    #[error("IncrementalStMan string cell of column {column} at row {row} is corrupt (cell bytes {cell})")]
+    CorruptString { column: usize, row: u64, cell: u32 },
 }
 
 /// The `IncrementalStMan` header at the start of the data file
@@ -116,6 +118,10 @@ pub struct IsmFile {
     pub header: IsmHeader,
     pub index: IsmIndex,
     data: crate::datafile::Buffer,
+    /// Optional `table.f{seq}i` array index file: an ISM indirect array
+    /// column's bucket cell is an 8-byte offset into this `StManArrayFile`
+    /// (the same record format StandardStMan uses, issue #48).
+    f0i: Option<crate::datafile::Buffer>,
 }
 
 /// Per-column per-bucket interval index.
@@ -141,11 +147,30 @@ impl IsmFile {
         let data = crate::datafile::Buffer::from_file(file)
             .map_err(|e| IsmError::FileIo(crate::datafile::FileIoError::new(&path, e)))?;
         let (header, index) = Self::parse_meta(&data, table_big_endian)?;
+        let f0i = Self::open_array_file(table_dir.as_ref(), seq_nr)?;
         Ok(IsmFile {
             header,
             index,
             data,
+            f0i,
         })
+    }
+
+    /// The optional array index file (`table.f{seq}i`) only exists for
+    /// tables with ISM indirect array columns.
+    fn open_array_file(
+        table_dir: &std::path::Path,
+        seq_nr: u32,
+    ) -> Result<Option<crate::datafile::Buffer>, IsmError> {
+        let path = table_dir.join(format!("table.f{seq_nr}i"));
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let file = std::fs::File::open(&path)
+            .map_err(|e| IsmError::FileIo(crate::datafile::FileIoError::new(&path, e)))?;
+        crate::datafile::Buffer::from_file(file)
+            .map(Some)
+            .map_err(|e| IsmError::FileIo(crate::datafile::FileIoError::new(&path, e)))
     }
 
     /// Parse an IncrementalStMan data file.
@@ -155,6 +180,7 @@ impl IsmFile {
             header,
             index,
             data: crate::datafile::Buffer::from(data.to_vec()),
+            f0i: None,
         })
     }
 
@@ -195,6 +221,9 @@ impl IsmFile {
     /// the cells out, to keep streaming scans resident at ~the working set).
     pub fn drop_data_pages(&self) {
         self.data.drop_pages();
+        if let Some(f0i) = &self.f0i {
+            f0i.drop_pages();
+        }
     }
 
     fn bucket_bytes(&self, bucket: u32) -> Result<&[u8], IsmError> {
@@ -242,6 +271,37 @@ impl IsmFile {
         Err(IsmError::ColumnEmpty { column, row: 0 })
     }
 
+    /// Read the cell of `column` (index within this data manager) at `row`:
+    /// a scalar decodes inline, a string from its u32-prefixed inline cell,
+    /// an array through its 8-byte reference into the array index file
+    /// (issue #48). A row the column has no interval for is
+    /// [`IsmError::ColumnEmpty`], exactly as for a scalar.
+    pub fn read_cell(
+        &self,
+        column: usize,
+        desc: &ColumnDesc,
+        row: u64,
+    ) -> Result<RecordValue, IsmError> {
+        match (&desc.kind, desc.data_type) {
+            (crate::tabledesc::ColumnKind::Array, DataType::String) => {
+                // An array of strings stores its elements in the string
+                // buckets of the index file; no fixture covers it yet, so
+                // the #47 named error stays until one does.
+                Err(IsmError::NotScalar(desc.name.clone()))
+            }
+            (crate::tabledesc::ColumnKind::Array, _) => {
+                let mut out = None;
+                self.for_each_cell_at(column, row, 1, |b, off, r| {
+                    out = Some(self.decode_array_at(b, off, r, column, desc)?);
+                    Ok::<(), IsmError>(())
+                })?;
+                out.ok_or(IsmError::RowOutOfRange { row })
+            }
+            (_, DataType::String) => Ok(RecordValue::String(self.read_string_cell(column, row)?)),
+            _ => self.read_scalar_cell(column, desc, row),
+        }
+    }
+
     /// Read the scalar value for `column` (index within this data manager)
     /// at `row`. The value is the interval entry covering `row`.
     pub fn read_scalar_cell(
@@ -262,33 +322,164 @@ impl IsmFile {
         out.ok_or(IsmError::RowOutOfRange { row })
     }
 
-    /// Visit the raw stored bytes (data-file byte order, [`ism_cell_size`]
-    /// long) of `column` for rows `start .. start + nrow`, borrowed from the
-    /// mapped file.
-    ///
-    /// Each bucket's interval index is parsed once and walked forward with
-    /// the rows, so a range read is linear in the rows plus the intervals
-    /// it spans. (Resolving every row on its own re-parses the whole bucket
-    /// index per row: quadratic for a column that changes every row, like
-    /// an MS `ANTENNA1`.)
-    pub fn for_each_cell_raw<'a, E: From<IsmError>>(
-        &'a self,
+    /// Read one scalar string: the inline cell is `[u32 cell_bytes =
+    /// 4 + nchar][chars]` in the data file's byte order, packed without
+    /// alignment (verified against casacore-written tables, issue #48).
+    pub fn read_string_cell(&self, column: usize, row: u64) -> Result<String, IsmError> {
+        let mut out = None;
+        self.for_each_cell_at(column, row, 1, |b, off, r| {
+            out = Some(self.decode_string_at(b, off, r, column)?);
+            Ok::<(), IsmError>(())
+        })?;
+        out.ok_or(IsmError::RowOutOfRange { row })
+    }
+
+    fn decode_string_at(
+        &self,
+        b: &[u8],
+        off: usize,
+        row: u64,
+        column: usize,
+    ) -> Result<String, IsmError> {
+        let head = b
+            .get(off..off + 4)
+            .ok_or(IsmError::ColumnEmpty { column, row })?;
+        let cell = if self.header.big_endian {
+            u32::from_be_bytes(head.try_into().unwrap())
+        } else {
+            u32::from_le_bytes(head.try_into().unwrap())
+        };
+        let len = cell
+            .checked_sub(4)
+            .ok_or(IsmError::CorruptString { column, row, cell })?;
+        let bytes = b
+            .get(off + 4..off + 4 + len as usize)
+            .ok_or(IsmError::CorruptString { column, row, cell })?;
+        Ok(String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    /// Decode one indirect array cell: the 8-byte reference is null (0)
+    /// for a row that was never written — casacore's "no array", which
+    /// reads as the column default exactly as a StandardStMan undefined
+    /// cell does (#45) — otherwise it points at a `StIndArray` record in
+    /// the array index file (`[u32 refcount][u32 ndim][u32 CASA dims...]
+    /// [elements]`, the StandardStMan format).
+    fn decode_array_at(
+        &self,
+        b: &[u8],
+        off: usize,
+        row: u64,
+        column: usize,
+        desc: &ColumnDesc,
+    ) -> Result<RecordValue, IsmError> {
+        let cell = b
+            .get(off..off + 8)
+            .ok_or(IsmError::ColumnEmpty { column, row })?;
+        let offset = if self.header.big_endian {
+            i64::from_be_bytes(cell.try_into().unwrap())
+        } else {
+            i64::from_le_bytes(cell.try_into().unwrap())
+        };
+        if offset == 0 {
+            return crate::table::default_cell_value(desc)
+                .ok_or_else(|| IsmError::NotScalar(desc.name.clone()));
+        }
+        let f0i = self
+            .f0i
+            .as_deref()
+            .ok_or_else(|| IsmError::MissingArrayFile(desc.name.clone()))?;
+        let (logical, nelem, data) =
+            crate::ssm::st_ind_array_region(f0i, self.header.big_endian, offset, desc.data_type)?;
+        Ok(crate::ssm::decode_array_elements(
+            self.header.big_endian,
+            desc.data_type,
+            logical,
+            nelem,
+            data,
+        )?)
+    }
+
+    /// Whether the array cell of `column` at `row` holds an array:
+    /// casacore's `isShapeDefined` — the 8-byte reference is non-null.
+    /// Scalar and string columns are defined in every row; a row with no
+    /// interval at all (added but never written) is not.
+    pub fn is_cell_defined(
+        &self,
+        column: usize,
+        desc: &ColumnDesc,
+        row: u64,
+    ) -> Result<bool, IsmError> {
+        if !matches!(desc.kind, crate::tabledesc::ColumnKind::Array) {
+            return Ok(true);
+        }
+        let mut out = false;
+        self.for_each_cell_at(column, row, 1, |b, off, _| {
+            let cell = b
+                .get(off..off + 8)
+                .ok_or(IsmError::ColumnEmpty { column, row })?;
+            let offset = if self.header.big_endian {
+                i64::from_be_bytes(cell.try_into().unwrap())
+            } else {
+                i64::from_le_bytes(cell.try_into().unwrap())
+            };
+            out = offset != 0;
+            Ok::<(), IsmError>(())
+        })?;
+        Ok(out)
+    }
+
+    /// Visit the decoded cells of `column` for rows `start .. start+nrow`
+    /// (the `getcol` path): one linear walk of each bucket's interval
+    /// index, decoding per the column kind.
+    pub fn for_each_decoded<E: From<IsmError>>(
+        &self,
         column: usize,
         desc: &ColumnDesc,
         start: u64,
         nrow: u64,
-        mut visit: impl FnMut(&'a [u8]) -> Result<(), E>,
+        mut visit: impl FnMut(RecordValue) -> Result<(), E>,
     ) -> Result<(), E> {
-        if desc.data_type == DataType::String {
-            return Err(IsmError::StringUnsupported.into());
+        match (&desc.kind, desc.data_type) {
+            (crate::tabledesc::ColumnKind::Array, DataType::String) => {
+                Err(IsmError::NotScalar(desc.name.clone()).into())
+            }
+            (crate::tabledesc::ColumnKind::Array, _) => {
+                self.for_each_cell_at(column, start, nrow, |b, off, r| {
+                    visit(self.decode_array_at(b, off, r, column, desc)?)
+                })
+            }
+            (_, DataType::String) => self.for_each_cell_at(column, start, nrow, |b, off, r| {
+                visit(RecordValue::String(
+                    self.decode_string_at(b, off, r, column)?,
+                ))
+            }),
+            _ => {
+                let big_endian = self.header.big_endian;
+                self.for_each_cell_raw(column, desc, start, nrow, |cell| {
+                    visit(
+                        crate::ssm::decode_scalar(cell, desc, big_endian)
+                            .map_err(IsmError::from)?,
+                    )
+                })
+            }
         }
-        if matches!(desc.kind, crate::tabledesc::ColumnKind::Array) {
-            // An array cell is not one scalar at the stored offset; reading
-            // it as such returns garbage (issue #47). Refuse loudly until
-            // array cells are decoded properly.
-            return Err(IsmError::NotScalar(desc.name.clone()).into());
-        }
-        let want = ism_cell_size(desc) as usize;
+    }
+
+    /// Walk the cells of `column` for rows `start .. start+nrow`, handing
+    /// the visitor the bucket bytes and the data-area offset of each row's
+    /// cell. The cell's extent depends on the column kind (fixed-size
+    /// scalar, u32-prefixed string, 8-byte array reference), so unlike
+    /// [`IsmFile::for_each_cell_raw`] the visitor bounds-checks its own
+    /// slice. Each bucket's interval index is parsed once and walked
+    /// forward with the rows, so a range read is linear in the rows plus
+    /// the intervals it spans.
+    fn for_each_cell_at<'a, E: From<IsmError>>(
+        &'a self,
+        column: usize,
+        start: u64,
+        nrow: u64,
+        mut visit: impl FnMut(&'a [u8], usize, u64) -> Result<(), E>,
+    ) -> Result<(), E> {
         let data_off = 4usize; // data area starts after the index-offset u32
         let end = start.saturating_add(nrow);
         let mut row = start;
@@ -317,15 +508,44 @@ impl IsmFile {
                     inx += 1;
                 }
                 let offset = data_off + ci.offsets[inx] as usize;
-                let cell = b.get(offset..offset + want).ok_or(IsmError::ColumnEmpty {
-                    column,
-                    row: row + k,
-                })?;
-                visit(cell)?;
+                visit(b, offset, row + k)?;
             }
             row += stop;
         }
         Ok(())
+    }
+
+    /// Visit the raw stored bytes (data-file byte order, [`ism_cell_size`]
+    /// long) of `column` for rows `start .. start + nrow`, borrowed from
+    /// the mapped file. Scalar columns only (the raw bulk-fill path).
+    ///
+    /// Each bucket's interval index is parsed once and walked forward with
+    /// the rows, so a range read is linear in the rows plus the intervals
+    /// it spans. (Resolving every row on its own re-parses the whole bucket
+    /// index per row: quadratic for a column that changes every row, like
+    /// an MS `ANTENNA1`.)
+    pub fn for_each_cell_raw<'a, E: From<IsmError>>(
+        &'a self,
+        column: usize,
+        desc: &ColumnDesc,
+        start: u64,
+        nrow: u64,
+        mut visit: impl FnMut(&'a [u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if desc.data_type == DataType::String {
+            return Err(IsmError::NotScalar(desc.name.clone()).into());
+        }
+        if matches!(desc.kind, crate::tabledesc::ColumnKind::Array) {
+            // An array cell is not one scalar at the stored offset.
+            return Err(IsmError::NotScalar(desc.name.clone()).into());
+        }
+        let want = ism_cell_size(desc) as usize;
+        self.for_each_cell_at(column, start, nrow, |b, offset, row| {
+            let cell = b
+                .get(offset..offset + want)
+                .ok_or(IsmError::ColumnEmpty { column, row })?;
+            visit(cell)
+        })
     }
 }
 
@@ -425,13 +645,49 @@ pub fn ism_cell_size(desc: &ColumnDesc) -> u32 {
     }
 }
 
-/// Per-column raw cell bytes handed to `write_ism_file`.
+/// Per-column encoded cells handed to `write_ism_file`. Cells vary in size
+/// (strings carry their u32 length prefix; arrays an 8-byte reference), so
+/// the column is a list of per-row byte strings rather than one flat
+/// `n_rows * cell_size` buffer.
 #[derive(Debug, Clone, Copy)]
 pub struct WriteIsmColumn<'a> {
-    /// Bytes per row cell (fixed element size; ISM scalar columns only).
-    pub cell_size: u32,
-    /// Concatenated cell bytes: `n_rows * cell_size` bytes.
-    pub bytes: &'a [u8],
+    /// The encoded cell bytes, one per row.
+    pub cells: &'a [Vec<u8>],
+}
+
+/// Encode one scalar string cell as ISM stores it inline in the bucket
+/// data area: `[u32 cell_bytes = 4 + nchar][chars]` in the data file's
+/// byte order, packed without alignment (issue #48).
+pub fn encode_ism_string_cell(big_endian: bool, s: &str) -> Vec<u8> {
+    let mut cell = Vec::with_capacity(4 + s.len());
+    let n = (4 + s.len()) as u32;
+    cell.extend_from_slice(&if big_endian {
+        n.to_be_bytes()
+    } else {
+        n.to_le_bytes()
+    });
+    cell.extend_from_slice(s.as_bytes());
+    cell
+}
+
+/// Assemble an array index file (`table.f{seq}i`) from `StIndArray` records
+/// (`crate::ssm::encode_array_record`): the 16-byte `StManArrayFile`
+/// header — `[u32 version = 0][Int64 file length][u32 spare]`, no per-record
+/// reference count (version 0), matching what the StandardStMan builder
+/// writes — followed by the concatenated records. casacore reads version 0
+/// files without the refcount, and casacure's reader handles both.
+pub fn build_array_index_file(big_endian: bool, records: &[Vec<u8>]) -> Vec<u8> {
+    let mut f0i = vec![0u8; 16];
+    let len = (16 + records.iter().map(Vec::len).sum::<usize>()) as i64;
+    f0i[4..12].copy_from_slice(&if big_endian {
+        len.to_be_bytes()
+    } else {
+        len.to_le_bytes()
+    });
+    for r in records {
+        f0i.extend_from_slice(r);
+    }
+    f0i
 }
 
 /// Serialize a complete IncrementalStMan data file — header, data buckets
@@ -476,9 +732,7 @@ pub fn write_ism_file(big_endian: bool, n_rows: u64, cols: &[WriteIsmColumn<'_>]
         let slices: Vec<WriteIsmColumn<'_>> = cols
             .iter()
             .map(|col| WriteIsmColumn {
-                cell_size: col.cell_size,
-                bytes: &col.bytes[(start_row * col.cell_size as u64) as usize
-                    ..(end_row * col.cell_size as u64) as usize],
+                cells: &col.cells[start_row as usize..end_row as usize],
             })
             .collect();
         let bucket = encode_ism_bucket(big_endian, bucket_size, end_row - start_row, &slices)
@@ -498,18 +752,22 @@ pub fn write_ism_file(big_endian: bool, n_rows: u64, cols: &[WriteIsmColumn<'_>]
 /// The rows an IncrementalStMan bucket of `bucket_size` bytes can always
 /// hold, whatever the values: every row a new interval in every column
 /// (`[u32 indexOffset]` + the cells + per column `[u32 nr]` and a u32 row
-/// and u32 offset per interval).
+/// and u32 offset per interval). Variable-size cells are bounded by their
+/// longest row.
 pub fn ism_rows_per_bucket(bucket_size: usize, cols: &[WriteIsmColumn<'_>]) -> usize {
     let ncols = cols.len();
-    let sum_sizes: usize = cols.iter().map(|c| c.cell_size as usize).sum();
+    let sum_sizes: usize = cols
+        .iter()
+        .map(|c| c.cells.iter().map(Vec::len).max().unwrap_or(0))
+        .sum();
     let per_row = sum_sizes + 8 * ncols;
     (bucket_size.saturating_sub(4 + 4 * ncols) / per_row.max(1)).max(1)
 }
 
-/// Encode one IncrementalStMan bucket of `nrows` rows: `cols[c].bytes`
-/// holds exactly `nrows` cells of column `c`.  Consecutive rows with
-/// identical bytes share one stored value (an interval entry), exactly as
-/// `ISMBucket::addData` does.  `None` when the encoding does not fit.
+/// Encode one IncrementalStMan bucket of `nrows` rows: `cols[c].cells`
+/// holds exactly `nrows` encoded cells of column `c`.  Consecutive rows
+/// with identical bytes share one stored value (an interval entry), exactly
+/// as `ISMBucket::addData` does.  `None` when the encoding does not fit.
 pub fn encode_ism_bucket(
     big_endian: bool,
     bucket_size: usize,
@@ -522,11 +780,9 @@ pub fn encode_ism_bucket(
     let mut starts: Vec<Vec<u32>> = vec![Vec::new(); ncols];
     let mut offsets: Vec<Vec<u32>> = vec![Vec::new(); ncols];
     for (c, col) in cols.iter().enumerate() {
-        let size = col.cell_size as usize;
         let mut prev: Option<&[u8]> = None;
-        for row in 0..nrows as usize {
-            let cell = &col.bytes[row * size..(row + 1) * size];
-            if prev != Some(cell) {
+        for (row, cell) in col.cells.iter().enumerate() {
+            if prev != Some(cell.as_slice()) {
                 starts[c].push(row as u32);
                 offsets[c].push(0);
             }
@@ -539,9 +795,8 @@ pub fn encode_ism_bucket(
     for row in 0..nrows as usize {
         for (c, col) in cols.iter().enumerate() {
             if next[c] < starts[c].len() && starts[c][next[c]] as usize == row {
-                let size = col.cell_size as usize;
                 offsets[c][next[c]] = data.len() as u32;
-                data.extend_from_slice(&col.bytes[row * size..(row + 1) * size]);
+                data.extend_from_slice(&col.cells[row]);
                 next[c] += 1;
             }
         }
@@ -755,24 +1010,119 @@ mod tests {
     }
 
     #[test]
-    fn rejects_array_and_string_columns() {
-        // Reading a non-scalar ISM column must raise, not return garbage
-        // values decoded from the wrong offsets (issue #47). The guard fires
-        // before any data is touched, so the single-interval file suffices.
+    fn rejects_only_string_arrays() {
+        // A string-array column keeps the #47 named error: its elements live
+        // in the string buckets of the index file, which no fixture covers
+        // yet. Numeric arrays and scalar strings read (issues #47/#48).
         let f = IsmFile::parse(&one_interval_file(), false).unwrap();
         let mut arr = scalar_desc("A", DataType::Float);
         arr.ndim = 1;
         arr.shape = Some(vec![4]);
         arr.kind = ColumnKind::Array;
+        // The bucket cell is an 8-byte array reference; without an array
+        // index file the read names the missing file.
         assert!(matches!(
-            f.read_scalar_cell(0, &arr, 0),
-            Err(IsmError::NotScalar(name)) if name == "A"
+            f.read_cell(0, &arr, 0),
+            Err(IsmError::MissingArrayFile(name)) if name == "A"
         ));
-        let mut s = scalar_desc("S", DataType::String);
-        s.kind = ColumnKind::Scalar(RecordValue::String(String::new()));
         assert!(matches!(
-            f.read_scalar_cell(0, &s, 0),
-            Err(IsmError::StringUnsupported)
+            f.is_cell_defined(0, &arr, 0),
+            Ok(true) // the synthetic cell holds a non-null reference
+        ));
+        let mut sa = scalar_desc("SA", DataType::String);
+        sa.ndim = 1;
+        sa.kind = ColumnKind::Array;
+        assert!(matches!(
+            f.read_cell(0, &sa, 0),
+            Err(IsmError::NotScalar(name)) if name == "SA"
+        ));
+    }
+
+    #[test]
+    fn reads_inline_string_cells() {
+        // Scalar strings are inline `[u32 cell_bytes = 4 + nchar][chars]`,
+        // interval-compressed like scalars (issue #48). Hand-build a bucket:
+        // rows 0..2 "aa", 2..4 "b", 4..5 "" — three intervals, one column.
+        let bs = 128u32;
+        // Cells: "aa" -> u32 6 + 2 chars, "b" -> u32 5 + 1 char, "" -> u32 4.
+        let cells: [&[u8]; 3] = [
+            &[6, 0, 0, 0, b'a', b'a'],
+            &[5, 0, 0, 0, b'b'],
+            &[4, 0, 0, 0],
+        ];
+        let mut file = vec![0u8; DATA_START + bs as usize];
+        let mut w = Writer::new_le();
+        w.put_root_object_start("IncrementalStMan", 5);
+        w.put_bool(false);
+        w.put_u32(bs);
+        w.put_u32(1);
+        w.put_u32(0);
+        w.put_u32(0);
+        w.put_u32(0);
+        w.put_i32(-1);
+        w.put_object_end();
+        let hdr = w.into_bytes();
+        file[..hdr.len()].copy_from_slice(&hdr);
+        let b = DATA_START;
+        // Data area at 4..4+15; the index follows at 19.
+        file[b..b + 4].copy_from_slice(&19u32.to_le_bytes());
+        let mut pos = b + 4;
+        for cell in cells {
+            file[pos..pos + cell.len()].copy_from_slice(cell);
+            pos += cell.len();
+        }
+        // column 0 index: nr=3, rownrs=[0,2,4], offsets=[0,6,11].
+        file[pos..pos + 4].copy_from_slice(&3u32.to_le_bytes());
+        pos += 4;
+        for r in [0u32, 2, 4] {
+            file[pos..pos + 4].copy_from_slice(&r.to_le_bytes());
+            pos += 4;
+        }
+        for o in [0u32, 6, 11] {
+            file[pos..pos + 4].copy_from_slice(&o.to_le_bytes());
+            pos += 4;
+        }
+        let mut w = Writer::new_le();
+        w.put_root_object_start("ISMIndex", 1);
+        w.put_u32(1);
+        w.put_object_start("Block", 1);
+        w.put_u32(2);
+        w.put_u32(0);
+        w.put_u32(5);
+        w.put_object_end();
+        w.put_object_start("Block", 1);
+        w.put_u32(1);
+        w.put_u32(0);
+        w.put_object_end();
+        w.put_object_end();
+        file.extend_from_slice(&w.into_bytes());
+
+        let f = IsmFile::parse(&file, false).unwrap();
+        let desc = scalar_desc("S", DataType::String);
+        let want = ["aa", "aa", "b", "b", ""];
+        for (row, expect) in want.iter().enumerate() {
+            assert_eq!(
+                f.read_cell(0, &desc, row as u64).unwrap(),
+                RecordValue::String(expect.to_string()),
+                "row {row}"
+            );
+        }
+        // Whole-column and windowed walks agree with the per-cell reads.
+        let mut all = Vec::new();
+        f.for_each_decoded(0, &desc, 0, 5, |v| {
+            all.push(v);
+            Ok::<(), IsmError>(())
+        })
+        .unwrap();
+        assert_eq!(all.len(), 5);
+        assert_eq!(
+            all[4],
+            RecordValue::String(String::new()),
+            "windowed walk row 4"
+        );
+        assert!(matches!(
+            f.read_cell(0, &desc, 5),
+            Err(IsmError::RowOutOfRange { row: 5 })
         ));
     }
 
@@ -864,25 +1214,19 @@ mod tests {
         let jcol = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
         let icol = scalar_desc("I", DataType::Int);
         let dcol = scalar_desc("J", DataType::Double);
-        let mut ibytes = Vec::new();
-        let mut jbytes = Vec::new();
-        for i in 0..n as usize {
-            ibytes.extend_from_slice(
-                &crate::ssm::encode_scalar_cell(big, &icol, &RecordValue::Int(icomp[i])).unwrap(),
-            );
-            jbytes.extend_from_slice(
-                &crate::ssm::encode_scalar_cell(big, &dcol, &RecordValue::Double(jcol[i])).unwrap(),
-            );
-        }
+        let icells: Vec<Vec<u8>> = (0..n as usize)
+            .map(|i| {
+                crate::ssm::encode_scalar_cell(big, &icol, &RecordValue::Int(icomp[i])).unwrap()
+            })
+            .collect();
+        let jcells: Vec<Vec<u8>> = (0..n as usize)
+            .map(|i| {
+                crate::ssm::encode_scalar_cell(big, &dcol, &RecordValue::Double(jcol[i])).unwrap()
+            })
+            .collect();
         let cols = [
-            WriteIsmColumn {
-                cell_size: 4,
-                bytes: &ibytes,
-            },
-            WriteIsmColumn {
-                cell_size: 8,
-                bytes: &jbytes,
-            },
+            WriteIsmColumn { cells: &icells },
+            WriteIsmColumn { cells: &jcells },
         ];
         let file = write_ism_file(big, n, &cols);
         let f = IsmFile::parse(&file, big).unwrap();
@@ -916,16 +1260,11 @@ mod tests {
         let n: u64 = 2800;
         let icol = scalar_desc("I", DataType::Int);
         let vals: Vec<i32> = (0..n as i32).map(|i| i % 7 - 3).collect();
-        let mut bytes = Vec::with_capacity(n as usize * 4);
-        for &v in &vals {
-            bytes.extend_from_slice(
-                &crate::ssm::encode_scalar_cell(false, &icol, &RecordValue::Int(v)).unwrap(),
-            );
-        }
-        let cols = [WriteIsmColumn {
-            cell_size: 4,
-            bytes: &bytes,
-        }];
+        let cells: Vec<Vec<u8>> = vals
+            .iter()
+            .map(|&v| crate::ssm::encode_scalar_cell(false, &icol, &RecordValue::Int(v)).unwrap())
+            .collect();
+        let cols = [WriteIsmColumn { cells: &cells }];
         let file = write_ism_file(false, n, &cols);
         let f = IsmFile::parse(&file, false).unwrap();
         assert!(

@@ -142,11 +142,15 @@ None currently. Unimplemented features and compatibility gaps are tracked in
 casacure reads the storage managers that appear in mainstream MS output:
 `StandardStMan`, `IncrementalStMan`, and the tiled family
 `TiledColumnStMan` / `TiledShapeStMan` / `TiledCellStMan` (read and
-written). IncrementalStMan reads cover scalar numeric columns; an ISM
-array or string column raises a named error
-(`IncrementalStMan array column X is not supported yet` /
-`IncrementalStMan strings are not supported yet`) instead of returning
-data, until issue #47 implements them. Two casacore managers are not
+written). IncrementalStMan reads cover scalar columns (numeric, Bool and
+string), fixed- and variable-shape arrays — an array cell is an 8-byte
+reference into `table.f{seq}i`, a string cell an inline u32-prefixed cell —
+and writes cover the same kinds, so casacore reads casacure-written ISM
+tables (issue #48). The one remaining ISM kind, an *array of strings*
+(its elements live in the string buckets of the index file, which no
+fixture covers yet), raises a named error
+(`IncrementalStMan array column X is not supported yet`) instead of
+returning data. Two casacore managers are not
 implemented and fail at open with
 an error naming the manager, rather than a bare missing-file or generic
 message:

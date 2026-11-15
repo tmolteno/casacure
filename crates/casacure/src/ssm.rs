@@ -142,6 +142,81 @@ impl SsmIndex {
     }
 }
 
+/// Decode a `StIndArray` record at `offset` in an array index file
+/// (`table.f{seq}i`): `[u32 refcount? (file version > 0)][u32 ndim][u32
+/// CASA dims...][element data]`. Shared by the StandardStMan and
+/// IncrementalStMan readers — both store an indirect array column's cells
+/// as 8-byte offsets into a `StManArrayFile` of these records. Returns the
+/// logical (reversed-CASA) shape, the element count, and the element bytes
+/// in the data file's byte order.
+pub fn st_ind_array_region(
+    f0i: &[u8],
+    big_endian: bool,
+    offset: i64,
+    elem: DataType,
+) -> Result<(Vec<u32>, usize, &[u8]), SsmError> {
+    let off = usize::try_from(offset).map_err(|_| SsmError::BadArrayRef {
+        offset,
+        len: f0i.len(),
+    })?;
+    if off >= f0i.len() {
+        return Err(SsmError::BadArrayRef {
+            offset,
+            len: f0i.len(),
+        });
+    }
+    let version = u32_from(f0i, 0, big_endian);
+    let mut p = off;
+    if version > 0 {
+        let _ref_count = u32_at(f0i, p, big_endian)?;
+        p += 4;
+    }
+    let ndim = u32_at(f0i, p, big_endian)? as usize;
+    p += 4;
+    let mut casa_dims: Vec<u32> = Vec::with_capacity(ndim);
+    for _ in 0..ndim {
+        let d = u32_at(f0i, p, big_endian)?;
+        p += 4;
+        casa_dims.push(d);
+    }
+    let logical: Vec<u32> = casa_dims.iter().rev().copied().collect();
+    // ndim == 0 is an EMPTY array (a variable-shape cell that holds
+    // nothing yet, e.g. an array column created with `addrows` and never
+    // written): `product()` over no dims is 1, which made the reader claim
+    // one element and run off the end of the index file on the last
+    // record ("array reference 36 falls outside the array index file
+    // (len 40)").
+    let nelem: usize = if casa_dims.is_empty() {
+        0
+    } else {
+        casa_dims.iter().map(|&d| d as usize).product()
+    };
+    let region_size = if elem == DataType::Bool {
+        nelem.div_ceil(8)
+    } else {
+        nelem
+            .checked_mul(array_elem_size(elem))
+            .ok_or(SsmError::BadArrayRef {
+                offset,
+                len: f0i.len(),
+            })?
+    };
+    let data_start = p;
+    let data_end = data_start
+        .checked_add(region_size)
+        .ok_or(SsmError::BadArrayRef {
+            offset,
+            len: f0i.len(),
+        })?;
+    if data_end > f0i.len() {
+        return Err(SsmError::BadArrayRef {
+            offset,
+            len: f0i.len(),
+        });
+    }
+    Ok((logical, nelem, &f0i[data_start..data_end]))
+}
+
 /// A parsed StandardStMan data file: header, decoded index, and the raw
 /// bucket region for direct cell access.
 #[derive(Debug)]
@@ -622,66 +697,9 @@ impl StandardStManFile {
             .f0i
             .as_deref()
             .ok_or_else(|| SsmError::MissingArrayFile(desc.name.clone(), "table.f0i".into()))?;
-        let off = usize::try_from(offset).map_err(|_| SsmError::BadArrayRef {
-            offset,
-            len: f0i.len(),
-        })?;
-        if off >= f0i.len() {
-            return Err(SsmError::BadArrayRef {
-                offset,
-                len: f0i.len(),
-            });
-        }
-        let version = u32_from(f0i, 0, self.header.big_endian);
-        let mut p = off;
-        if version > 0 {
-            let _ref_count = u32_at(f0i, p, self.header.big_endian)?;
-            p += 4;
-        }
-        let ndim = u32_at(f0i, p, self.header.big_endian)? as usize;
-        p += 4;
-        let mut casa_dims: Vec<u32> = Vec::with_capacity(ndim);
-        for _ in 0..ndim {
-            let d = u32_at(f0i, p, self.header.big_endian)?;
-            p += 4;
-            casa_dims.push(d);
-        }
-        let logical: Vec<u32> = casa_dims.iter().rev().copied().collect();
-        // ndim == 0 is an EMPTY array (a variable-shape cell that holds
-        // nothing yet, e.g. an array column created with `addrows` and never
-        // written): `product()` over no dims is 1, which made the reader claim
-        // one element and run off the end of the index file on the last
-        // record ("array reference 36 falls outside the array index file
-        // (len 40)").
-        let nelem: usize = if casa_dims.is_empty() {
-            0
-        } else {
-            casa_dims.iter().map(|&d| d as usize).product()
-        };
-        let region_size = if desc.data_type == DataType::Bool {
-            nelem.div_ceil(8)
-        } else {
-            nelem
-                .checked_mul(array_elem_size(desc.data_type))
-                .ok_or(SsmError::BadArrayRef {
-                    offset,
-                    len: f0i.len(),
-                })?
-        };
-        let data_start = p;
-        let data_end = data_start
-            .checked_add(region_size)
-            .ok_or(SsmError::BadArrayRef {
-                offset,
-                len: f0i.len(),
-            })?;
-        if data_end > f0i.len() {
-            return Err(SsmError::BadArrayRef {
-                offset,
-                len: f0i.len(),
-            });
-        }
-        Ok((logical, nelem, &f0i[data_start..data_end]))
+        let (logical, nelem, data) =
+            st_ind_array_region(f0i, self.header.big_endian, offset, desc.data_type)?;
+        Ok((logical, nelem, data))
     }
 }
 
@@ -976,7 +994,7 @@ pub fn read_array_cell(
 
 /// Decode an array cell's `nelem` stored elements (data-file byte order;
 /// Bool bit-packed from bit 0) into a value of shape `logical`.
-fn decode_array_elements(
+pub(crate) fn decode_array_elements(
     big_endian: bool,
     elem: DataType,
     logical: Vec<u32>,

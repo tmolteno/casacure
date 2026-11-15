@@ -795,13 +795,8 @@ pub(crate) fn ism_update(
     }
     let bs = h.bucket_size as usize;
     let sizes: Vec<u32> = cds.iter().map(|cd| ism_cell_size(cd)).collect();
-    let shape: Vec<WriteIsmColumn<'_>> = sizes
-        .iter()
-        .map(|&cell_size| WriteIsmColumn {
-            cell_size,
-            bytes: &[],
-        })
-        .collect();
+    let shape: Vec<WriteIsmColumn<'_>> =
+        cds.iter().map(|_| WriteIsmColumn { cells: &[] }).collect();
     let cap = ism_rows_per_bucket(bs, &shape) as u64;
     let mut defaults = Vec::with_capacity(cds.len());
     for cd in cds {
@@ -820,21 +815,21 @@ pub(crate) fn ism_update(
     // Rows [start, end) of every column: `disk_end` rows from the file, the
     // rest defaults, then the pending cells overlaid.
     let gather = |f: Option<&IsmFile>, start: u64, disk_end: u64, end: u64| {
-        let mut cols: Vec<Vec<u8>> = Vec::with_capacity(cds.len());
+        let mut cols: Vec<Vec<Vec<u8>>> = Vec::with_capacity(cds.len());
         for (c, cd) in cds.iter().enumerate() {
             let size = sizes[c] as usize;
-            let mut buf = Vec::with_capacity((end - start) as usize * size);
+            let mut cells: Vec<Vec<u8>> = Vec::with_capacity((end - start) as usize);
             if let Some(f) = f {
                 if disk_end > start {
                     f.for_each_cell_raw(c, cd, start, disk_end - start, |cell| {
-                        buf.extend_from_slice(cell);
+                        cells.push(cell.to_vec());
                         Ok::<(), crate::ism::IsmError>(())
                     })
                     .map_err(|e| e.to_string())?;
                 }
             }
-            while buf.len() < (end - start) as usize * size {
-                buf.extend_from_slice(&defaults[c]);
+            while cells.len() < (end - start) as usize {
+                cells.push(defaults[c].clone());
             }
             if let Some(p) = pending.get(c) {
                 let lo = p.partition_point(|(r, _)| *r < start);
@@ -842,20 +837,16 @@ pub(crate) fn ism_update(
                     if cell.len() != size {
                         return Err(format!("ISM cell of {} bytes, want {size}", cell.len()));
                     }
-                    let at = (r - start) as usize * size;
-                    buf[at..at + size].copy_from_slice(cell);
+                    cells[(r - start) as usize] = cell.clone();
                 }
             }
-            cols.push(buf);
+            cols.push(cells);
         }
         Ok::<_, String>(cols)
     };
-    let encode = |cols: &[Vec<u8>], n: u64| {
-        let w: Vec<WriteIsmColumn<'_>> = cols
-            .iter()
-            .zip(&sizes)
-            .map(|(bytes, &cell_size)| WriteIsmColumn { cell_size, bytes })
-            .collect();
+    let encode = |cols: &[Vec<Vec<u8>>], n: u64| {
+        let w: Vec<WriteIsmColumn<'_>> =
+            cols.iter().map(|cells| WriteIsmColumn { cells }).collect();
         encode_ism_bucket(big_endian, bs, n, &w)
     };
 

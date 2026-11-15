@@ -439,13 +439,17 @@ pub fn create_table(
                 }
             }
             "IncrementalStMan" => {
-                let file = build_ism_data(big_endian, nrow, dm_name, desc, values, &dm_cols)?;
+                let (file, f0i) =
+                    build_ism_data(big_endian, nrow, dm_name, desc, values, &dm_cols)?;
                 dms.push(DmBlob {
                     type_name: type_name.clone(),
                     sequence_nr: dm as u32,
                     blob: crate::ism::write_ism_blob(dm_name),
                 });
                 data_files.push((dm as u32, file));
+                if let Some(f0i) = f0i {
+                    index_files.push((dm as u32, f0i));
+                }
             }
             "TiledColumnStMan" | "TiledShapeStMan" => {
                 let (header, tile, file_seq) = build_tsm_data(
@@ -861,8 +865,12 @@ fn build_ssm_data(
     Ok((file, f0i, spec))
 }
 
-/// Build the IncrementalStMan data-file bytes for one ISM data manager
-/// (scalar columns only).
+/// Build the IncrementalStMan data-file bytes for one ISM data manager.
+/// Scalar cells encode inline, scalar strings as their u32-prefixed inline
+/// cells, and array cells as 8-byte references into the array index file
+/// (`table.f{seq}i`, returned alongside — issue #48); an array cell whose
+/// value is the undefined empty (a never-written variable-shape row) gets
+/// casacore's null reference, like the StandardStMan builder writes (#45).
 fn build_ism_data(
     big_endian: bool,
     nrow: u64,
@@ -870,48 +878,103 @@ fn build_ism_data(
     desc: &crate::tabledesc::TableDesc,
     values: &[Vec<crate::record::RecordValue>],
     dm_cols: &[usize],
-) -> Result<Vec<u8>, TableCreateError> {
+) -> Result<(Vec<u8>, Option<Vec<u8>>), TableCreateError> {
     let _ = dm_name;
-    let mut cell_buffers: Vec<Vec<u8>> = Vec::with_capacity(dm_cols.len());
-    let mut cell_sizes: Vec<u32> = Vec::with_capacity(dm_cols.len());
+    let mut cell_buffers: Vec<Vec<Vec<u8>>> = Vec::with_capacity(dm_cols.len());
+    let mut array_records: Vec<Vec<u8>> = Vec::new();
+    let mut records_len: usize = 0;
     for &col in dm_cols {
         let cd = &desc.columns[col];
-        if !matches!(cd.kind, crate::tabledesc::ColumnKind::Scalar(_)) {
-            return Err(TableCreateError::NotScalar(cd.name.clone()));
+        let encode_err = |e: crate::ssm::SsmError| {
+            TableCreateError::Io(std::io::Error::other(format!(
+                "encode {}.{}: {e}",
+                desc.name, cd.name
+            )))
+        };
+        let mut cells = Vec::with_capacity(values[col].len());
+        match (&cd.kind, cd.data_type) {
+            (crate::tabledesc::ColumnKind::Array, crate::record::DataType::String) => {
+                return Err(TableCreateError::NotScalar(format!(
+                    "IncrementalStMan string array column {} is not writable yet",
+                    cd.name
+                )));
+            }
+            (crate::tabledesc::ColumnKind::Array, _) => {
+                for value in &values[col] {
+                    match value {
+                        crate::record::RecordValue::Array(arr)
+                            if cd.shape.as_ref().is_none_or(|s| s.is_empty())
+                                && arr.data.is_empty() =>
+                        {
+                            // An undefined cell: the null "no array"
+                            // reference, not array content (#45).
+                            cells.push(vec![0u8; 8]);
+                        }
+                        crate::record::RecordValue::Array(arr) => {
+                            let record =
+                                crate::ssm::encode_array_record(big_endian, cd.data_type, arr)
+                                    .map_err(encode_err)?;
+                            let offset = 16 + records_len as i64;
+                            records_len += record.len();
+                            array_records.push(record);
+                            cells.push(if big_endian {
+                                offset.to_be_bytes().to_vec()
+                            } else {
+                                offset.to_le_bytes().to_vec()
+                            });
+                        }
+                        other => {
+                            return Err(TableCreateError::NotScalar(format!(
+                                "{}.{}: expected an array cell, got {other:?}",
+                                desc.name, cd.name
+                            )))
+                        }
+                    }
+                }
+            }
+            (_, crate::record::DataType::String) | (_, crate::record::DataType::Table) => {
+                for value in &values[col] {
+                    let s = match value {
+                        crate::record::RecordValue::String(s)
+                        | crate::record::RecordValue::Table(s) => s,
+                        other => {
+                            return Err(TableCreateError::NotScalar(format!(
+                                "{}.{}: expected a string cell, got {other:?}",
+                                desc.name, cd.name
+                            )))
+                        }
+                    };
+                    cells.push(crate::ism::encode_ism_string_cell(big_endian, s));
+                }
+            }
+            (crate::tabledesc::ColumnKind::Scalar(_), _) => {
+                for value in &values[col] {
+                    cells.push(
+                        crate::ssm::encode_scalar_cell(big_endian, cd, value)
+                            .map_err(encode_err)?,
+                    );
+                }
+            }
+            (crate::tabledesc::ColumnKind::Record, _) => {
+                return Err(TableCreateError::NotScalar(cd.name.clone()));
+            }
         }
-        if cd.data_type == crate::record::DataType::String {
-            return Err(TableCreateError::Io(std::io::Error::other(format!(
-                "IncrementalStMan string column {} is not writable yet",
-                cd.name
-            ))));
-        }
-        // ISM stores whole cells: a Bool cell is one byte, not the
-        // StandardStMan bit-packed 0 (`encode_scalar_cell` already emits that
-        // one byte for Bool, so the cell size must match it).
-        let size = crate::ism::ism_cell_size(cd);
-        let mut buf = Vec::with_capacity(values[col].len() * size as usize);
-        for value in &values[col] {
-            buf.extend_from_slice(
-                &crate::ssm::encode_scalar_cell(big_endian, cd, value).map_err(|e| {
-                    TableCreateError::Io(std::io::Error::other(format!(
-                        "encode {}.{}: {e}",
-                        desc.name, cd.name
-                    )))
-                })?,
-            );
-        }
-        cell_buffers.push(buf);
-        cell_sizes.push(size);
+        cell_buffers.push(cells);
     }
     let ism_cols: Vec<crate::ism::WriteIsmColumn<'_>> = cell_buffers
         .iter()
-        .zip(cell_sizes.iter())
-        .map(|(buf, size)| crate::ism::WriteIsmColumn {
-            cell_size: *size,
-            bytes: buf,
-        })
+        .map(|cells| crate::ism::WriteIsmColumn { cells })
         .collect();
-    Ok(crate::ism::write_ism_file(big_endian, nrow, &ism_cols))
+    let f0 = crate::ism::write_ism_file(big_endian, nrow, &ism_cols);
+    let f0i = if array_records.is_empty() {
+        None
+    } else {
+        Some(crate::ism::build_array_index_file(
+            big_endian,
+            &array_records,
+        ))
+    };
+    Ok((f0, f0i))
 }
 
 /// Build the TiledColumnStMan header + tile data for one TSM data manager
@@ -1996,7 +2059,7 @@ impl Table {
                 }
             }
             ColumnSource::Ism { file, within } => {
-                file.read_scalar_cell(within, desc, row).map_err(Into::into)
+                file.read_cell(within, desc, row).map_err(Into::into)
             }
             ColumnSource::Tsm { file } => file.read_cell(desc, row).map_err(Into::into),
         }
@@ -2131,10 +2194,12 @@ impl Table {
             ColumnSource::Ssm { file, spec, within } => {
                 crate::ssm::is_array_cell_defined(file, spec, within, desc, row).map_err(Into::into)
             }
-            // casacure reads IncrementalStMan scalars only (an ISM array
-            // column is not supported on read at all), so every ISM cell
-            // casacure can serve is defined.
-            ColumnSource::Ism { .. } => Ok(true),
+            // An ISM array cell is defined when its 8-byte reference into
+            // the array index file is non-null (casacore's `isShapeDefined`,
+            // issue #48); scalars and strings are defined in every row.
+            ColumnSource::Ism { file, within } => {
+                file.is_cell_defined(within, desc, row).map_err(Into::into)
+            }
             ColumnSource::Tsm { file } => file.is_cell_defined(desc, row).map_err(Into::into),
         }
     }
@@ -2509,10 +2574,10 @@ impl Table {
         let src = self.column_source(col_idx)?;
         let mut out = Vec::with_capacity(nrow as usize);
         if let ColumnSource::Ism { file, within } = src {
-            // One linear walk of each bucket's interval index for the range.
-            let big_endian = file.header.big_endian;
-            file.for_each_cell_raw(within, desc, startrow, nrow, |cell| {
-                out.push(crate::ssm::decode_scalar(cell, desc, big_endian)?);
+            // One linear walk of each bucket's interval index for the range,
+            // decoding per the column kind (scalar/string/array, issue #48).
+            file.for_each_decoded(within, desc, startrow, nrow, |cell| {
+                out.push(cell);
                 Ok::<(), crate::ism::IsmError>(())
             })
             .map_err(|e| match e {
@@ -2565,13 +2630,12 @@ impl Table {
                 j += 1;
             }
             match &src {
-                // One linear walk of the run's bucket interval indexes.
+                // One linear walk of the run's bucket interval indexes,
+                // decoding per the column kind (scalar/string/array).
                 ColumnSource::Ism { file, within } => {
-                    let big_endian = file.header.big_endian;
                     let mut k = i;
-                    file.for_each_cell_raw(*within, desc, start, (j - i) as u64, |cell| {
-                        slots[order[k].1] =
-                            Some(crate::ssm::decode_scalar(cell, desc, big_endian)?);
+                    file.for_each_decoded(*within, desc, start, (j - i) as u64, |cell| {
+                        slots[order[k].1] = Some(cell);
                         k += 1;
                         Ok::<(), crate::ism::IsmError>(())
                     })
@@ -3879,10 +3943,13 @@ impl WritableTable {
                             | crate::tabledesc::ColumnKind::Array
                     )
                 }
-                "IncrementalStMan" => {
-                    matches!(cd.kind, crate::tabledesc::ColumnKind::Scalar(_))
-                        && cd.data_type != crate::record::DataType::String
-                }
+                "IncrementalStMan" => match cd.kind {
+                    crate::tabledesc::ColumnKind::Scalar(_) => true,
+                    crate::tabledesc::ColumnKind::Array => {
+                        cd.data_type != crate::record::DataType::String
+                    }
+                    crate::tabledesc::ColumnKind::Record => false,
+                },
                 _ => false,
             };
             if !supported {
@@ -4062,12 +4129,14 @@ impl WritableTable {
                     (crate::columnset::write_standard_stman(&spec), files)
                 }
                 "IncrementalStMan" => {
-                    let f0 = build_ism_data(false, nrow, &nd.name, &self.desc, values, &nd.cols)
-                        .map_err(storage)?;
-                    (
-                        crate::ism::write_ism_blob(&nd.name),
-                        vec![(format!("table.f{}", nd.seq), f0)],
-                    )
+                    let (f0, f0i) =
+                        build_ism_data(false, nrow, &nd.name, &self.desc, values, &nd.cols)
+                            .map_err(storage)?;
+                    let mut files = vec![(format!("table.f{}", nd.seq), f0)];
+                    if let Some(i) = f0i {
+                        files.push((format!("table.f{}i", nd.seq), i));
+                    }
+                    (crate::ism::write_ism_blob(&nd.name), files)
                 }
                 _ => {
                     let (hdr, tile, file_seq) = build_tsm_data(
@@ -4459,7 +4528,7 @@ impl WritableTable {
                                 })?;
                             }
                         } else {
-                            let f0 = build_ism_data(
+                            let (f0, f0i) = build_ism_data(
                                 false,
                                 nrow,
                                 &dm.type_name,
@@ -4471,6 +4540,12 @@ impl WritableTable {
                             let path = dir.join(format!("table.f{seq}"));
                             crate::datafile::write_atomic(&path, &f0)
                                 .map_err(|e| WriteTableError::Storage(storage_error(&path, e)))?;
+                            if let Some(i) = f0i {
+                                let index_path = dir.join(format!("table.f{seq}i"));
+                                crate::datafile::write_atomic(&index_path, &i).map_err(|e| {
+                                    WriteTableError::Storage(storage_error(&index_path, e))
+                                })?;
+                            }
                         }
                     }
                     for &col in &cols {
@@ -7438,6 +7513,125 @@ mod tests {
                 RecordValue::Float(row as f32)
             );
         }
+    }
+
+    #[test]
+    fn ism_arrays_and_strings_round_trip_through_create_and_flush() {
+        use crate::record::{ArrayData, ArrayValue};
+        // ISM-bound fixed/variable arrays and scalar strings (issue #48):
+        // create writes bucket cells (arrays as 8-byte references into
+        // table.f0i, strings inline), a second session patches cells through
+        // the flush rebuild, and reads see all of it.
+        fn ism_array(name: &str, dt: DataType, casa_shape: Vec<i64>) -> ColumnDesc {
+            let mut d = array_col(name, dt, 0, casa_shape);
+            d.data_manager_type = "IncrementalStMan".into();
+            d.data_manager_group = "IncrementalStMan".into();
+            d
+        }
+        let mut desc = typed_desc();
+        let mut sigma = ism_array("SIGMA", DataType::Double, vec![]);
+        sigma.ndim = 1; // variable-shape: no shape in the descriptor
+        desc.columns = vec![
+            ism_array("WEIGHT", DataType::Float, vec![4]),
+            sigma,
+            ism_col("NAME", DataType::String, 0),
+            ism_col("TIME", DataType::Double, 0),
+        ];
+        let sigma_cell = |r: u64, n: u32| {
+            RecordValue::Array(ArrayValue {
+                shape: vec![n],
+                data: ArrayData::Double((0..n as usize).map(|i| r as f64 + i as f64).collect()),
+            })
+        };
+        let undefined = RecordValue::Array(ArrayValue {
+            shape: vec![0],
+            data: ArrayData::Double(Vec::new()),
+        });
+        let nrows = 6u64;
+        let weight = |base: f32| {
+            RecordValue::Array(ArrayValue {
+                shape: vec![4],
+                data: ArrayData::Float(vec![base; 4]),
+            })
+        };
+        let values = vec![
+            (0..nrows).map(|r| weight(r as f32)).collect(),
+            vec![
+                sigma_cell(0, 1),
+                sigma_cell(1, 2),
+                sigma_cell(2, 3),
+                undefined.clone(),
+                sigma_cell(4, 2),
+                sigma_cell(5, 1),
+            ],
+            vec![
+                RecordValue::String(String::new()),
+                RecordValue::String("a".into()),
+                RecordValue::String("a much longer string".into()),
+                RecordValue::String("xy".into()),
+                RecordValue::String("a".into()),
+                RecordValue::String("end".into()),
+            ],
+            (0..nrows).map(|r| RecordValue::Double(r as f64)).collect(),
+        ];
+        let dir = temp_dir("ism48");
+        create_table(&dir, &desc, &values).unwrap();
+        assert!(
+            dir.join("table.f0i").is_file(),
+            "array columns create the array index file"
+        );
+
+        {
+            let t = Table::open(&dir, true).unwrap();
+            for r in 0..nrows {
+                assert_eq!(t.getcell(0, r).unwrap(), weight(r as f32), "WEIGHT {r}");
+                assert_eq!(t.getcell(1, r).unwrap(), values[1][r as usize], "SIGMA {r}");
+                assert_eq!(
+                    t.is_cell_defined(1, r).unwrap(),
+                    r != 3,
+                    "SIGMA defined {r}"
+                );
+            }
+            assert_eq!(
+                t.getcell(2, 2).unwrap(),
+                RecordValue::String("a much longer string".into())
+            );
+            // A windowed whole-column read through the interval walk.
+            let cells = t.getcol(1, 1, 3).unwrap();
+            assert_eq!(cells, values[1][1..4], "SIGMA window");
+        }
+        {
+            // Second session: patch a string and an array cell; the
+            // in-place patch declines them and the flush rebuilds the file.
+            let (_snap, mut wt) = WritableTable::open_for_update(&dir).unwrap();
+            wt.putcell(2, 0, RecordValue::String("rewritten".into()))
+                .unwrap();
+            wt.putcell(1, 0, sigma_cell(100, 2)).unwrap();
+            wt.flush().unwrap();
+        }
+        let t = Table::open(&dir, true).unwrap();
+        assert_eq!(
+            t.getcell(2, 0).unwrap(),
+            RecordValue::String("rewritten".into()),
+            "patched NAME"
+        );
+        assert_eq!(
+            t.getcell(1, 0).unwrap(),
+            sigma_cell(100, 2),
+            "patched SIGMA"
+        );
+        assert_eq!(t.getcell(1, 4).unwrap(), sigma_cell(4, 2), "SIGMA 4 intact");
+        assert_eq!(
+            t.getcell(2, 2).unwrap(),
+            RecordValue::String("a much longer string".into()),
+            "NAME 2 intact"
+        );
+        assert!(!t.is_cell_defined(1, 3).unwrap(), "SIGMA 3 still undefined");
+        assert_eq!(
+            t.getcell(0, 5).unwrap(),
+            weight(5.0),
+            "untouched WEIGHT column intact"
+        );
     }
 
     #[test]
