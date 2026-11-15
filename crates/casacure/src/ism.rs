@@ -670,21 +670,35 @@ pub fn encode_ism_string_cell(big_endian: bool, s: &str) -> Vec<u8> {
     cell
 }
 
-/// Assemble an array index file (`table.f{seq}i`) from `StIndArray` records
-/// (`crate::ssm::encode_array_record`): the 16-byte `StManArrayFile`
-/// header — `[u32 version = 0][Int64 file length][u32 spare]`, no per-record
-/// reference count (version 0), matching what the StandardStMan builder
-/// writes — followed by the concatenated records. casacore reads version 0
-/// files without the refcount, and casacure's reader handles both.
-pub fn build_array_index_file(big_endian: bool, records: &[Vec<u8>]) -> Vec<u8> {
+/// Assemble an array index file (`table.f{seq}i`) from `StIndArray` record
+/// payloads and their reference counts. casacore's ISM opens its array file
+/// with `StManArrayFile(fileName() + 'i', opt, 1, ...)` — version **1**,
+/// which prefixes every record with a 4-byte reference count — so the
+/// header is `[u32 version = 1][Int64 file length][u32 spare]` in the data
+/// file's byte order and each record is `[u32 refcount][ndim][CASA dims]
+/// [elements]` (the refcount is casacore's shared-record bookkeeping:
+/// adjacent rows holding equal arrays share one record). Readers of both
+/// versions exist on both sides, so files written either way read
+/// everywhere.
+pub fn build_array_index_file(big_endian: bool, records: &[(Vec<u8>, u32)]) -> Vec<u8> {
     let mut f0i = vec![0u8; 16];
-    let len = (16 + records.iter().map(Vec::len).sum::<usize>()) as i64;
+    let len = (16 + records.iter().map(|(r, _)| 4 + r.len()).sum::<usize>()) as i64;
+    f0i[0..4].copy_from_slice(&if big_endian {
+        1u32.to_be_bytes()
+    } else {
+        1u32.to_le_bytes()
+    });
     f0i[4..12].copy_from_slice(&if big_endian {
         len.to_be_bytes()
     } else {
         len.to_le_bytes()
     });
-    for r in records {
+    for (r, refcount) in records {
+        f0i.extend_from_slice(&if big_endian {
+            refcount.to_be_bytes()
+        } else {
+            refcount.to_le_bytes()
+        });
         f0i.extend_from_slice(r);
     }
     f0i
@@ -696,11 +710,107 @@ pub fn build_array_index_file(big_endian: bool, records: &[Vec<u8>]) -> Vec<u8> 
 /// in a column share one stored value (an interval entry), exactly as
 /// `ISMBucket::addData` does.
 pub fn write_ism_file(big_endian: bool, n_rows: u64, cols: &[WriteIsmColumn<'_>]) -> Vec<u8> {
-    // Match casacore's default ISM bucket size; rows per bucket constrained
-    // so data + per-column index fit.
+    write_ism_file_with(big_endian, n_rows, cols, 1, 0)
+}
+
+/// One ISM bucket under construction: the data area bytes and, per column,
+/// the interval index (start rows and data offsets) plus the value bytes
+/// covering the next row (interval compression state).
+struct BucketState {
+    data: Vec<u8>,
+    /// Per column: (interval start rows, data offsets).
+    index: Vec<(Vec<u64>, Vec<u32>)>,
+    /// Bytes of the value covering the next row, per column.
+    last: Vec<Option<Vec<u8>>>,
+}
+
+/// [`write_ism_file`] with the header's persistent-cache and unique-number
+/// fields spelled out. casacore's ISM defaults `persCacheSize` to 1 (its
+/// spec constructor, `ISMBase.cc`); `uniqnr` is 1 per indirect-array column
+/// the group holds (opening its `StManArrayFile` bumps the manager's
+/// counter), 0 for scalar-only groups — verified byte-for-byte against
+/// casacore-written tables.
+pub fn write_ism_file_with(
+    big_endian: bool,
+    n_rows: u64,
+    cols: &[WriteIsmColumn<'_>],
+    pers_cache_size: u32,
+    uniq_nr: u32,
+) -> Vec<u8> {
+    // Match casacore's default ISM bucket size.
     let bucket_size = ISM_BUCKET_SIZE;
-    let rows_per_bucket = ism_rows_per_bucket(bucket_size, cols);
-    let nr_buckets = n_rows.div_ceil(rows_per_bucket as u64) as usize;
+
+    // Fill buckets the way a clean casacore column write fills them
+    // (ISMBucket::canAddData): a column's cell starts a new interval
+    // whenever its bytes differ from the previous row's, each new interval
+    // costing its bytes plus 12 of index, with a bucket holding rows until
+    // `dataLeng + cell + indexLeng + 4 + 8 > bucketSize` — the same
+    // capacity casacore's 64-bit-rownr builds account (single-column tables
+    // come out byte-identical to casacore's). Boundaries are row-atomic: a
+    // row that would straddle a full bucket starts the next one, with every
+    // column re-adding its interval there — intervals never span buckets,
+    // so a read of any column at any row finds it. (casacore allows
+    // mid-row boundaries and duplicates the straddling values; its own
+    // boundaries moreover depend on the write session's history — putcol
+    // and putcell of the same data produce different files — so byte parity
+    // beyond the single-column layout is not defined; see DIFFERENCES.md.)
+    let ncols = cols.len();
+    let mut buckets: Vec<BucketState> = Vec::new();
+    let mut cur = BucketState {
+        data: Vec::new(),
+        index: vec![(Vec::new(), Vec::new()); ncols],
+        last: vec![None; ncols],
+    };
+    // The index length tracks the encoded form: the indexOffset u32, one
+    // u32 per column, and u32 row + u32 offset + u64 rownr per interval
+    // (ISMBucket::canAddData's accounting).
+    let mut cur_index_len = 4 + 4 * ncols;
+    let mut new_bucket = |cur: &mut BucketState, index_len: &mut usize| {
+        buckets.push(std::mem::replace(
+            cur,
+            BucketState {
+                data: Vec::new(),
+                index: vec![(Vec::new(), Vec::new()); ncols],
+                last: vec![None; ncols],
+            },
+        ));
+        *index_len = 4 + 4 * ncols;
+    };
+    for r in 0..n_rows as usize {
+        // Would every new interval of this row fit the current bucket,
+        // checked in order with casacore's exact canAddData accounting
+        // (`dataLeng + cell + indexLeng + 4 + 8 <= bucketSize`, against the
+        // index length before each add's own 12 bytes)?
+        let mut data_len = cur.data.len();
+        let mut index_len = cur_index_len;
+        let mut fits = true;
+        for (c, col) in cols.iter().enumerate() {
+            if cur.last[c].as_deref() != Some(col.cells[r].as_slice()) {
+                if data_len + col.cells[r].len() + index_len + 4 + 8 > bucket_size {
+                    fits = false;
+                    break;
+                }
+                data_len += col.cells[r].len();
+                index_len += 12;
+            }
+        }
+        if !fits {
+            new_bucket(&mut cur, &mut cur_index_len);
+        }
+        for (c, col) in cols.iter().enumerate() {
+            let cell = &col.cells[r];
+            if cur.last[c].as_deref() == Some(cell.as_slice()) {
+                continue; // the open interval covers this row too
+            }
+            cur.index[c].0.push(r as u64);
+            cur.index[c].1.push(cur.data.len() as u32);
+            cur.data.extend_from_slice(cell);
+            cur.last[c] = Some(cell.clone());
+            cur_index_len += 12;
+        }
+    }
+    buckets.push(cur);
+    let nr_buckets = buckets.len();
 
     let mut file = Vec::with_capacity(512 + nr_buckets * bucket_size + 256);
 
@@ -717,8 +827,8 @@ pub fn write_ism_file(big_endian: bool, n_rows: u64, cols: &[WriteIsmColumn<'_>]
     }
     hw.put_u32(bucket_size as u32);
     hw.put_u32(nr_buckets as u32);
-    hw.put_u32(0); // pers cache size
-    hw.put_u32(0); // uniqnr
+    hw.put_u32(pers_cache_size);
+    hw.put_u32(uniq_nr);
     hw.put_u32(0); // free buckets
     hw.put_i32(-1); // first free bucket
     hw.put_object_end();
@@ -726,27 +836,60 @@ pub fn write_ism_file(big_endian: bool, n_rows: u64, cols: &[WriteIsmColumn<'_>]
     file.resize(512, 0);
 
     // Buckets.
-    for b in 0..nr_buckets {
-        let start_row = b as u64 * rows_per_bucket as u64;
-        let end_row = (start_row + rows_per_bucket as u64).min(n_rows);
-        let slices: Vec<WriteIsmColumn<'_>> = cols
+    let mut boundaries: Vec<u64> = Vec::with_capacity(nr_buckets + 1);
+    let mut numbers: Vec<u32> = Vec::with_capacity(nr_buckets);
+    for (i, b) in buckets.into_iter().enumerate() {
+        // A bucket's start is the first row any of its intervals covers.
+        let start = b
+            .index
             .iter()
-            .map(|col| WriteIsmColumn {
-                cells: &col.cells[start_row as usize..end_row as usize],
-            })
-            .collect();
-        let bucket = encode_ism_bucket(big_endian, bucket_size, end_row - start_row, &slices)
-            .expect("an ISM bucket of rows_per_bucket rows always fits");
-        file.extend_from_slice(&bucket);
+            .flat_map(|(rows, _)| rows.iter().copied())
+            .min()
+            .unwrap_or(0);
+        boundaries.push(start);
+        numbers.push(i as u32);
+        file.extend_from_slice(&encode_bucket_state(big_endian, bucket_size, start, b));
     }
+    boundaries.push(n_rows);
 
     // ISMIndex at the end.
-    let boundaries: Vec<u64> = (0..=nr_buckets)
-        .map(|b| (b as u64 * rows_per_bucket as u64).min(n_rows))
-        .collect();
-    let numbers: Vec<u32> = (0..nr_buckets as u32).collect();
     file.extend_from_slice(&encode_ism_index(big_endian, &boundaries, &numbers));
     file
+}
+
+/// Encode one filled bucket state into `bucket_size` bytes: the indexOffset
+/// u32, the data area, then the per-column interval index with **bucket-
+/// relative** row numbers (32-bit).
+fn encode_bucket_state(
+    big_endian: bool,
+    bucket_size: usize,
+    start_row: u64,
+    state: BucketState,
+) -> Vec<u8> {
+    let mut bucket = vec![0u8; bucket_size];
+    let index_len: usize = state
+        .index
+        .iter()
+        .map(|(rows, _)| 4 + 4 * rows.len() + 4 * rows.len())
+        .sum();
+    let index_offset = (state.data.len() + 4) as u32;
+    debug_assert!(4 + state.data.len() + index_len <= bucket_size);
+    put_u32_e(&mut bucket, 0, index_offset, big_endian);
+    bucket[4..4 + state.data.len()].copy_from_slice(&state.data);
+    let mut pos = 4usize + state.data.len();
+    for (rows, offsets) in &state.index {
+        put_u32_e(&mut bucket, pos, rows.len() as u32, big_endian);
+        pos += 4;
+        for &s in rows {
+            put_u32_e(&mut bucket, pos, (s - start_row) as u32, big_endian);
+            pos += 4;
+        }
+        for &o in offsets {
+            put_u32_e(&mut bucket, pos, o, big_endian);
+            pos += 4;
+        }
+    }
+    bucket
 }
 
 /// The rows an IncrementalStMan bucket of `bucket_size` bytes can always

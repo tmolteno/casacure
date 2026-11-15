@@ -33,8 +33,8 @@ pub use columnset::{
     ColumnInfo, ColumnSet, ColumnSetError, DataManager, DataManagerBlob, DmBlob, StandardStMan,
 };
 pub use ism::{
-    build_array_index_file, encode_ism_string_cell, write_ism_file, IsmError, IsmFile, IsmHeader,
-    IsmIndex, WriteIsmColumn,
+    build_array_index_file, encode_ism_string_cell, write_ism_file, write_ism_file_with, IsmError,
+    IsmFile, IsmHeader, IsmIndex, WriteIsmColumn,
 };
 pub use ssm::{
     encode_scalar_cell, layout, read_array_cell, scalar_cell_size, write_standard_stman_file,

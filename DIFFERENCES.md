@@ -168,6 +168,26 @@ message:
 A real-world file that needs either one reopens the question, as with
 `TiledDataStMan` (`help wanted` on a fixture file, issue #18).
 
+## IncrementalStMan files: canonical layout, session-dependent boundaries
+
+casacure's ISM writer emits the casacore C++ format's canonical constants —
+the header's persistent-cache size (1) and unique number (one per indirect
+array column), the array index file's version-1 records with their 4-byte
+reference counts, the per-bucket data+interval-index layout, and the
+`ISMIndex` — and fills each bucket to exactly the capacity casacore's
+`ISMBucket::canAddData` accounts, so single-column tables are byte-identical
+to casacore's through every bucket (`tests/test_ism_byte_parity.py` pins
+this against real python-casacore output). What is deliberately not
+reproduced byte-for-byte is the placement of bucket boundaries and array
+records across a multi-column, multi-bucket table's history: casacore's own
+output is not canonical there — putcol and row-by-row putcell of the same
+data produce different files (mid-row bucket splits with duplicated
+boundary values, refcount/free-list artifacts of the
+create-defaults-then-replace lifecycle, stale bytes left in bucket slack),
+so there is no single casacore byte sequence to equal. casacure picks a
+deterministic row-atomic layout instead; every casacore build reads it, and
+the tables compare equal value-for-value.
+
 ## Locking: casacore's protocol, with the yield checked at operation entry
 
 Not a divergence from the on-disk protocol — casacore's locking is

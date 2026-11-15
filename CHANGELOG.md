@@ -28,6 +28,19 @@ subtasks are moved here.
   `tests/make_fixtures.py`; unit tests round-trip the writer through the
   reader in both byte orders' layout; `DIFFERENCES.md` updated.
 
+- **IncrementalStMan files reproduce the casacore C++ output's canonical
+  layout (issue #48 follow-up).** Byte-level comparison against
+  python-casacore-written tables (new `tests/test_ism_byte_parity.py`)
+  drove the writer to casacore's format constants: header persistent-cache
+  size 1 and unique number = one per indirect array column, the array index
+  file at version 1 with a 4-byte reference count per `StIndArray` record,
+  and buckets filled to exactly the capacity `ISMBucket::canAddData`
+  accounts — single-column tables now come out byte-identical through every
+  bucket. Bucket boundaries beyond the single-column case stay
+  row-atomic rather than casacore's session-history-dependent mid-row
+  splits (casacore's own putcol vs putcell outputs differ; see
+  DIFFERENCES.md), with values identical either way.
+
 - **Reading a never-written variable-shape column raises like casacore
   instead of returning a silent `(nrow, 0, ..., 0)` (issue #49).** The
   #45-era behavior stacked every undefined cell into a zero-sized guess,

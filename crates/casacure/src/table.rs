@@ -881,7 +881,13 @@ fn build_ism_data(
 ) -> Result<(Vec<u8>, Option<Vec<u8>>), TableCreateError> {
     let _ = dm_name;
     let mut cell_buffers: Vec<Vec<Vec<u8>>> = Vec::with_capacity(dm_cols.len());
-    let mut array_records: Vec<Vec<u8>> = Vec::new();
+    // StIndArray record payloads with their reference counts (casacore's
+    // version-1 array file prefixes each record with a refcount; a clean
+    // sequential write gives every row its own record, refcount 1 — record
+    // sharing is a bucket-split-duplication artifact of casacore's
+    // mid-row boundaries, which casacure's row-atomic layout does not
+    // produce).
+    let mut array_records: Vec<(Vec<u8>, u32)> = Vec::new();
     let mut records_len: usize = 0;
     for &col in dm_cols {
         let cd = &desc.columns[col];
@@ -915,8 +921,8 @@ fn build_ism_data(
                                 crate::ssm::encode_array_record(big_endian, cd.data_type, arr)
                                     .map_err(encode_err)?;
                             let offset = 16 + records_len as i64;
-                            records_len += record.len();
-                            array_records.push(record);
+                            records_len += 4 + record.len(); // refcount + record
+                            array_records.push((record, 1));
                             cells.push(if big_endian {
                                 offset.to_be_bytes().to_vec()
                             } else {
@@ -965,7 +971,16 @@ fn build_ism_data(
         .iter()
         .map(|cells| crate::ism::WriteIsmColumn { cells })
         .collect();
-    let f0 = crate::ism::write_ism_file(big_endian, nrow, &ism_cols);
+    let f0 = crate::ism::write_ism_file_with(
+        big_endian,
+        nrow,
+        &ism_cols,
+        1,
+        dm_cols
+            .iter()
+            .filter(|&&c| matches!(desc.columns[c].kind, crate::tabledesc::ColumnKind::Array))
+            .count() as u32,
+    );
     let f0i = if array_records.is_empty() {
         None
     } else {
