@@ -5,6 +5,8 @@ subtasks are moved here.
 
 ## [Unreleased]
 
+## [3.8.45] - 2026-11-16
+
 ### Fixed
 
 - **IncrementalStMan array and string columns are read and written
