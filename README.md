@@ -150,14 +150,22 @@ differences from casacore are in [`MEASURES_ACCURACY.md`](MEASURES_ACCURACY.md).
 
 ### Driving dask-ms on casacure
 
-> Applies to **dask-ms 0.2.x** (`pip install "dask-ms<0.3"`). dask-ms 0.3.0
-> (now in alpha) opens tables through **arcae** instead of
-> `casacore.tables`, so neither routing below has an import site to
-> intercept there — the 0.3 integration point is tracked in
-> [issue #13](https://github.com/tmolteno/casacure/issues/13) and
-> [ratt-ru/dask-ms#392](https://github.com/ratt-ru/dask-ms/discussions/392).
+> **For downstream users:** the supported path is **dask-ms-2**
+> (`pip install dask-ms-2`, repo
+> [tmolteno/dask-ms](https://github.com/tmolteno/dask-ms)) — permanently
+> forked from ratt-ru/dask-ms with casacure as a hard dependency
+> (`casacure>=3.8.41`). It needs no shim and no environment variable.
+>
+> The routing below applies to **upstream dask-ms 0.2.x**
+> (`pip install "dask-ms<0.3"`) and is what this repo's own harness runs as
+> a compatibility gate ([issue #7](https://github.com/tmolteno/casacure/issues/7)).
+> Upstream dask-ms 0.3.0 (final on PyPI since 2026-11-13) opens tables
+> through **arcae** instead of `casacore.tables`, so neither routing below
+> has an import site to intercept there — moot now that integration
+> continues in the fork ([issue #13](https://github.com/tmolteno/casacure/issues/13),
+> [ratt-ru/dask-ms#392](https://github.com/ratt-ru/dask-ms/discussions/392)).
 
-dask-ms imports `casacore.tables`; point it at casacure in one of two ways:
+Upstream dask-ms 0.2.x imports `casacore.tables`; point it at casacure in one of two ways:
 
 **1. A drop-in `casacore` shim** — a two-file package that re-exports
 casacure, placed on `PYTHONPATH` ahead of any real python-casacore (this is
@@ -168,11 +176,11 @@ casacore/__init__.py          # (empty)
 casacore/tables.py            # from casacure.tables import *
 ```
 
-**2. Backend selection** (the cleaner upstream path) — an env-gated
+**2. Backend selection** — an env-gated
 `DASK_MS_BACKEND=casacure` that aliases `casacore.tables` → `casacure.tables`
 in-process. It is a ~10-line `sys.modules` swap in dask-ms's `__init__`,
-validated against the full dask-ms suite; it is the prototype for the upstream
-store-dispatch change.
+validated against the full dask-ms suite. (dask-ms-2 bakes this routing in,
+without the env var.)
 
 Either way, the dask-ms workflow is unchanged:
 

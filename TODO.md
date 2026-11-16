@@ -152,12 +152,23 @@ XFAILs) are recorded in issue #7.
   to intercept (verified against 0.3.0a1). The harness pins `dask-ms<0.3`
   (README); upstream conversation: casacure issue #13 +
   ratt-ru/dask-ms#392.
-- [ ] dask-ms 0.3 backend: hook casacure into the arcae surface — either an
+- [X] ~~dask-ms 0.3 backend: hook casacure into the arcae surface — either an
       upstream backend-selection point at the function-level `import arcae`
       seams (`open_table`/`taql_table`/`create_ms`/`create_table`) or an
       `arcae`-shaped shim module implementing its Arrow-based data-transfer
       API on casacure. Supersedes the 0.2-era
-      "`fsspec_store.py`/`dask_ms.py` store dispatch" item (upstream, later)
+      "`fsspec_store.py`/`dask_ms.py` store dispatch" item (upstream, later)~~
+      **2026-11-16: RESOLVED by the permanent fork.** dask-ms-2
+      ([tmolteno/dask-ms](https://github.com/tmolteno/dask-ms), PyPI
+      `dask-ms-2`) is forked from ratt-ru/dask-ms for good and depends on
+      casacure directly (hard `casacure>=3.8.41` requirement since 0.2.36).
+      No upstream seam (ratt-ru/dask-ms#383 is abandoned on the EOL 0.2.x
+      line) and no arcae shim will be pursued; the fork supersedes this item
+      and the 0.2-era store-dispatch item. Fork-side work (e.g. moving
+      environments off the casacure 3.8.41 lock to ≥3.8.45, which fixes the
+      #49 FLAG_CATEGORY breakage) lives in the fork. Issues #7 and #13
+      closed on this decision; the upstream dask-ms 0.2.x suite stays in
+      this repo's harness only as a compatibility gate.
 
 ## 8. python-casacore dependent-package surveys
 
